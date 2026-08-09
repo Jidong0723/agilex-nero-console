@@ -162,6 +162,49 @@ class FakeBroker:
         return {"ok": True, "reason": reason}
 
 
+class SafetyGateTests(unittest.TestCase):
+    def test_velocity_clipping_is_permitted_and_reported(self) -> None:
+        supervisor = SafetySupervisor({})
+        limits = {
+            "effective_lower_rad": [-1.0] * 7,
+            "effective_upper_rad": [1.0] * 7,
+            "controller_speed_rad_s": [0.45] * 7,
+            "controller_acceleration_rad_s2": [2.0] * 7,
+        }
+        supervisor.configure(limits, [0.45] * 7, [2.0] * 7)
+
+        safe, accepted, reason = supervisor.final_gate(
+            [0.94] + [0.0] * 6,
+            [0.0] * 7,
+            [0.45] + [0.0] * 6,
+            delay_s=0.1,
+            feedback_hard_stale=False,
+        )
+
+        self.assertTrue(accepted)
+        self.assertEqual(reason, "velocity clipped by final safety gate")
+        self.assertGreaterEqual(safe[0], 0.0)
+        self.assertLess(safe[0], 0.45)
+
+    def test_feedback_staleness_remains_a_hard_rejection(self) -> None:
+        supervisor = SafetySupervisor({})
+        limits = {
+            "effective_lower_rad": [-1.0] * 7,
+            "effective_upper_rad": [1.0] * 7,
+            "controller_speed_rad_s": [0.45] * 7,
+            "controller_acceleration_rad_s2": [2.0] * 7,
+        }
+        supervisor.configure(limits, [0.45] * 7, [2.0] * 7)
+
+        safe, accepted, reason = supervisor.final_gate(
+            [0.0] * 7, [0.0] * 7, [0.1] * 7, delay_s=0.1, feedback_hard_stale=True
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(reason, "feedback hard stale")
+        self.assertEqual(safe, [0.0] * 7)
+
+
 class TeleopPositionDispatchTests(unittest.TestCase):
     def test_hardware_loop_sends_ruckig_joint_positions(self) -> None:
         config = {

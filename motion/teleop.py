@@ -631,11 +631,15 @@ class SafetySupervisor:
             return [0.0] * 7, False, "feedback hard stale"
         safe, report = self.limit_velocity(q, qd, velocity, delay_s)
         data = self._require()
-        unsafe = any(abs(a - b) > 1e-6 and abs(b) > 1e-5 for a, b in zip(velocity, safe))
+        limited = any(abs(a - b) > 1e-6 and abs(b) > 1e-5 for a, b in zip(velocity, safe))
         for row in report["joints"]:
             if row["distance_to_limit_rad"] < 0.0:
                 return [0.0] * 7, False, f"J{row['joint']} exceeds effective position limit"
-        return safe, not unsafe, None if not unsafe else "velocity clipped by final safety gate"
+        # A dynamic braking limit is a normal constrained-tracking outcome:
+        # execute the clipped velocity and report it, rather than faulting the
+        # whole OSC session.  Feedback loss and an already-out-of-range joint
+        # remain hard rejections above.
+        return safe, True, None if not limited else "velocity clipped by final safety gate"
 
 
 class OperationalSpaceServo:
@@ -1551,6 +1555,7 @@ class OperationalSpaceServo:
                     q, qd, planned, delay_budget,
                     hard_stale and motion_or_brake_active,
                 )
+                gate_limited = gate_reason == "velocity clipped by final safety gate"
                 if not gate_ok:
                     with self.lock: self.trajectory_state, self.trajectory_brake_reason = "FAULT", gate_reason or "final safety gate rejected velocity"
                     final_velocity = [0.0] * 7
@@ -1573,7 +1578,10 @@ class OperationalSpaceServo:
                         (float(command) - float(previous)) / max(0.001, actual_dt)
                         for command, previous in zip(final_velocity, previous_velocity)
                     ]
-                    self._set_result(True, "shadow velocity servo", robot_commands_sent=False, solver=pink if pink and pink.get("ok") else None, ruckig=ruckig_info)
+                    result_reason = "shadow velocity servo"
+                    if gate_limited:
+                        result_reason += " with final safety gate velocity limit"
+                    self._set_result(True, result_reason, robot_commands_sent=False, solver=pink if pink and pink.get("ok") else None, ruckig=ruckig_info, supervisor=supervisor_report, gate_reason=gate_reason, gate_limited=gate_limited)
                     batch = None
                 else:
                     # Ruckig is still driven with Pink's velocity proposal,
@@ -1603,7 +1611,9 @@ class OperationalSpaceServo:
                         result_reason = "CPV joint-position batch sent with soft-stale derating"
                     elif hard_stale:
                         result_reason = "CPV measured-position hold sent after hard stale feedback"
-                    self._set_result(gate_ok, result_reason, robot_commands_sent=True, solver=pink if pink and pink.get("ok") else None, ruckig=ruckig_info, supervisor=supervisor_report, gate_reason=gate_reason)
+                    elif gate_limited:
+                        result_reason = "CPV joint-position batch sent with final safety gate velocity limit"
+                    self._set_result(gate_ok, result_reason, robot_commands_sent=True, solver=pink if pink and pink.get("ok") else None, ruckig=ruckig_info, supervisor=supervisor_report, gate_reason=gate_reason, gate_limited=gate_limited)
                 self.last_sent_velocity = list(final_velocity)
                 with self.lock:
                     if (
@@ -1618,7 +1628,7 @@ class OperationalSpaceServo:
                         self.needs_resync = True
                         if not shadow:
                             self.broker.latch_teleop_hold("teleop braking settled")
-                    self._timing = {"actual_dt_s": actual_dt, "feedback_age_s": feedback_age, "feedback_soft_stale": soft_stale, "feedback_hard_stale": hard_stale, "solver_age_s": solver_age, "batch_skew_ms": (batch or {}).get("batch_skew_ms"), "delay_budget_s": delay_budget, "motion_epoch": epoch, "gate_ok": gate_ok}
+                    self._timing = {"actual_dt_s": actual_dt, "feedback_age_s": feedback_age, "feedback_soft_stale": soft_stale, "feedback_hard_stale": hard_stale, "solver_age_s": solver_age, "batch_skew_ms": (batch or {}).get("batch_skew_ms"), "delay_budget_s": delay_budget, "motion_epoch": epoch, "gate_ok": gate_ok, "gate_limited": gate_limited, "gate_reason": gate_reason}
             except PermissionError as exc:
                 # Authority revocation is an expected ownership handoff, not a
                 # robot fault.  In particular, it must never promote a stale

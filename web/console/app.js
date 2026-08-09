@@ -510,7 +510,7 @@
     $("period-ms").textContent = Number.isFinite(finite(timing.actual_dt_s, NaN)) ? `${fixed(timing.actual_dt_s * 1000, 1)} ms` : "--";
     $("solver-age").textContent = Number.isFinite(finite(timing.solver_age_s, NaN)) ? `${fixed(timing.solver_age_s * 1000, 0)} ms` : "--";
     $("feedback-age").textContent = Number.isFinite(finite(timing.feedback_age_s, NaN)) ? `${fixed(timing.feedback_age_s * 1000, 0)} ms` : "--";
-    $("gate-state").textContent = timing.gate_ok === true ? "通过" : timing.gate_ok === false ? "拒绝" : "--";
+    $("gate-state").textContent = timing.gate_limited === true ? "限速" : timing.gate_ok === true ? "通过" : timing.gate_ok === false ? "拒绝" : "--";
     $("trajectory-state").textContent = diagnostic.trajectory_state || "--";
     const active = current.state === "ACTIVE";
     $("start").disabled = current.state === "STARTING" || active;
