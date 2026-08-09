@@ -204,11 +204,33 @@ class SafetyGateTests(unittest.TestCase):
         self.assertEqual(reason, "feedback hard stale")
         self.assertEqual(safe, [0.0] * 7)
 
+    def test_small_feedback_limit_excursion_clips_outward_motion_without_faulting(self) -> None:
+        supervisor = SafetySupervisor({"feedback_limit_tolerance_rad": 0.05})
+        limits = {
+            "effective_lower_rad": [-1.0] * 7,
+            "effective_upper_rad": [1.0] * 7,
+            "controller_speed_rad_s": [0.45] * 7,
+            "controller_acceleration_rad_s2": [2.0] * 7,
+        }
+        supervisor.configure(limits, [0.45] * 7, [2.0] * 7)
+
+        safe, accepted, reason = supervisor.final_gate(
+            [1.02] + [0.0] * 6,
+            [0.0] * 7,
+            [0.1] + [0.0] * 6,
+            delay_s=0.1,
+            feedback_hard_stale=False,
+        )
+
+        self.assertTrue(accepted)
+        self.assertEqual(reason, "velocity clipped by final safety gate")
+        self.assertEqual(safe[0], 0.0)
+
 
 class TeleopPositionDispatchTests(unittest.TestCase):
-    def test_hardware_loop_sends_ruckig_joint_positions(self) -> None:
+    def test_hardware_loop_can_send_direct_pink_joint_positions(self) -> None:
         config = {
-            "solver": {"dt_s": 0.02, "ruckig_max_acceleration": 2.0, "ruckig_max_jerk": 20.0, "urdf": str(ROOT / "vendor/nero_description/nero_description.urdf")},
+            "solver": {"dt_s": 0.02, "direct_pink_cpv_position": True, "ruckig_max_acceleration": 2.0, "ruckig_max_jerk": 20.0, "urdf": str(ROOT / "vendor/nero_description/nero_description.urdf")},
             "runtime": {"control_hz": 50, "max_control_hz": 100},
             "limits": {"joint_speed_rad_s": 0.45, "input_filter_alpha": 1.0, "deadman_timeout_s": 1.0, "feedback_soft_stale_s": 1.0, "feedback_hard_stale_s": 2.0, "solver_stale_s": 1.0, "max_stale_velocity_repeats": 3},
         }
@@ -234,6 +256,7 @@ class TeleopPositionDispatchTests(unittest.TestCase):
         self.assertTrue(all(len(target) == 7 for target in broker.robot.positions))
         self.assertGreater(max(abs(value) for value in broker.robot.positions[-1]), 0.0)
         self.assertEqual(controller.status()["last_result"]["reason"], "CPV joint-position batch sent")
+        self.assertEqual(controller.status()["last_result"]["ruckig"]["mode"], "bypassed")
 
 
 @unittest.skip("Superseded by pose-clutch coverage in tests.test_pose_teleop")

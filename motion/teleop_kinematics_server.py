@@ -162,7 +162,7 @@ class Solver:
         )
         frame_task.set_target(target_tcp)
         posture_reference = finite_vector(request.get("posture_reference_rad", q_feedback), 7, "posture_reference_rad")
-        posture_task = self.PostureTask(cost=float(request.get("posture_cost", 0.01)))
+        posture_task = self.PostureTask(cost=float(request.get("posture_cost", 0.005)))
         posture_task.set_target(self._q(posture_reference))
         damping_task = self.DampingTask(cost=damping_cost)
         acceleration_limit = self.AccelerationLimit(self.model, np.asarray(acceleration_limits, dtype=float))

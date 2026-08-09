@@ -73,6 +73,17 @@ class PoseTeleopTests(unittest.TestCase):
         finally:
             self._close(controller)
 
+    def test_active_osc_session_reports_an_expired_heartbeat_lease(self) -> None:
+        controller, _solver = self._controller()
+        try:
+            controller.config["session_timeout_s"] = 0.01
+            controller._heartbeat_monotonic_ns = time.monotonic_ns() - 1_000_000_000
+            self.assertTrue(controller.heartbeat_expired())
+            controller._heartbeat_monotonic_ns = time.monotonic_ns()
+            self.assertFalse(controller.heartbeat_expired())
+        finally:
+            self._close(controller)
+
     def test_absolute_osc_target_resumes_without_clutch_state(self) -> None:
         controller, solver = self._controller()
         try:

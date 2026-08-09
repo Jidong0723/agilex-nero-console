@@ -684,6 +684,11 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 return self._json_ok(self.broker.osc_command(body))
             if self.path == "/api/osc/session/stop":
                 return self._json_ok(self.broker.osc_stop(str(body.get("reason", "OSC session stopped"))))
+            if self.path == "/api/osc/session/heartbeat":
+                return self._json_ok(self.broker.osc_heartbeat(
+                    str(body.get("client_id", "anonymous")),
+                    str(body.get("session_id", "")),
+                ))
             if self.path == "/api/teleop/session/start":
                 result = self.broker.teleop_start(
                         body.get("mode"),

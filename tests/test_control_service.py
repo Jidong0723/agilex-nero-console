@@ -633,26 +633,59 @@ class OscFacadeTests(unittest.TestCase):
 
                     def status(self):
                         return {
-                            "session": {"state": "ACTIVE", "id": "osc-1"},
+                            "session": {"state": "ACTIVE", "id": "osc-1", "input_source": "legacy-adapter"},
                             "clutch_active": True, "anchor_id": 9, "relative_pose": {"position_m": [1, 2, 3]},
                             "reference_pose": {"position_m": [0.1, 0.2, 0.3], "orientation_xyzw": [0, 0, 0, 1]},
-                            "last_result": {}, "solver": {}, "workspace": {}, "diagnostics": {},
+                            "last_result": {"solver": {"tcp": {
+                                "position_m": [0.0, 0.2, 0.3],
+                                "rotation": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                            }, "condition_number": 12.5, "nullspace_velocity_norm": 0.02}},
+                            "last_output": {"status": "limited", "final_joint_target_rad": [0.1] * 7, "final_joint_velocity_rad_s": [0.2] * 7, "sequence": 3, "epoch": 4},
+                            "solver": {}, "workspace": {}, "diagnostics": {"loop_count": 8, "output_count": 7, "cpv_dispatch_count": 0, "timing": {}},
                         }
 
                     def stop_session(self, reason):
                         return {"handoff": {"reason": reason}}
 
+                    def heartbeat(self, client_id, session_id):
+                        self.heartbeat_call = (client_id, session_id)
+                        return self.status()
+
                 controller.osc_servo = FakeOscServo()  # type: ignore[assignment]
                 controller.teleop = controller.osc_servo
+                controller.status = lambda: {  # type: ignore[method-assign]
+                    "control": {"robot": {"joint_angles_rad": [0.0] * 7}},
+                }
                 state = controller.osc_state()
                 self.assertNotIn("clutch_active", state)
                 self.assertNotIn("anchor_id", state)
+                self.assertNotIn("input_source", state["session"])
+                self.assertEqual(state["robot"]["joint_angles_rad"], [0.0] * 7)
+                self.assertEqual(state["execution"]["current_tcp_pose"]["position_m"], [0.0, 0.2, 0.3])
+                self.assertEqual(state["execution"]["observed_source"], "simulated_final_output")
+                self.assertEqual(state["execution"]["output_count"], 7)
+                self.assertEqual(state["command"]["output_status"], "limited")
+                self.assertAlmostEqual(state["diagnostics"]["tcp_error"]["position_norm_m"], 0.1)
+                self.assertAlmostEqual(state["diagnostics"]["tcp_error"]["orientation_angle_rad"], 0.0)
+                self.assertEqual(state["diagnostics"]["pink"]["condition_number"], 12.5)
+                self.assertEqual(state["transport"]["participation"], "not_participating")
+                self.assertIsNone(state["transport"]["last_cpv_dispatch"])
                 result = controller.osc_command({
                     "session_id": "osc-1", "client_id": "client", "sequence": 1, "type": "track_tcp",
                     "payload": {"target_pose": {"position_m": [0.1, 0.2, 0.3], "orientation_xyzw": [0, 0, 0, 1]}},
                 })
                 self.assertTrue(result["ok"])
                 self.assertEqual(result["result"]["mode"], "track_tcp")
+                compact = controller.osc_command({
+                    "session_id": "osc-1", "client_id": "client", "sequence": 2, "type": "track_tcp",
+                    "acknowledgement_only": True,
+                    "payload": {"target_pose": {"position_m": [0.1, 0.2, 0.3], "orientation_xyzw": [0, 0, 0, 1]}},
+                })
+                self.assertTrue(compact["ok"])
+                self.assertNotIn("state", compact)
+                heartbeat = controller.osc_heartbeat("client", "osc-1")
+                self.assertTrue(heartbeat["ok"])
+                self.assertEqual(controller.osc_servo.heartbeat_call, ("client", "osc-1"))
             finally:
                 controller.close()
 

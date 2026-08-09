@@ -584,6 +584,7 @@ class SafetySupervisor:
         # conservative configured floor in the braking budget until it is
         # characterized from hardware logs.
         self.controller_response_floor_s = max(0.0, float(config.get("controller_response_delay_s", 0.04)))
+        self.feedback_limit_tolerance_rad = max(0.0, float(config.get("feedback_limit_tolerance_rad", 0.0)))
 
     def configure(self, limits: dict[str, Any], requested_speed: list[float], requested_acceleration: list[float]) -> None:
         self.limit_data = dict(limits)
@@ -631,10 +632,21 @@ class SafetySupervisor:
             return [0.0] * 7, False, "feedback hard stale"
         safe, report = self.limit_velocity(q, qd, velocity, delay_s)
         data = self._require()
-        limited = any(abs(a - b) > 1e-6 and abs(b) > 1e-5 for a, b in zip(velocity, safe))
+        # A complete outward clamp to zero is still a safety limitation and
+        # must be observable as such, not reported as an unconstrained pass.
+        limited = any(abs(a - b) > 1e-6 for a, b in zip(velocity, safe))
         for row in report["joints"]:
             if row["distance_to_limit_rad"] < 0.0:
-                return [0.0] * 7, False, f"J{row['joint']} exceeds effective position limit"
+                excursion = -float(row["distance_to_limit_rad"])
+                requested = float(row["requested_rad_s"])
+                dispatched = float(row["safe_rad_s"])
+                # A small calibration-seam excursion beyond the
+                # URDF/controller intersection is feedback tolerance only:
+                # stationary or inward motion may continue, but it never
+                # authorizes outward motion or a larger excursion.
+                outward = (requested > 1e-9 and dispatched > 1e-9) or (requested < -1e-9 and dispatched < -1e-9)
+                if excursion > self.feedback_limit_tolerance_rad or outward:
+                    return [0.0] * 7, False, f"J{row['joint']} exceeds effective position limit"
         # A dynamic braking limit is a normal constrained-tracking outcome:
         # execute the clipped velocity and report it, rather than faulting the
         # whole OSC session.  Feedback loss and an already-out-of-range joint
@@ -705,7 +717,14 @@ class OperationalSpaceServo:
         self._feedback_thread: threading.Thread | None = None
         self.thread: threading.Thread | None = None
         self.stop_event = threading.Event()
-        self.cpv_send_count, self.loop_count = 0, 0
+        self.cpv_send_count, self.output_count, self.loop_count = 0, 0, 0
+        self.last_output: dict[str, Any] = {
+            "status": "held",
+            "final_joint_target_rad": None,
+            "final_joint_velocity_rad_s": [0.0] * 7,
+            "sequence": 0,
+            "epoch": 0,
+        }
         self._send_times: deque[float] = deque(maxlen=256)
         self._batch_history: deque[dict[str, Any]] = deque(maxlen=256)
         self._timing: dict[str, Any] = {}
@@ -977,7 +996,8 @@ class OperationalSpaceServo:
                 self.trajectory_state, self.trajectory_brake_reason, self.feedback_sync_pending = "HOLD_READY", None, True
                 self.needs_resync = True
                 self.stop_event.clear()
-                self._send_times.clear(); self._batch_history.clear(); self.cpv_send_count = 0; self.loop_count = 0
+                self._send_times.clear(); self._batch_history.clear(); self.cpv_send_count = 0; self.output_count = 0; self.loop_count = 0
+                self.last_output = {"status": "held", "final_joint_target_rad": list(joints), "final_joint_velocity_rad_s": [0.0] * 7, "sequence": 0, "epoch": self.motion_epoch}
                 self.last_result = {"ok": True, "reason": "session started", "robot_commands_sent": False}
                 self.thread = threading.Thread(target=self._loop, name="nero-teleop-loop", daemon=True)
                 self.thread.start()
@@ -1264,6 +1284,19 @@ class OperationalSpaceServo:
             self._heartbeat_monotonic_ns = time.monotonic_ns()
             return self.status()
 
+    def heartbeat_expired(self) -> bool:
+        """Whether the active OSC owner lease has expired.
+
+        The control broker's watchdog owns the resulting hardware handoff;
+        keeping this method read-only avoids a servo-thread/transport lock
+        inversion while still making browser loss a server-enforced boundary.
+        """
+        with self.lock:
+            if not self._session_active() or not self._heartbeat_monotonic_ns:
+                return False
+            timeout_s = float(self.config.get("session_timeout_s", 5.0))
+            return (time.monotonic_ns() - self._heartbeat_monotonic_ns) / 1e9 > timeout_s
+
     def _start_feedback_worker(self) -> None:
         self._feedback_stop.clear()
         def run() -> None:
@@ -1314,7 +1347,7 @@ class OperationalSpaceServo:
         with self.lock:
             debug_fn = getattr(self.solver, "debug_status", None)
             debug = debug_fn() if callable(debug_fn) else {}
-            return {"state_sequence": self.state_sequence, "session": self._session_view(), "intent": dict(self.intent) if self.intent else None, "input_enabled": self.input_enabled, "input_source": self.input_source, "clutch_active": self.clutch_active, "anchor_id": self.anchor_id, "reference_revision": self.reference_revision, "tcp_anchor": dict(self.tcp_anchor) if self.tcp_anchor else None, "relative_pose": dict(self.relative_pose), "reference_pose": dict(self.reference_pose) if self.reference_pose else None, "last_error": self.last_error, "last_result": dict(self.last_result), "pose_mapping_verified": bool(self.pose_input.get("mapping_verified", False)), "solver": {"running": bool(self.solver.process and self.solver.process.poll() is None), "python": str(self.solver.python), "tcp_verified": False, "debug": debug}, "workspace": {"min_xyz_m": list(self.limits.get("workspace_min_m", [-0.45, -0.15, -0.02])), "max_xyz_m": list(self.limits.get("workspace_max_m", [0.45, 0.60, 0.70])), "min_flange_z_m": float(self.limits.get("min_flange_z_m", -0.02))}, "diagnostics": {"trajectory_state": self.trajectory_state, "trajectory_brake_reason": self.trajectory_brake_reason, "motion_epoch": self.motion_epoch, "needs_resync": self.needs_resync, "last_sent_velocity_rad_s": list(self.last_sent_velocity), "trajectory": dict(self.trajectory) if self.trajectory else None, "limit_authority": dict(self.authority.effective) if self.authority.effective else None, "supervisor": dict(self.supervisor.limit_data) if self.supervisor.limit_data else None, "timing": dict(self._timing), "recent_cpv_batches": list(self._batch_history)[-10:]}}
+            return {"state_sequence": self.state_sequence, "session": self._session_view(), "intent": dict(self.intent) if self.intent else None, "input_enabled": self.input_enabled, "input_source": self.input_source, "clutch_active": self.clutch_active, "anchor_id": self.anchor_id, "reference_revision": self.reference_revision, "tcp_anchor": dict(self.tcp_anchor) if self.tcp_anchor else None, "relative_pose": dict(self.relative_pose), "reference_pose": dict(self.reference_pose) if self.reference_pose else None, "last_error": self.last_error, "last_result": dict(self.last_result), "last_output": dict(self.last_output), "pose_mapping_verified": bool(self.pose_input.get("mapping_verified", False)), "solver": {"running": bool(self.solver.process and self.solver.process.poll() is None), "python": str(self.solver.python), "tcp_verified": False, "debug": debug}, "workspace": {"min_xyz_m": list(self.limits.get("workspace_min_m", [-0.45, -0.15, -0.02])), "max_xyz_m": list(self.limits.get("workspace_max_m", [0.45, 0.60, 0.70])), "min_flange_z_m": float(self.limits.get("min_flange_z_m", -0.02))}, "diagnostics": {"trajectory_state": self.trajectory_state, "trajectory_brake_reason": self.trajectory_brake_reason, "motion_epoch": self.motion_epoch, "needs_resync": self.needs_resync, "last_sent_velocity_rad_s": list(self.last_sent_velocity), "trajectory": dict(self.trajectory) if self.trajectory else None, "limit_authority": dict(self.authority.effective) if self.authority.effective else None, "supervisor": dict(self.supervisor.limit_data) if self.supervisor.limit_data else None, "timing": dict(self._timing), "loop_count": self.loop_count, "output_count": self.output_count, "cpv_dispatch_count": self.cpv_send_count, "recent_cpv_batches": list(self._batch_history)[-10:]}}
 
     def kinematics(self) -> dict[str, Any]:
         return {"schema_version": "nero.teleop.v1", "tcp_verified": False, "tcp_offset_m": self.config.get("tcp", {}).get("offset_from_link7_m"), "last_result": dict(self.last_result), "shadow_default": True}
@@ -1444,6 +1477,15 @@ class OperationalSpaceServo:
                     if self.session: self.session["last_input_age_s"] = age if math.isfinite(age) else None
                     explicit_nonzero = bool(self.clutch_active and intent)
                     state_before_input_check = self.trajectory_state
+                    heartbeat_age = (
+                        max(0.0, (time.monotonic_ns() - self._heartbeat_monotonic_ns) / 1e9)
+                        if self._heartbeat_monotonic_ns else None
+                    )
+                    # A normally started OSC session always installs its
+                    # lease timestamp.  Keep hand-built legacy/test sessions
+                    # without one backward compatible rather than treating
+                    # their missing timestamp as an immediate timeout.
+                    heartbeat_expired = heartbeat_age is not None and heartbeat_age > float(self.config.get("session_timeout_s", 5.0))
                     trajectory = self.trajectory or {}
                     brake_is_still_moving = (
                         state_before_input_check == "BRAKING"
@@ -1454,7 +1496,12 @@ class OperationalSpaceServo:
                             > float(self.config.get("solver", {}).get("hold_acceleration_epsilon_rad_s2", 0.02))
                         )
                     )
-                    if self.trajectory_state == "RUNNING" and intent and (not valid_input or not deadman):
+                    if self.trajectory_state == "RUNNING" and heartbeat_expired:
+                        # A persistent OSC target is never permission to run
+                        # unattended.  The browser heartbeat is the owner
+                        # lease; immediately brake it when that lease expires.
+                        self._invalidate_motion("teleop session heartbeat expired")
+                    elif self.trajectory_state == "RUNNING" and intent and (not valid_input or not deadman):
                         self._invalidate_motion("input timed out" if not valid_input else "clutch released")
                     # A stationary session has no active motion to protect.
                     # Keep an old sample visible while HOLD_READY; the next
@@ -1504,7 +1551,7 @@ class OperationalSpaceServo:
                 data = self.supervisor._require()
                 anchor_id = int((intent or {}).get("anchor_id", self.anchor_id))
                 reference_revision = int((intent or {}).get("reference_revision", self.reference_revision))
-                self.solver.submit({"sequence": int((intent or {}).get("sequence", session.get("sequence", 0))), "motion_epoch": epoch, "anchor_id": anchor_id, "reference_revision": reference_revision, "joint_angles_rad": q, "joint_state_monotonic_ns": time.monotonic_ns(), "target_position_m": target_pose["position_m"], "target_orientation_xyzw": target_pose["orientation_xyzw"], "last_sent_joint_velocity_rad_s": self.last_sent_velocity, "joint_speed_limit_rad_s": data["speed_rad_s"], "joint_acceleration_limit_rad_s2": data["acceleration_rad_s2"], "soft_lower_rad": data["soft_lower_rad"], "soft_upper_rad": data["soft_upper_rad"], "posture_reference_rad": self.posture_reference or q, "posture_cost": float(self.config.get("solver", {}).get("posture_cost", 0.01)), "damping_cost": float(self.config.get("solver", {}).get("damping_cost", 0.05)), "frame_position_cost": float(self.config.get("solver", {}).get("frame_position_cost", 10.0)), "frame_orientation_cost": float(self.config.get("solver", {}).get("frame_orientation_cost", 1.0)), "frame_gain": float(self.config.get("solver", {}).get("frame_gain", 0.5)), "feedback_limit_tolerance_rad": float(self.config.get("solver", {}).get("feedback_limit_tolerance_rad", 0.05)), "dt_s": period})
+                self.solver.submit({"sequence": int((intent or {}).get("sequence", session.get("sequence", 0))), "motion_epoch": epoch, "anchor_id": anchor_id, "reference_revision": reference_revision, "joint_angles_rad": q, "joint_state_monotonic_ns": time.monotonic_ns(), "target_position_m": target_pose["position_m"], "target_orientation_xyzw": target_pose["orientation_xyzw"], "last_sent_joint_velocity_rad_s": self.last_sent_velocity, "joint_speed_limit_rad_s": data["speed_rad_s"], "joint_acceleration_limit_rad_s2": data["acceleration_rad_s2"], "soft_lower_rad": data["soft_lower_rad"], "soft_upper_rad": data["soft_upper_rad"], "posture_reference_rad": self.posture_reference or q, "posture_cost": float(self.config.get("solver", {}).get("posture_cost", 0.005)), "damping_cost": float(self.config.get("solver", {}).get("damping_cost", 0.05)), "frame_position_cost": float(self.config.get("solver", {}).get("frame_position_cost", 10.0)), "frame_orientation_cost": float(self.config.get("solver", {}).get("frame_orientation_cost", 1.0)), "frame_gain": float(self.config.get("solver", {}).get("frame_gain", 0.5)), "feedback_limit_tolerance_rad": float(self.config.get("solver", {}).get("feedback_limit_tolerance_rad", 0.05)), "dt_s": period})
                 pink = self.solver.poll(epoch, anchor_id, reference_revision)
                 if pink and pink.get("ok"):
                     self._solver_reuse_count = 0
@@ -1523,18 +1570,20 @@ class OperationalSpaceServo:
                     self.last_solver_result = pink
                 if state == "RUNNING" and pink and pink.get("ok"):
                     raw_dq = _finite_vector(pink.get("pink_joint_velocity_rad_s"), 7, "pink_joint_velocity_rad_s")
-                    # Pink's position-task IK can chatter near workspace
-                    # boundaries even when the Cartesian target is fixed.
-                    # Smooth its velocity proposal before Ruckig so solver
-                    # sign changes do not become visible joint oscillation.
-                    filter_alpha = float(self.limits.get("input_filter_alpha", 1.0))
-                    if not math.isfinite(filter_alpha):
-                        filter_alpha = 1.0
-                    filter_alpha = max(0.05, min(1.0, filter_alpha))
-                    raw_dq = [
-                        filter_alpha * value + (1.0 - filter_alpha) * previous
-                        for value, previous in zip(raw_dq, self.last_sent_velocity)
-                    ]
+                    direct_pink_cpv = bool(self.config.get("solver", {}).get("direct_pink_cpv_position", False))
+                    if not direct_pink_cpv:
+                        # Pink's position-task IK can chatter near workspace
+                        # boundaries even when the Cartesian target is fixed.
+                        # Smooth its velocity proposal before Ruckig so solver
+                        # sign changes do not become visible joint oscillation.
+                        filter_alpha = float(self.limits.get("input_filter_alpha", 1.0))
+                        if not math.isfinite(filter_alpha):
+                            filter_alpha = 1.0
+                        filter_alpha = max(0.05, min(1.0, filter_alpha))
+                        raw_dq = [
+                            filter_alpha * value + (1.0 - filter_alpha) * previous
+                            for value, previous in zip(raw_dq, self.last_sent_velocity)
+                        ]
                     delay_budget = self.supervisor.observe_delay(feedback_age, actual_dt, solver_age, float(self._timing.get("batch_skew_ms", 0.0) or 0.0) / 1000.0, float(self._timing.get("response_s", 0.0) or 0.0))
                     target_velocity, supervisor_report = self.supervisor.limit_velocity(q, qd, raw_dq, delay_budget)
                     soft_stale_scale = 1.0
@@ -1550,7 +1599,15 @@ class OperationalSpaceServo:
                 else:
                     target_velocity, supervisor_report, pink = [0.0] * 7, {"reason": "direct Ruckig braking"}, None
                     delay_budget = self.supervisor.observe_delay(feedback_age, actual_dt, None, float(self._timing.get("batch_skew_ms", 0.0) or 0.0) / 1000.0, float(self._timing.get("response_s", 0.0) or 0.0))
-                planned, ruckig_info = self._advance_ruckig(target_velocity, actual_dt)
+                direct_pink_cpv = bool(self.config.get("solver", {}).get("direct_pink_cpv_position", False))
+                if direct_pink_cpv:
+                    # Diagnostic mode: Pink's unfiltered differential-IK
+                    # output is integrated exactly once into the CPV joint
+                    # position.  Ruckig is intentionally not advanced.
+                    planned = list(target_velocity)
+                    ruckig_info = {"enabled": False, "mode": "bypassed", "reason": "direct Pink-to-CPV diagnostic mode", "measured_period_s": actual_dt}
+                else:
+                    planned, ruckig_info = self._advance_ruckig(target_velocity, actual_dt)
                 final_velocity, gate_ok, gate_reason = self.supervisor.final_gate(
                     q, qd, planned, delay_budget,
                     hard_stale and motion_or_brake_active,
@@ -1581,17 +1638,17 @@ class OperationalSpaceServo:
                     result_reason = "shadow velocity servo"
                     if gate_limited:
                         result_reason += " with final safety gate velocity limit"
-                    self._set_result(True, result_reason, robot_commands_sent=False, solver=pink if pink and pink.get("ok") else None, ruckig=ruckig_info, supervisor=supervisor_report, gate_reason=gate_reason, gate_limited=gate_limited)
+                    with self.lock:
+                        self.output_count += 1
+                        self.last_output = {"status": "limited" if gate_limited else "accepted", "final_joint_target_rad": list(self.shadow_joints), "final_joint_velocity_rad_s": list(final_velocity), "sequence": int((intent or {}).get("sequence", session.get("sequence", 0))), "epoch": epoch}
+                    self._set_result(True, result_reason, robot_commands_sent=False, solver=pink if pink and pink.get("ok") else None, ruckig=ruckig_info, supervisor=supervisor_report, gate_reason=gate_reason, gate_limited=gate_limited, final_joint_target_rad=list(self.shadow_joints), final_joint_velocity_rad_s=list(final_velocity))
                     batch = None
                 else:
-                    # Ruckig is still driven with Pink's velocity proposal,
-                    # but its joint-position trajectory is what reaches the
-                    # arm. If the final safety gate changes the velocity,
-                    # rebuild this tick's position target from the measured
-                    # joints so a clipped command cannot retain Ruckig's
-                    # original, unsafe position.
+                    # In direct diagnostic mode, and whenever the final gate
+                    # changes Ruckig's proposal, build CPV from the measured
+                    # joints. This keeps the sole output a joint position.
                     position_target = list(self.trajectory["position_rad"])
-                    if not gate_ok or any(abs(actual - planned_value) > 1e-9 for actual, planned_value in zip(final_velocity, planned)):
+                    if direct_pink_cpv or not gate_ok or any(abs(actual - planned_value) > 1e-9 for actual, planned_value in zip(final_velocity, planned)):
                         previous_velocity = list(self.trajectory["velocity_rad_s"])
                         position_target = [
                             float(current) + float(command) * actual_dt
@@ -1605,7 +1662,8 @@ class OperationalSpaceServo:
                         ]
                     batch = self.broker.send_servo_position(position_target, str(session.get("session_id")), epoch)
                     with self.lock:
-                        self.cpv_send_count += 1; self._send_times.append(time.monotonic()); self._batch_history.append({"motion_epoch": epoch, "joint_target_rad": list(position_target), "joint_velocity_rad_s": list(final_velocity), **batch})
+                        self.cpv_send_count += 1; self.output_count += 1; self._send_times.append(time.monotonic()); self._batch_history.append({"motion_epoch": epoch, "joint_target_rad": list(position_target), "joint_velocity_rad_s": list(final_velocity), **batch})
+                        self.last_output = {"status": "limited" if gate_limited else "accepted", "final_joint_target_rad": list(position_target), "final_joint_velocity_rad_s": list(final_velocity), "sequence": int((intent or {}).get("sequence", session.get("sequence", 0))), "epoch": epoch}
                     result_reason = "CPV joint-position batch sent"
                     if soft_stale and not hard_stale:
                         result_reason = "CPV joint-position batch sent with soft-stale derating"
@@ -1613,7 +1671,7 @@ class OperationalSpaceServo:
                         result_reason = "CPV measured-position hold sent after hard stale feedback"
                     elif gate_limited:
                         result_reason = "CPV joint-position batch sent with final safety gate velocity limit"
-                    self._set_result(gate_ok, result_reason, robot_commands_sent=True, solver=pink if pink and pink.get("ok") else None, ruckig=ruckig_info, supervisor=supervisor_report, gate_reason=gate_reason, gate_limited=gate_limited)
+                    self._set_result(gate_ok, result_reason, robot_commands_sent=True, solver=pink if pink and pink.get("ok") else None, ruckig=ruckig_info, supervisor=supervisor_report, gate_reason=gate_reason, gate_limited=gate_limited, final_joint_target_rad=list(position_target), final_joint_velocity_rad_s=list(final_velocity))
                 self.last_sent_velocity = list(final_velocity)
                 with self.lock:
                     if (

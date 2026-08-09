@@ -635,6 +635,7 @@ class OperationalSpaceController:
         snapshot = {
             "timestamp": now_iso(),
             "control": control,
+            "robot": robot_state,
             "can_feedback_recovery": control.get("can_feedback_recovery", {}),
             "lease": lease.public() if lease else None,
             "active_action": self._active_action_public(),
@@ -770,9 +771,15 @@ class OperationalSpaceController:
         result = self.hold(reason)
         return {"ok": bool(result.get("ok")), "result": result, "state": self.osc_state()}
 
+    def osc_heartbeat(self, client_id: str, session_id: str) -> dict[str, Any]:
+        """Renew an OSC command session without exposing an input adapter."""
+        self.osc_servo.heartbeat(client_id, session_id)
+        return {"ok": True, "state": self.osc_state()}
+
     def osc_command(self, body: dict[str, Any]) -> dict[str, Any]:
         command_type = str(body.get("type", "")).strip().lower()
         payload = dict(body.get("payload") or {})
+        acknowledgement_only = bool(body.get("acknowledgement_only", False)) and command_type == "track_tcp"
         if command_type in {"track_tcp", "move_tcp"}:
             result = self.osc_servo.submit_absolute_target(body, mode=command_type)
         elif command_type in {"hold", "stop"}:
@@ -796,34 +803,126 @@ class OperationalSpaceController:
             result = self.execute(token, {"type": "joint_target", **payload}, body.get("timeout"))
         else:
             raise ValueError("OSC command type must be track_tcp, move_tcp, hold, stop, freedrive, gripper, or joint_target")
-        return {"ok": bool(result.get("ok", result.get("accepted", False))), "result": result, "state": self.osc_state()}
+        response = {"ok": bool(result.get("ok", result.get("accepted", False))), "result": result}
+        # Continuous target updates can arrive at the servo rate.  Returning
+        # the full state (including raw CAN feedback) for every update turns
+        # command acknowledgement into the bottleneck.  Clients opting into
+        # this compact response consume the normal /api/osc/state snapshot.
+        if not acknowledgement_only:
+            response["state"] = self.osc_state()
+        return response
 
     def osc_state(self) -> dict[str, Any]:
         servo = dict(self.osc_servo.status())
         # Deliberately exclude every legacy clutch/input-adapter concept.
         for key in ("clutch_active", "anchor_id", "relative_pose", "tcp_anchor", "input_source", "pose_mapping_verified"):
             servo.pop(key, None)
+        raw_session = servo.get("session")
+        session = (
+            {key: value for key, value in raw_session.items() if key != "input_source"}
+            if isinstance(raw_session, dict) else raw_session
+        )
         snapshot = self.status()
         current_tcp = None
         solver = dict((servo.get("last_result") or {}).get("solver") or {})
         if isinstance(solver.get("tcp"), dict):
-            current_tcp = solver["tcp"]
+            try:
+                current_tcp = OperationalSpaceServo._pose_from_tcp(solver["tcp"])
+            except (TypeError, ValueError):
+                current_tcp = None
+        target_tcp = servo.get("reference_pose")
+        tcp_tracking_error = self._tcp_tracking_error(current_tcp, target_tcp)
+        raw_diagnostics = dict(servo.get("diagnostics") or {})
+        last_result = dict(servo.get("last_result") or {})
+        last_output = dict(servo.get("last_output") or {})
+        execution_mode = str((session or {}).get("execution_mode") or "shadow")
+        shadow = execution_mode == "shadow"
+        pink = dict(last_result.get("solver") or {})
+        gate = {
+            "status": last_output.get("status", "held"),
+            "accepted": bool(last_result.get("ok", False)),
+            "limited": bool(last_result.get("gate_limited", False)),
+            "reason": last_result.get("gate_reason"),
+        }
+        diagnostics = {
+            "loop_count": raw_diagnostics.get("loop_count", 0),
+            "tcp_error": tcp_tracking_error,
+            "pink": pink,
+            "ruckig": last_result.get("ruckig"),
+            "safety_gate": gate,
+            "timing": raw_diagnostics.get("timing", {}),
+            "trajectory_state": raw_diagnostics.get("trajectory_state"),
+            "trajectory_brake_reason": raw_diagnostics.get("trajectory_brake_reason"),
+        }
+        recent_batches = list(raw_diagnostics.get("recent_cpv_batches") or [])
+        observed_joints = last_output.get("final_joint_target_rad") if shadow else (snapshot.get("robot") or {}).get("joint_angles_rad")
         return {
+            "schema_version": "nero.osc.v2",
             "state_sequence": servo.get("state_sequence", 0),
-            "session": servo.get("session"),
-            "current_tcp_pose": current_tcp,
-            "target_tcp_pose": servo.get("reference_pose"),
-            "intent": servo.get("intent"),
-            "last_result": servo.get("last_result"),
+            "session": session,
+            "command": {
+                "target_tcp": target_tcp,
+                "final_joint_target_rad": last_output.get("final_joint_target_rad"),
+                "final_joint_velocity_rad_s": last_output.get("final_joint_velocity_rad_s"),
+                "sequence": last_output.get("sequence", (session or {}).get("sequence", 0)),
+                "epoch": last_output.get("epoch", raw_diagnostics.get("motion_epoch")),
+                "output_status": last_output.get("status", "held"),
+            },
+            "execution": {
+                "mode": execution_mode,
+                "commanded_joint_state_rad": last_output.get("final_joint_target_rad"),
+                "observed_joint_state_rad": observed_joints,
+                "observed_source": "simulated_final_output" if shadow else "measured_can_feedback",
+                "output_count": raw_diagnostics.get("output_count", 0),
+                "accepting_targets": bool(servo.get("input_enabled")),
+                "current_tcp_pose": current_tcp,
+            },
+            "diagnostics": diagnostics,
+            "transport": {
+                "connected": bool((snapshot.get("control") or {}).get("connected")),
+                "reason": (snapshot.get("control") or {}).get("reason"),
+                "can_health": snapshot.get("feedback_ready"),
+                "latest_hardware_feedback": snapshot.get("robot"),
+                "participation": "not_participating" if shadow else "active",
+                "cpv_dispatch_count": raw_diagnostics.get("cpv_dispatch_count", 0),
+                "last_cpv_dispatch": None if shadow else (recent_batches[-1] if recent_batches else None),
+            },
             "solver": servo.get("solver"),
             "workspace": servo.get("workspace"),
-            "diagnostics": servo.get("diagnostics"),
-            "control": snapshot.get("control"),
-            "robot": snapshot.get("robot"),
+            "robot": snapshot.get("robot") or (snapshot.get("control") or {}).get("robot"),
             "gripper": snapshot.get("gripper"),
             "authority": self.authority_status(snapshot.get("control")),
             "active_action": snapshot.get("active_action"),
-            "feedback_ready": snapshot.get("feedback_ready"),
+        }
+
+    @staticmethod
+    def _tcp_tracking_error(current: Any, target: Any) -> dict[str, Any] | None:
+        """Return base-frame target-minus-current TCP error, when both poses exist."""
+        if not isinstance(current, dict) or not isinstance(target, dict):
+            return None
+        try:
+            current_position = [float(value) for value in current["position_m"]]
+            target_position = [float(value) for value in target["position_m"]]
+            current_orientation = [float(value) for value in current["orientation_xyzw"]]
+            target_orientation = [float(value) for value in target["orientation_xyzw"]]
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (len(current_position), len(target_position), len(current_orientation), len(target_orientation)) != (3, 3, 4, 4):
+            return None
+        values = current_position + target_position + current_orientation + target_orientation
+        if not all(math.isfinite(value) for value in values):
+            return None
+        current_norm = math.sqrt(sum(value * value for value in current_orientation))
+        target_norm = math.sqrt(sum(value * value for value in target_orientation))
+        if current_norm < 1e-9 or target_norm < 1e-9:
+            return None
+        dot = abs(sum(a * b for a, b in zip(current_orientation, target_orientation)) / (current_norm * target_norm))
+        orientation_angle = 2.0 * math.acos(max(-1.0, min(1.0, dot)))
+        position_vector = [target_position[index] - current_position[index] for index in range(3)]
+        return {
+            "position_vector_m": position_vector,
+            "position_norm_m": math.sqrt(sum(value * value for value in position_vector)),
+            "orientation_angle_rad": orientation_angle,
         }
 
     def handoff_to_console(self, reason: str = "operator returned to the control console") -> dict[str, Any]:
@@ -1357,6 +1456,18 @@ class OperationalSpaceController:
                 self.robot.request_preempt(reason)
                 result = self.robot.hold_follower_without_position_target(reason).to_dict()
                 self._log("lease_expired_hold", owner=expired.owner, result=result)
+            # Browser/PICO adapters are not trusted to remain scheduled when
+            # a page is hidden, reloaded, or the network drops.  Their OSC
+            # heartbeat is therefore a real ownership lease: terminate the
+            # session through the same official Follower/HOLD path rather
+            # than leaving an ACTIVE session waiting for a later reconnect.
+            if self.osc_servo.heartbeat_expired():
+                reason = "OSC session heartbeat expired"
+                try:
+                    result = self.hold(reason)
+                    self._log("osc_heartbeat_expired_hold", result=result)
+                except Exception as exc:
+                    self._log("osc_heartbeat_expired_hold_failed", error=f"{type(exc).__name__}: {exc}")
 
     def _log(self, record_type: str, **payload: Any) -> None:
         with self._log_lock:

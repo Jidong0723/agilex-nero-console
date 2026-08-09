@@ -6,14 +6,15 @@
     "timeout_s": 10.0,
     "startup_timeout_s": 12.0,
     "dt_s": 0.02,
+    "direct_pink_cpv_position": true,
     "ruckig_target_horizon_s": 0.1,
-    "ruckig_max_acceleration": 2.0,
+    "ruckig_max_acceleration": 5.0,
     "ruckig_max_jerk": 20.0,
-    "posture_cost": 0.05,
+    "posture_cost": 0.005,
     "damping_cost": 0.05,
-    "frame_position_cost": 10.0,
+    "frame_position_cost": 1.0,
     "frame_orientation_cost": 1.0,
-    "frame_gain": 0.1,
+    "frame_gain": 1.0,
     "feedback_limit_tolerance_rad": 0.05,
     "hold_velocity_epsilon_rad_s": 0.005,
     "hold_acceleration_epsilon_rad_s2": 0.02,
@@ -39,7 +40,7 @@
   "limits": {
     "linear_speed_m_s": 0.06,
     "angular_speed_rad_s": 0.45,
-    "joint_speed_rad_s": 0.45,
+    "joint_speed_rad_s": 2.0,
     "velocity_error_warning_rad_s": 0.10,
     "velocity_error_brake_rad_s": 0.25,
     "velocity_error_fault_rad_s": 0.45,
@@ -47,7 +48,7 @@
     "feedback_soft_stale_s": 0.06,
     "feedback_hard_stale_s": 0.15,
     "solver_stale_s": 0.10,
-    "max_stale_velocity_repeats": 3,
+    "max_stale_velocity_repeats": 1,
     "input_filter_alpha": 0.35,
     "deadman_timeout_s": 0.25,
     "workspace_min_m": [-0.45, -0.45, -0.01],
@@ -67,7 +68,8 @@
   "safety_supervisor": {
     "fixed_model_margin_rad": [0.03, 0.03, 0.03, 0.025, 0.03, 0.02, 0.02],
     "controller_stop_reserve_rad": [0.02, 0.02, 0.02, 0.02, 0.02, 0.015, 0.015],
-    "controller_response_delay_s": 0.04
+    "controller_response_delay_s": 0.04,
+    "feedback_limit_tolerance_rad": 0.05
   },
   "runtime": {
     "control_hz": 50,
