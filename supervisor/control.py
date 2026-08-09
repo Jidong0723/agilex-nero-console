@@ -19,6 +19,9 @@ from nero_backend.robot import NeroRobot
 from motion.safety import arm_status_is_no_solution_only
 from shared.schemas import jsonable, now_iso
 from motion.teleop import OperationalSpaceServo
+from .pi05_adapter import Pi05InputAdapter
+from .pico_adapter import PicoInputAdapter
+from .camera_resource import SharedCameraResource
 
 
 GRIPPER_TIP_CANDIDATE_OFFSET_M = (0.175, 0.0, -0.0235)
@@ -176,6 +179,11 @@ class OperationalSpaceController:
         # Legacy adapters and callers retain this name, but it is the same
         # single OSC servo instance, never a second control loop.
         self.teleop = self.osc_servo
+        pi05_path = Path(__file__).resolve().parents[1] / "config" / "pi05.json"
+        pi05_config = json.loads(pi05_path.read_text(encoding="utf-8"))
+        self.cameras = SharedCameraResource(pi05_config["cameras"])
+        self.pi05 = Pi05InputAdapter(self, pi05_path, self.cameras)
+        self.pico = PicoInputAdapter(self, dict(config_data.get("pico_adapter") or {}))
 
     # ---- Sole transport-owner entry points ---------------------------------
     # Teleop and HTTP handlers deliberately use these methods rather than the
@@ -505,6 +513,9 @@ class OperationalSpaceController:
 
     def close(self) -> dict[str, Any]:
         self._running.clear()
+        self.pi05.close()
+        self.cameras.close()
+        self.pico.disconnected("control service shutdown")
         self.teleop.stop_session("control service shutdown")
         if self._status_monitor is not None and self._status_monitor is not threading.current_thread():
             self._status_monitor.join(timeout=1.0)
@@ -768,7 +779,13 @@ class OperationalSpaceController:
         return {"ok": True, "state": self.osc_state(), "session": result.get("session", {})}
 
     def osc_stop(self, reason: str = "OSC session stopped") -> dict[str, Any]:
-        result = self.hold(reason)
+        session = self.osc_servo.status().get("session") or {}
+        if session.get("state") == "ACTIVE" and session.get("execution_mode") == "shadow":
+            stopped = self.osc_servo.stop_session(reason)
+            result = {"ok": True, "reason": reason, "robot_commands_sent": False,
+                      "handoff": stopped.get("handoff", {})}
+        else:
+            result = self.hold(reason)
         return {"ok": bool(result.get("ok")), "result": result, "state": self.osc_state()}
 
     def osc_heartbeat(self, client_id: str, session_id: str) -> dict[str, Any]:
@@ -783,7 +800,9 @@ class OperationalSpaceController:
         if command_type in {"track_tcp", "move_tcp"}:
             result = self.osc_servo.submit_absolute_target(body, mode=command_type)
         elif command_type in {"hold", "stop"}:
-            result = self.hold(str(payload.get("reason", "OSC HOLD requested")))
+            reason = str(payload.get("reason", "OSC HOLD requested"))
+            session = self.osc_servo.status().get("session") or {}
+            result = self.osc_servo.request_shadow_hold(reason) if session.get("execution_mode") == "shadow" else self.hold(reason)
         elif command_type == "freedrive":
             result = self.freedrive(
                 str(payload.get("reason", "OSC FREEDRIVE requested")),
@@ -894,6 +913,61 @@ class OperationalSpaceController:
             "authority": self.authority_status(snapshot.get("control")),
             "active_action": snapshot.get("active_action"),
         }
+
+    # π0.5 stays outside OSC: this adapter reads OSC state and only returns
+    # standard OSC commands.  It never receives a transport/robot handle.
+    def pi05_state(self) -> dict[str, Any]:
+        return self.pi05.snapshot()
+
+    def pi05_update_config(self, body: dict[str, Any]) -> dict[str, Any]:
+        return self.pi05.update_config(body)
+
+    def pi05_activate_cameras(self) -> dict[str, Any]:
+        return self.cameras.activate()
+
+    def pi05_start(self, session_id: str, client_id: str) -> dict[str, Any]:
+        return self.pi05.start(session_id, client_id)
+
+    def pi05_stop(self, reason: str = "pi05 adapter stopped") -> dict[str, Any]:
+        return self.pi05.stop(reason)
+
+    def pi05_camera_devices(self) -> list[dict[str, Any]]:
+        return self.cameras.devices()
+
+    def pi05_frame_jpeg(self, source: str) -> bytes | None:
+        return self.cameras.frame_jpeg(source)
+
+    def camera_state(self) -> dict[str, Any]: return self.cameras.snapshot()
+    def camera_update_config(self, body: dict[str, Any]) -> dict[str, Any]: return self.cameras.update_config(body.get("cameras", body))
+    def camera_activate(self) -> dict[str, Any]: return self.cameras.activate()
+    def camera_deactivate(self) -> dict[str, Any]:
+        # π0.5 consumes the shared frames; stopping it first prevents a policy
+        # request from racing a released OpenCV capture.
+        if self.pi05.snapshot().get("state") == "RUNNING": self.pi05.stop("cameras closed by operator")
+        return self.cameras.deactivate()
+
+    # PICO is an external input adapter.  Its status has its own endpoint and
+    # is deliberately not folded into the public OSC state snapshot.
+    def pico_state(self) -> dict[str, Any]:
+        return self.pico.snapshot()
+
+    def pico_begin_pairing(self, session_id: str, client_id: str) -> None:
+        self.pico.begin_pairing(session_id, client_id)
+
+    def pico_paired(self) -> None:
+        self.pico.paired()
+
+    def pico_message(self, kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        if kind == "heartbeat":
+            self.pico.heartbeat(); return None
+        if kind == "anchor_begin": return self.pico.anchor_begin(payload)
+        if kind == "pose": return self.pico.pose(payload)
+        if kind == "gripper": return self.pico.gripper(payload.get("value", 0.0))
+        if kind in {"anchor_release", "hold"}: return self.pico.stop("PICO operator HOLD" if kind == "hold" else "PICO right Grip released")
+        raise ValueError("unsupported PICO adapter message")
+
+    def pico_disconnected(self, reason: str) -> None:
+        self.pico.disconnected(reason)
 
     @staticmethod
     def _tcp_tracking_error(current: Any, target: Any) -> dict[str, Any] | None:

@@ -24,6 +24,9 @@ from urllib.request import urlopen
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+VENDOR_ROOT = PROJECT_ROOT / "vendor"
+if str(VENDOR_ROOT) not in sys.path:
+    sys.path.insert(0, str(VENDOR_ROOT))
 
 from supervisor.instance_lock import InstanceLock  # noqa: E402
 
@@ -508,16 +511,14 @@ class PicoGateway:
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=1.0)
 
-    def create_pairing(self, session_id: str) -> dict[str, Any]:
+    def create_pairing(self, session_id: str, client_id: str) -> dict[str, Any]:
         if self._server is None:
             raise RuntimeError(self.error or "PICO WebSocket gateway is unavailable")
-        # The operator requested a fixed code so the headset APK does not
-        # need a per-session code-entry workflow. Session binding, expiry,
-        # single-connection pairing, and invalidation on stop remain active.
-        code = "1111"
+        self.runtime.require_broker().pico_begin_pairing(session_id, client_id)
+        code = f"{secrets.randbelow(1_000_000):06d}"
         expires = time.monotonic() + float(self.config.get("pair_ttl_s", 120.0))
         with self._lock:
-            self._pair = {"session_id": session_id, "code": code, "expires_monotonic": expires, "paired": False}
+            self._pair = {"session_id": session_id, "client_id": client_id, "code": code, "expires_monotonic": expires, "paired": False}
             self._connection_active = False
             self._last_input_monotonic = 0.0
         return self.status()
@@ -526,6 +527,10 @@ class PicoGateway:
         with self._lock:
             self._pair = None
             self._connection_active = False
+        try:
+            self.runtime.require_broker().pico_disconnected("PICO pairing invalidated")
+        except Exception:
+            pass
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -543,7 +548,7 @@ class PicoGateway:
                     advertised_host = "<PC-LAN-IP>"
             if not advertised_host:
                 advertised_host = host
-            return {
+            result = {
                 "enabled": bool(self.config.get("enabled", True)), "ready": self._server is not None,
                 "host": host, "port": int(self.config.get("port", 8768)),
                 "ws_url": f"ws://{advertised_host}:{int(self.config.get('port', 8768))}",
@@ -553,14 +558,27 @@ class PicoGateway:
                 "last_input_age_s": None if not self._last_input_monotonic else max(0.0, time.monotonic() - self._last_input_monotonic),
                 "error": self.error,
             }
+            if pair and not pair.get("paired"):
+                # The companion app scans this opaque local-LAN payload; OSC
+                # never receives it and it expires with the pairing record.
+                result["pair_uri"] = f"nero-pico://pair?ws={result['ws_url']}&session={pair['session_id']}&code={pair['code']}"
+            return result
 
     def _send(self, connection: Any, payload: dict[str, Any]) -> None:
         connection.send(json.dumps(payload, ensure_ascii=False))
 
+    def pair_svg(self) -> bytes | None:
+        status = self.status(); uri = status.get("pair_uri")
+        if not uri:
+            return None
+        import qrcode
+        import qrcode.image.svg
+        image = qrcode.make(uri, image_factory=qrcode.image.svg.SvgPathImage, border=1)
+        return image.to_string(encoding="utf-8")
+
     def _handle_connection(self, connection: Any) -> None:
         paired_session: str | None = None
         last_sequence = 0
-        last_anchor = 0
         try:
             raw = connection.recv(timeout=10)
             message = json.loads(raw)
@@ -581,6 +599,7 @@ class PicoGateway:
                 self._pair["paired"] = True
                 self._connection_active = True
                 paired_session = str(pair["session_id"])
+            self.runtime.require_broker().pico_paired()
             self._send(connection, {"ok": True, "type": "paired", "session_id": paired_session})
             while True:
                 raw = connection.recv(timeout=float(self.config.get("message_timeout_s", 0.25)))
@@ -593,21 +612,14 @@ class PicoGateway:
                 if sequence <= last_sequence:
                     raise PermissionError("PICO sequence is not monotonic")
                 kind = str(message.get("type", ""))
-                event = {"clutch_begin": "clutch_begin", "pose": "pose", "clutch_release": "clutch_release"}.get(kind)
-                if event is None:
-                    if kind == "heartbeat":
-                        self._send(connection, {"ok": True, "type": "heartbeat"})
-                        continue
-                    raise ValueError("unsupported PICO message type")
-                payload: dict[str, Any] = {"event": event, "sequence": sequence, "anchor_id": int(message.get("anchor_id", -1)), "pose_scale": float(message.get("pose_scale", 1.0)), "tracking_valid": bool(message.get("tracking_valid", True))}
-                if event == "pose":
-                    payload["relative_pose"] = {"position_m": message.get("relative_position_m"), "orientation_xyzw": message.get("relative_orientation_xyzw")}
-                result = self.runtime.require_broker().teleop_pico_intent(payload)
+                if kind not in {"heartbeat", "anchor_begin", "pose", "anchor_release", "gripper", "hold"}:
+                    raise ValueError("unsupported PICO adapter message type")
+                payload: dict[str, Any] = {"position_m": message.get("position_m"), "orientation_xyzw": message.get("orientation_xyzw"), "tracking_valid": bool(message.get("tracking_valid", True)), "value": message.get("value", 0.0)}
+                result = self.runtime.require_broker().pico_message(kind, payload)
                 last_sequence = sequence
-                last_anchor = int(result.get("anchor_id", payload["anchor_id"]))
                 with self._lock:
                     self._last_input_monotonic = time.monotonic()
-                self._send(connection, {"ok": True, "type": "ack", "sequence": sequence, "anchor_id": last_anchor, "data": result})
+                self._send(connection, {"ok": True, "type": "ack", "sequence": sequence, "data": result})
         except TimeoutError:
             pass
         except Exception as exc:
@@ -622,9 +634,7 @@ class PicoGateway:
                     self._pair["paired"] = False
             if paired_session:
                 try:
-                    status = self.runtime.require_broker().teleop_status()
-                    if status.get("clutch_active"):
-                        self.runtime.require_broker().teleop_pico_intent({"event": "clutch_release", "sequence": max(last_sequence + 1, int(status.get("session", {}).get("sequence", 0)) + 1), "anchor_id": int(status.get("anchor_id", last_anchor)), "pose_scale": 1.0})
+                    self.runtime.require_broker().pico_disconnected("PICO WebSocket disconnected")
                 except Exception:
                     pass
 
@@ -658,6 +668,29 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 return self._json_ok(self.broker.broker_status())
             if parsed.path == "/api/osc/state":
                 return self._json_ok(self.broker.osc_state())
+            if parsed.path == "/api/pi05/state":
+                return self._json_ok(self.broker.pi05_state())
+            if parsed.path == "/api/cameras/state":
+                return self._json_ok(self.broker.camera_state())
+            if parsed.path == "/api/adapters/pico/state":
+                result = self.broker.pico_state()
+                if self.pico_gateway is not None:
+                    result["gateway"] = self.pico_gateway.status()
+                return self._json_ok(result)
+            if parsed.path == "/api/adapters/pico/pair.svg":
+                if self.pico_gateway is None:
+                    return self.send_error(HTTPStatus.NOT_FOUND, "PICO gateway is unavailable")
+                payload = self.pico_gateway.pair_svg()
+                if payload is None:
+                    return self.send_error(HTTPStatus.NOT_FOUND, "PICO pairing QR is not available")
+                return self._send_bytes(payload, "image/svg+xml")
+            if parsed.path in {"/api/cameras/list", "/api/pi05/cameras/list"}:
+                return self._json_ok({"cameras": self.broker.pi05_camera_devices()})
+            if parsed.path in {"/api/cameras/frame/external.jpg", "/api/cameras/frame/wrist.jpg", "/api/pi05/frame/external.jpg", "/api/pi05/frame/wrist.jpg"}:
+                payload = self.broker.pi05_frame_jpeg("external" if "external" in parsed.path else "wrist")
+                if payload is None:
+                    return self.send_error(HTTPStatus.NOT_FOUND, "π0.5 camera frame is not available")
+                return self._send_bytes(payload, "image/jpeg")
             if parsed.path == "/api/teleop/kinematics":
                 return self._json_ok(self.broker.teleop_kinematics())
             return self._static(parsed.path)
@@ -689,6 +722,29 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     str(body.get("client_id", "anonymous")),
                     str(body.get("session_id", "")),
                 ))
+            if self.path == "/api/pi05/config":
+                return self._json_ok(self.broker.pi05_update_config(body))
+            if self.path in {"/api/cameras/config", "/api/pi05/cameras/config"}:
+                return self._json_ok(self.broker.camera_update_config(body))
+            if self.path in {"/api/cameras/activate", "/api/pi05/cameras/activate"}:
+                return self._json_ok(self.broker.camera_activate())
+            if self.path in {"/api/cameras/deactivate", "/api/pi05/cameras/deactivate"}:
+                return self._json_ok(self.broker.camera_deactivate())
+            if self.path == "/api/pi05/start":
+                return self._json_ok(self.broker.pi05_start(
+                    str(body.get("session_id", "")), str(body.get("client_id", "anonymous"))
+                ))
+            if self.path == "/api/pi05/stop":
+                return self._json_ok(self.broker.pi05_stop(str(body.get("reason", "pi05 adapter stopped"))))
+            if self.path == "/api/adapters/pico/pair":
+                if self.pico_gateway is None:
+                    raise RuntimeError("PICO WebSocket gateway is unavailable")
+                return self._json_ok(self.pico_gateway.create_pairing(
+                    str(body.get("session_id", "")), str(body.get("client_id", "anonymous"))))
+            if self.path == "/api/adapters/pico/disconnect":
+                if self.pico_gateway is not None:
+                    self.pico_gateway.invalidate()
+                return self._json_ok(self.broker.pico_state())
             if self.path == "/api/teleop/session/start":
                 result = self.broker.teleop_start(
                         body.get("mode"),

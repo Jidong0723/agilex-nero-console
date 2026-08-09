@@ -66,6 +66,15 @@
     "message_timeout_s": 0.25,
     "max_hz": 90,
     "max_message_bytes": 4096
+  },
+  "pico_adapter": {
+    "mapping_verified": true,
+    "translation_gain": 1.0,
+    "rotation_gain": 1.0,
+    "position_axis_map": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+    "orientation_axis_map": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+    "gripper_open_width_m": 0.095,
+    "gripper_force_n": 1.0
   }
 }
 

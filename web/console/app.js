@@ -6,17 +6,18 @@
     const legacy = $("mode");
     if (!$("execution-mode") && legacy) {
       legacy.id = "execution-mode";
-      legacy.innerHTML = '<option value="shadow">影子模式</option><option value="hardware">真机模式</option>';
+      legacy.innerHTML = '<option value="shadow">影子模式（只看虚拟机械臂）</option><option value="hardware">真机模式（控制真实机械臂）</option>';
       const label = legacy.closest("label");
       if (label) {
-        label.firstChild.textContent = "执行目标";
+        label.firstChild.textContent = "控制模式";
         const inputLabel = document.createElement("label");
-        inputLabel.innerHTML = '输入适配器<select id="input-adapter"><option value="web">WebAdapter · 网页摇杆</option></select>';
+        inputLabel.innerHTML = '控制方式<select id="input-adapter"><option value="web">网页摇杆</option><option value="pi05">π0.5 自动控制</option><option value="pico">PICO 4 Ultra 手柄遥控</option></select>';
         label.parentElement?.insertBefore(inputLabel, label.nextSibling);
       }
     }
   }
   ensureSelectionControls();
+  document.querySelector(".intent-readout span")?.replaceChildren("当前摇杆输入");
   const keys = new Set(["KeyW", "KeyS", "KeyQ", "KeyE", "KeyR", "KeyF", "KeyA", "KeyD"]);
   const clientId = (() => {
     const key = "nero.console.client.v2";
@@ -51,7 +52,87 @@
     resetPendingUntil: 0,
     keys: new Set(),
     sticks: new Map(),
+    pi05: null,
+    pi05Cameras: [],
+    pico: null,
   };
+
+  function buildPi05Card() {
+    if ($("pi05-panel")) return;
+    const panel = document.createElement("section");
+    panel.id = "pi05-panel"; panel.className = "pi05-panel hidden";
+    panel.innerHTML = `<div class="pi05-observation"><div class="pi05-head"><span class="pi05-index">01</span><div><strong>Observation</strong><small>π0.5 多模态输入</small></div></div><div class="pi05-cameras"><label>外部 RGB<input id="pi05-external-index" type="number" min="0" max="32" value="0"></label><label>腕部 RGB<input id="pi05-wrist-index" type="number" min="0" max="32" value="1"></label></div><div class="pi05-views"><div class="pi05-view"><span>外部视角</span><img id="pi05-external-frame" alt="外部 RGB 实时画面"><b id="pi05-external-preview">等待画面</b></div><div class="pi05-view"><span>腕部视角</span><img id="pi05-wrist-frame" alt="腕部 RGB 实时画面"><b id="pi05-wrist-preview">等待画面</b></div></div><label class="pi05-prompt">Prompt<textarea id="pi05-prompt" maxlength="500">place the fixed block into the fixed box</textarea></label></div><div class="pi05-arrow">→<small>推理中</small></div><div class="pi05-inference"><div class="pi05-head"><span class="pi05-index">02</span><div><strong>π0.5 Inference</strong><small>持续重规划</small></div></div><div class="pi05-orb">π</div><strong id="pi05-model-state">未连接</strong><div class="pi05-metrics"><span>状态<b id="pi05-run-state">IDLE</b></span><span>推理耗时<b id="pi05-inference-ms">--</b></span><span>生成序号<b id="pi05-chunk-length">0</b></span><span>执行动作<b id="pi05-executed">0</b></span></div><div class="pi05-actions"><button id="pi05-cameras" class="button" type="button">初始化相机</button><button id="pi05-start" class="button primary" type="button">启动 π0.5</button><button id="pi05-stop" class="button quiet" type="button">停止</button></div><p id="pi05-result" class="result">Action Chunk 将转换为绝对 TCP 目标，并只通过 OSC track_tcp 输出。</p></div>`;
+    document.querySelector(".teleop-panel")?.append(panel);
+    for (const id of ["pi05-external-index", "pi05-wrist-index"]) {
+      const input = $(id); const select = document.createElement("select");
+      select.id = id; select.setAttribute("aria-label", id.includes("external") ? "外部 RGB 相机" : "腕部 RGB 相机");
+      input?.replaceWith(select);
+    }
+    panel.querySelector(".pi05-cameras")?.insertAdjacentHTML("afterend", `<div class="camera-power"><span id="camera-power-pi05">相机状态：检查中</span><button id="camera-open-pi05" class="button" type="button">打开相机</button><button id="camera-close-pi05" class="button quiet" type="button">关闭相机</button></div>`);
+    panel.insertAdjacentHTML("afterbegin", `<section class="pi05-connection"><div class="pi05-connection-title"><span>02 · 连接状态</span><small id="pi05-connection-message">正在检测 SSH 与 OpenPI 连接</small></div><div class="pi05-connection-nodes"><article id="pi05-connection-ssh"></article><i>→</i><article id="pi05-connection-policy"></article></div><details class="pi05-help"><summary>连接帮助 <small>启动顺序与可复制命令</small></summary><div></div></details></section>`);
+    const help = panel.querySelector(".pi05-help");
+    help.innerHTML = `<summary><span>连接帮助</span><small>启动顺序与可复制命令</small></summary><div class="help-content"><article class="help-step"><div class="help-title"><b>1</b><strong>启动 NERO 控制服务</strong></div><p>确认 NERO 已通电、CANDO USB-CAN 已连接，且没有其他程序占用设备。</p><div class="command"><code>..\\neroAgilex-control-console\\run_console.cmd</code><button type="button" data-copy="..\\neroAgilex-control-console\\run_console.cmd">复制</button></div><p>打开 <a href="http://127.0.0.1:8765/" target="_blank" rel="noopener">127.0.0.1:8765</a>，确认持续显示最新 7 轴反馈。若显示 HTTP 502，通常是未通电、USB-CAN/驱动未连接、设备被占用或控制服务环境异常；先恢复有效反馈，第一个绿灯才会亮起。</p></article><article class="help-step"><div class="help-title"><b>2</b><strong>建立 SSH 本地转发</strong></div><p>在新的 PowerShell 窗口执行。输入 AutoDL 密码后保留该窗口；连接完成后仍可直接在远程终端输入命令。</p><div class="command"><code>ssh -t \`\n  -o LogLevel=QUIET \`\n  -o ServerAliveInterval=15 \`\n  -o ServerAliveCountMax=3 \`\n  -L 8000:127.0.0.1:8000 \`\n  -p 38341 \`\n  root@connect.bjb1.seetacloud.com</code><button type="button" data-copy="ssh -t \`\n  -o LogLevel=QUIET \`\n  -o ServerAliveInterval=15 \`\n  -o ServerAliveCountMax=3 \`\n  -L 8000:127.0.0.1:8000 \`\n  -p 38341 \`\n  root@connect.bjb1.seetacloud.com">复制</button></div><p>实例地址、端口或密码变更时，请使用 AutoDL 当前提供的信息。本机验证：<code>Test-NetConnection 127.0.0.1 -Port 8000</code>；看到 <code>TcpTestSucceeded : True</code> 即隧道已建立。</p></article><article class="help-step"><div class="help-title"><b>3</b><strong>启动 AutoDL π0.5 policy server</strong></div><p>在第 2 步登录后的 AutoDL 终端执行，并保持终端运行：</p><div class="command"><code>cd /root/autodl-tmp/libero_openpi_loop/openpi\nexport PATH=&quot;$HOME/.local/bin:$PATH&quot;\nexport BOTO_CONFIG=&quot;$HOME/.boto&quot;\nuv run --frozen --no-sync scripts/serve_policy.py --env LIBERO</code><button type="button" data-copy="cd /root/autodl-tmp/libero_openpi_loop/openpi\nexport PATH=&quot;$HOME/.local/bin:$PATH&quot;\nexport BOTO_CONFIG=&quot;$HOME/.boto&quot;\nuv run --frozen --no-sync scripts/serve_policy.py --env LIBERO">复制</button></div><p>SSH 仅转发端口，不会自动启动 policy server。</p></article><div class="help-ready"><strong>4. 刷新面板</strong><span>保持控制服务、SSH 隧道和 policy server 都在运行，刷新 <a href="http://127.0.0.1:8765/" target="_blank" rel="noopener">127.0.0.1:8765</a>。正常顺序：NERO 控制服务 → SSH 本地转发 → π0.5 WebSocket，三个状态均为绿色。</span></div></div>`;
+    help.querySelectorAll("[data-copy]").forEach((button) => button.addEventListener("click", async () => { await navigator.clipboard.writeText(button.dataset.copy || ""); const original = button.textContent; button.textContent = "已复制"; setTimeout(() => { button.textContent = original; }, 1200); }));
+    panel.querySelector(".pi05-inference")?.insertAdjacentHTML("beforeend", `<div class="pi05-chunk"><span>Action Chunk（首步）</span><code id="pi05-action-first">等待推理结果</code></div>`);
+    const actionControls = panel.querySelector(".pi05-actions");
+    actionControls.className = "pi05-adapter-actions";
+    panel.append(actionControls);
+    panel.querySelector(".pi05-inference .pi05-index").textContent = "03";
+    $("pi05-start").textContent = "接入 π0.5";
+    $("pi05-stop").textContent = "断开 π0.5";
+    // π0.5 follows the same compact input-adapter rhythm as the WebAdapter:
+    // input first, diagnostics beside it, connection and actions below.
+    const observation = panel.querySelector(".pi05-observation");
+    const inference = panel.querySelector(".pi05-inference");
+    const connection = panel.querySelector(".pi05-connection");
+    const chunk = panel.querySelector(".pi05-chunk");
+    observation?.querySelector(".pi05-head")?.remove();
+    const prompt = observation?.querySelector(".pi05-prompt");
+    observation?.querySelector(".pi05-views")?.after(prompt);
+    inference?.querySelector(".pi05-orb")?.remove();
+    observation?.querySelectorAll(".pi05-cameras label").forEach((label) => {
+      label.classList.add("pi05-camera-select");
+    });
+    inference?.querySelector(".pi05-index")?.remove();
+    $("pi05-cameras")?.remove();
+    if (prompt) prompt.firstChild.textContent = "任务说明";
+    const inferenceTitle = inference?.querySelector(".pi05-head strong");
+    if (inferenceTitle) inferenceTitle.textContent = "π0.5 自动控制";
+    const inferenceHint = inference?.querySelector(".pi05-head small");
+    if (inferenceHint) inferenceHint.textContent = "根据相机画面生成下一步动作";
+    const chunkTitle = chunk?.querySelector("span");
+    if (chunkTitle) chunkTitle.textContent = "下一步动作";
+    const inferenceStack = document.createElement("div");
+    inferenceStack.className = "pi05-inference-stack";
+    if (inference) inferenceStack.append(inference);
+    if (chunk) inferenceStack.append(chunk);
+    const row = document.createElement("div");
+    row.className = "pi05-adapter-row";
+    if (observation) row.append(observation);
+    row.append(inferenceStack);
+    panel.replaceChildren(row, connection, actionControls);
+    $("pi05-start").textContent = "开始自动控制";
+    $("pi05-stop").textContent = "停止自动控制";
+    [".sticks", ".intent-readout", ".keyboard-map", ".session-actions", "#pico-connection"].forEach((selector) => document.querySelector(selector)?.setAttribute("data-web-adapter", ""));
+  }
+
+  function buildPicoCard() {
+    if ($("pico-panel")) return;
+    const panel = document.createElement("section");
+    panel.id = "pico-panel"; panel.className = "pico-panel hidden";
+    panel.innerHTML = `<div class="pico-head"><span class="pi05-index">P</span><div><strong>PICO 4 Ultra</strong><small>6D 遥操输入适配器</small></div><span id="pico-state" class="badge neutral">IDLE</span></div><section class="pico-camera-resource"><strong>公共相机观测</strong><div class="pi05-cameras"><label>外部 RGB<select id="pico-external-index" aria-label="外部 RGB 相机"></select></label><label>腕部 RGB<select id="pico-wrist-index" aria-label="腕部 RGB 相机"></select></label></div><div class="pi05-views"><div class="pi05-view"><span>外部视角</span><img id="pico-external-frame" alt="外部 RGB 实时画面"><b>等待画面</b></div><div class="pi05-view"><span>腕部视角</span><img id="pico-wrist-frame" alt="腕部 RGB 实时画面"><b>等待画面</b></div></div></section><div class="pico-pair"><div id="pico-qr" class="pico-qr"><span>等待配对</span></div><div><strong>一次性配对</strong><p id="pico-url">先接入 PICO Adapter 以生成二维码。</p><code id="pico-code">------</code><small>二维码或短码有效期内仅允许一个头显接入。</small></div></div><div class="pico-status"><span>连接 <b id="pico-connected">未连接</b></span><span>追踪 <b id="pico-tracking">--</b></span><span>Anchor <b id="pico-anchor">--</b></span><span>夹爪 <b id="pico-gripper">--</b></span></div><div class="pico-controls"><strong>手柄映射</strong><p>右手 Grip 按住：定义 Anchor 并控制 TCP；右手 Trigger：夹爪开度；左手 Menu：安全 HOLD。松开 Grip、追踪丢失或断连都会进入 HOLD。</p></div><div class="pico-actions"><button id="pico-start" class="button primary" type="button">接入 PICO Adapter</button><button id="pico-stop" class="button quiet" type="button">断开 PICO Adapter</button></div><p id="pico-result" class="result">PICO 只向 OSC 提交绝对 TCP 与标准夹爪/HOLD 指令。</p>`;
+    document.querySelector(".teleop-panel")?.append(panel);
+    panel.querySelector(".pico-camera-resource .pi05-cameras")?.insertAdjacentHTML("afterend", `<div class="camera-power"><span id="camera-power-pico">相机状态：检查中</span><button id="camera-open-pico" class="button" type="button">打开相机</button><button id="camera-close-pico" class="button quiet" type="button">关闭相机</button></div>`);
+    const picoSubtitle = panel.querySelector(".pico-head small");
+    if (picoSubtitle) picoSubtitle.textContent = "用 PICO 手柄控制机械臂";
+    const picoAnchor = $("pico-anchor")?.parentElement;
+    if (picoAnchor) picoAnchor.firstChild.textContent = "控制起点 ";
+    const picoControls = panel.querySelector(".pico-controls");
+    if (picoControls) picoControls.innerHTML = "<strong>怎么控制</strong><p>按住右手 Grip：移动机械臂；右手 Trigger：开合夹爪；左手 Menu：立即停止。松开 Grip、追踪丢失或断开连接时，机械臂会自动停止。</p>";
+    $("pico-start").textContent = "连接 PICO 手柄";
+    $("pico-stop").textContent = "断开 PICO 手柄";
+    [".sticks", ".intent-readout", ".keyboard-map", ".session-actions", "#pico-connection"].forEach((selector) => document.querySelector(selector)?.setAttribute("data-web-adapter", ""));
+  }
 
   const canvas = $("workspace");
   const ctx = canvas?.getContext("2d");
@@ -157,6 +238,117 @@
     state.oscAnchor = null;
     state.intentPending = false;
     resetInput(false);
+  }
+
+  const selectedAdapter = () => $("input-adapter")?.value || "web";
+  function applyAdapterSelection() {
+    const pi = selectedAdapter() === "pi05";
+    const pico = selectedAdapter() === "pico";
+    document.querySelectorAll("[data-web-adapter]").forEach((element) => element.classList.toggle("hidden", pi || pico));
+    $("pi05-panel")?.classList.toggle("hidden", !pi);
+    $("pico-panel")?.classList.toggle("hidden", !pico);
+    const note = document.querySelector(".teleop-panel .section-note");
+    if (note) note.textContent = pi ? "π0.5 将双相机观测与 OSC 状态送入 OpenPI，并把 Action Chunk 转换为绝对 TCP 目标。" : pico ? "PICO Adapter 在 OSC 外部处理 Anchor，并只向 OSC 发送绝对 TCP 目标。" : "WebAdapter 将网页摇杆增量转换为基座系绝对 TCP 目标，并接入 OSC。";
+    if (note) note.textContent = pi ? "π0.5 会查看两路相机画面，自动生成并执行下一步机械臂动作。" : pico ? "用 PICO 手柄遥控机械臂：按住右手 Grip 才会移动，松开即停止。" : "用网页摇杆控制机械臂；系统会自动把摇杆动作变成机械臂末端的目标位置。";
+    if (pi || pico) {
+      void loadSharedCameras();
+      if (!state.cameras?.ready) void activateSharedCameras();
+    }
+    render();
+  }
+
+  function renderPico() {
+    const pico = state.pico || {}; const gateway = pico.gateway || {};
+    $("pico-state").textContent = pico.state || "IDLE";
+    $("pico-connected").textContent = pico.connected ? "已连接" : "未连接";
+    $("pico-tracking").textContent = pico.tracking_valid ? "有效" : "--";
+    $("pico-anchor").textContent = pico.anchor_active ? "已定义" : "未定义";
+    $("pico-gripper").textContent = Number.isFinite(Number(pico.gripper_position)) ? `${Math.round(Number(pico.gripper_position) * 100)}%` : "--";
+    $("pico-code").textContent = gateway.pair_code || "------";
+    $("pico-url").textContent = gateway.ws_url ? `头显将连接 ${gateway.ws_url}` : "先接入 PICO Adapter 以生成二维码。";
+    $("pico-result").textContent = pico.last_error || gateway.error || (gateway.paired ? "PICO 已配对；按住右手 Grip 开始定义 Anchor。" : "使用头显 App 扫描此处二维码或输入短码。");
+    // A compact visual token remains useful even before the companion scanner
+    // is available; the app also accepts the displayed short code.
+    const qr = $("pico-qr"); if (qr) qr.innerHTML = gateway.pair_code ? `<img src="/api/adapters/pico/pair.svg?v=${encodeURIComponent(gateway.pair_code)}" alt="PICO 一次性配对二维码">` : "等待配对";
+    $("pico-start").disabled = gateway.paired || session().state === "ACTIVE" && selectedAdapter() !== "pico";
+    $("pico-stop").disabled = !gateway.session_id && pico.state === "IDLE";
+    $("pico-start").textContent = "连接 PICO 手柄";
+    $("pico-stop").textContent = "断开 PICO 手柄";
+    if (!gateway.ws_url) $("pico-url").textContent = "点击“连接 PICO 手柄”后，会在这里生成二维码。";
+    if (!pico.last_error && !gateway.error) $("pico-result").textContent = gateway.paired ? "已配对。按住右手 Grip 后再移动手柄，即可控制机械臂。" : "在头显中扫描二维码，或输入这里显示的短码。";
+  }
+
+  async function startPico() {
+    $("pico-start").disabled = true; phase("正在接入 PICO Adapter…");
+    try {
+      let current = session();
+      if (current.state !== "ACTIVE") {
+        const started = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId }, 10000);
+        state.teleop = started.state; current = session();
+      }
+      state.pico = await api("/api/adapters/pico/pair", "POST", { session_id: current.id, client_id: clientId }, 10000);
+      phase("PICO 配对已创建；在头显中扫描二维码。 "); render();
+    } catch (error) { phase(`PICO 接入失败：${error.message}`, true); }
+    finally { $("pico-start").disabled = false; }
+  }
+
+  async function stopPico() {
+    try { state.pico = await api("/api/adapters/pico/disconnect", "POST", { reason: "Console disconnected PICO" }); state.teleop = (await api("/api/osc/session/stop", "POST", { reason: "PICO Adapter disconnected" })).state; render(); }
+    catch (error) { phase(`PICO 断开失败：${error.message}`, true); }
+  }
+
+  function renderPi05() {
+    const pi = state.pi05 || {}; const config = pi.config || {}; const cameras = config.cameras || {}; const model = config.model || {};
+    if ($("pi05-external-index") && document.activeElement !== $("pi05-external-index")) $("pi05-external-index").value = cameras.external?.index ?? 0;
+    if ($("pi05-wrist-index") && document.activeElement !== $("pi05-wrist-index")) $("pi05-wrist-index").value = cameras.wrist?.index ?? 1;
+    if ($("pi05-prompt") && document.activeElement !== $("pi05-prompt")) $("pi05-prompt").value = model.prompt || pi.prompt || "";
+    $("pi05-model-state").textContent = pi.model_state || "UNKNOWN";
+    $("pi05-run-state").textContent = pi.state || "IDLE";
+    $("pi05-inference-ms").textContent = Number.isFinite(Number(pi.inference_ms)) ? `${Number(pi.inference_ms).toFixed(0)} ms` : "--";
+    $("pi05-chunk-length").textContent = String(pi.action_chunk_length || 0);
+    $("pi05-executed").textContent = String(pi.executed_steps || 0);
+    const firstAction = Array.isArray(pi.action_chunk) && Array.isArray(pi.action_chunk[0]) ? pi.action_chunk[0] : null;
+    $("pi05-action-first").textContent = firstAction ? `[${firstAction.map((value) => Number(value).toFixed(3)).join(", ")}]` : "等待推理结果";
+    const result = $("pi05-result"); if (result) result.textContent = pi.last_error || "";
+    $("pi05-external-preview").textContent = pi.camera_ready ? "模型输入 224 × 224 RGB" : "等待画面";
+    $("pi05-wrist-preview").textContent = pi.camera_ready ? "模型输入 224 × 224 RGB" : "等待画面";
+    if (pi.frame_version) {
+      $("pi05-external-frame").src = `/api/pi05/frame/external.jpg?v=${pi.frame_version}`;
+      $("pi05-wrist-frame").src = `/api/pi05/frame/wrist.jpg?v=${pi.frame_version}`;
+      $("pi05-external-frame").classList.add("ready"); $("pi05-wrist-frame").classList.add("ready");
+    }
+    if ($("pi05-cameras")) $("pi05-cameras").disabled = pi.state === "RUNNING";
+    $("pi05-start").disabled = pi.state === "RUNNING" || !pi.camera_ready;
+    $("pi05-stop").disabled = pi.state !== "RUNNING" && pi.state !== "ERROR";
+    $("pi05-start").textContent = "开始自动控制";
+    $("pi05-stop").textContent = "停止自动控制";
+    renderPi05Connections(pi.connections || {});
+  }
+
+  function renderPi05Connections(connections) {
+    const map = [["pi05-connection-ssh", connections.ssh_forward, "SSH 本地转发", "127.0.0.1:8000"], ["pi05-connection-policy", connections.policy, "π0.5 WebSocket", "OpenPI policy server"]];
+    map.forEach(([id, item, fallbackLabel, fallbackEndpoint]) => { const element = $(id); if (!element) return; const stateName = item?.state || "bad"; element.className = `pi05-connection-node ${stateName}`; element.innerHTML = `<b>${item?.label || fallbackLabel}</b><small>${item?.endpoint || fallbackEndpoint}</small><em>${item?.message || "等待连接检测"}</em>`; });
+    const message = $("pi05-connection-message"); if (message) message.textContent = connections.policy?.state === "ok" ? "连接完成，可以接入 π0.5" : "请依次检查 OSC 服务、SSH 转发和 OpenPI policy server";
+  }
+
+  function cameraConfigBody() { return { cameras: {
+    external: { index: Number($(selectedAdapter() === "pico" ? "pico-external-index" : "pi05-external-index")?.value), width: 640, height: 480 },
+    wrist: { index: Number($(selectedAdapter() === "pico" ? "pico-wrist-index" : "pi05-wrist-index")?.value), width: 640, height: 480 },
+  }}; }
+
+  async function loadSharedCameras() {
+    try {
+      const [result, cameras] = await Promise.all([api("/api/cameras/list", "GET", undefined, 12000), api("/api/cameras/state", "GET", undefined, 12000)]); state.pi05Cameras = result.cameras || []; state.cameras = cameras;
+      const config = cameras.config || {}; const fill = (id, selected) => { const select = $(id); if (!select) return; select.innerHTML = state.pi05Cameras.map((camera) => `<option value="${Number(camera.index)}">${Number(camera.index)} · ${String(camera.name || "Camera")}</option>`).join("") || `<option value="${selected}">${selected} · 未检测到相机</option>`; select.value = String(selected); select.onchange = activateSharedCameras; };
+      ["pi05-external-index", "pico-external-index"].forEach((id) => fill(id, config.external?.index ?? 0));
+      ["pi05-wrist-index", "pico-wrist-index"].forEach((id) => fill(id, config.wrist?.index ?? 1));
+    } catch (error) { const result = $("pi05-result"); if (result) result.textContent = `相机列表读取失败：${error.message}`; }
+  }
+
+  function refreshPi05Frames() {
+    if ((selectedAdapter() !== "pi05" && selectedAdapter() !== "pico") || !state.cameras?.ready) return;
+    const stamp = Date.now();
+    ["pi05", "pico"].forEach((prefix) => { const external = $(`${prefix}-external-frame`), wrist = $(`${prefix}-wrist-frame`); if (external) { external.src = `/api/cameras/frame/external.jpg?t=${stamp}`; external.classList.add("ready"); } if (wrist) { wrist.src = `/api/cameras/frame/wrist.jpg?t=${stamp}`; wrist.classList.add("ready"); } });
   }
 
   function nextOscSequence() {
@@ -484,7 +676,8 @@
     // A successful /api/status response already proves that the service is
     // online. This flag describes only the USB-CAN robot transport.
     badge("connection", transport.connected ? "\u786c\u4ef6\u5df2\u8fde\u63a5" : "\u786c\u4ef6\u672a\u8fde\u63a5", transport.connected ? "ok" : "warn");
-    const modeLabel = current.state === "ACTIVE" ? `WebAdapter + ${isShadowSession(current) ? "影子" : "真机"}` : "未接入";
+    const adapterName = selectedAdapter() === "pi05" ? "π0.5" : selectedAdapter() === "pico" ? "PICO 4 Ultra" : "WebAdapter";
+    const modeLabel = current.state === "ACTIVE" ? `${adapterName} + ${isShadowSession(current) ? "影子" : "真机"}` : "未接入";
     badge("teleop-mode", modeLabel, current.state === "ACTIVE" && isShadowSession(current) ? "ok" : current.state === "ACTIVE" ? "warn" : "neutral");
     badge("session-state", current.state || "IDLE", current.state === "ACTIVE" ? "ok" : "neutral");
     badge("feedback-state", Number.isFinite(finite(timing.feedback_age_s, NaN)) ? `反馈 ${Math.round(timing.feedback_age_s * 1000)} ms` : "反馈 --", transport.can_health?.ok ? "ok" : "warn");
@@ -547,8 +740,14 @@
       $("reanchor").disabled = !active || diagnostic.trajectory_state === "BRAKING" || diagnostic.trajectory_state === "FAULT";
       $("reanchor").textContent = state.webAdapterActive ? "重锚定 WebAdapter" : "初始化 WebAdapter";
     }
+    $("start").textContent = active && !state.webAdapterActive ? "重新连接网页摇杆" : "连接网页摇杆";
+    $("stop").textContent = "断开网页摇杆";
+    if ($("reanchor")) $("reanchor").textContent = "重新对齐摇杆";
     const picoLine = $("pico-connection");
+    document.querySelector(".intent-readout span")?.replaceChildren("当前摇杆输入");
+    if (picoLine) picoLine.textContent = "网页摇杆的动作会自动换算为机械臂末端的目标位置。";
     if (picoLine) picoLine.textContent = "WebAdapter 在浏览器内将摇杆增量转换为基座系绝对 TCP 目标，并只调用 OSC track_tcp。";
+    if (picoLine) picoLine.textContent = "网页摇杆的动作会自动换算为机械臂末端的目标位置。";
     $("hold").disabled = !transport.connected;
     $("freedrive").disabled = !transport.connected;
     // Reset is served by the independent localhost watchdog and sends no
@@ -557,6 +756,9 @@
     $("reset-control").disabled = Date.now() < state.resetPendingUntil;
     drawWorkspace(teleop);
     renderHierarchy(teleop, broker, transport, robot, diagnostic, current);
+    renderPi05();
+    renderPico();
+    renderCameraControls();
   }
 
   async function refresh() {
@@ -566,12 +768,14 @@
     const resetPending = Date.now() < state.resetPendingUntil;
     const statusTimeout = resetPending ? 5000 : 900;
     try {
-      const osc = await api("/api/osc/state", "GET", undefined, statusTimeout);
+      const [osc, pi05, pico] = await Promise.all([api("/api/osc/state", "GET", undefined, statusTimeout), api("/api/pi05/state", "GET", undefined, statusTimeout), api("/api/adapters/pico/state", "GET", undefined, statusTimeout)]);
       if (generation !== state.requestGeneration) return;
       const sequence = Number(osc.state_sequence || osc.session?.sequence || 0);
       if (sequence < state.latestSequence) return;
       state.latestSequence = sequence;
       state.teleop = osc;
+      state.pi05 = pi05;
+      state.pico = pico;
       if (resetPending) {
         state.resetPendingUntil = 0;
         $("maintenance-result").textContent = "\u63a7\u5236\u670d\u52a1\u5df2\u6062\u590d\u3002";
@@ -622,6 +826,59 @@
     state.requestGeneration += 1;
     resetWebAdapter();
     try { state.teleop = (await api("/api/osc/session/stop", "POST", { reason: "WebAdapter disconnected" })).state; render(); } catch (error) { phase(`WebAdapter 断开失败：${error.message}`, true); }
+  }
+
+  function pi05ConfigBody() {
+    return { model: { prompt: $("pi05-prompt")?.value || "" }, cameras: {
+      external: { index: Number($("pi05-external-index")?.value), width: 640, height: 480 },
+      wrist: { index: Number($("pi05-wrist-index")?.value), width: 640, height: 480 },
+    }};
+  }
+
+  async function activateSharedCameras() {
+    try {
+      await api("/api/cameras/config", "POST", cameraConfigBody());
+      state.cameras = await api("/api/cameras/activate", "POST", {} , 10000);
+      renderPi05();
+    } catch (error) { phase(`公共相机接入失败：${error.message}`, true); await refresh(); }
+  }
+
+  async function deactivateSharedCameras() {
+    try {
+      state.cameras = await api("/api/cameras/deactivate", "POST", {}, 10000);
+      ["pi05", "pico"].forEach((prefix) => { ["external", "wrist"].forEach((source) => { const image = $(`${prefix}-${source}-frame`); if (image) { image.removeAttribute("src"); image.classList.remove("ready"); } }); });
+      render();
+    } catch (error) { phase(`关闭相机失败：${error.message}`, true); }
+  }
+
+  function renderCameraControls() {
+    const ready = Boolean(state.cameras?.ready);
+    ["pi05", "pico"].forEach((scope) => {
+      const status = $(`camera-power-${scope}`); if (status) status.textContent = ready ? "相机已打开" : "相机已关闭";
+      const open = $(`camera-open-${scope}`), close = $(`camera-close-${scope}`);
+      if (open) open.disabled = ready; if (close) close.disabled = !ready;
+    });
+  }
+
+  async function startPi05() {
+    try {
+      let current = session();
+      if (current.state !== "ACTIVE" || current.client_id !== clientId) {
+        const result = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId }, 10000);
+        state.teleop = result.state; state.latestSequence = Number(result.state?.state_sequence || 0); current = session();
+      }
+      await api("/api/pi05/config", "POST", pi05ConfigBody());
+      state.pi05 = await api("/api/pi05/start", "POST", { session_id: current.id, client_id: clientId }, 10000);
+      phase("π0.5 已接入 OSC；持续推理与 Action Chunk 执行中"); render();
+    } catch (error) { phase(`π0.5 启动失败：${error.message}`, true); await refresh(); }
+  }
+
+  async function stopPi05() {
+    try {
+      state.pi05 = await api("/api/pi05/stop", "POST", { reason: "operator stopped pi05 adapter" });
+      const result = await api("/api/osc/session/stop", "POST", { reason: "pi05 adapter stopped" });
+      state.teleop = result.state; render();
+    } catch (error) { phase(`π0.5 停止失败：${error.message}`, true); }
   }
 
   function stopWebAdapterForPageExit(reason) {
@@ -744,6 +1001,10 @@
 
   attachStick("xy");
   attachStick("right");
+  buildPi05Card();
+  buildPicoCard();
+  void loadSharedCameras();
+  $("input-adapter")?.addEventListener("change", applyAdapterSelection);
   $("execution-mode")?.addEventListener("change", () => { resetWebAdapter(); render(); });
   $("right-mode")?.addEventListener("change", () => { state.rightMode = $("right-mode").value; resetInput(true); updateRightLabels(); });
   $("scale")?.addEventListener("input", () => { $("scale-value").textContent = `${Math.round(Number($("scale").value) * 100)}%`; });
@@ -756,6 +1017,15 @@
   $("start").onclick = connectWebAdapter;
   $("stop").onclick = disconnectWebAdapter;
   $("reanchor")?.addEventListener("click", () => reanchorWebAdapter().catch((error) => phase(`WebAdapter 重锚定失败：${error.message}`, true)));
+  $("pi05-cameras")?.addEventListener("click", activateSharedCameras);
+  $("pi05-start")?.addEventListener("click", startPi05);
+  $("pi05-stop")?.addEventListener("click", stopPi05);
+  $("pico-start")?.addEventListener("click", startPico);
+  $("pico-stop")?.addEventListener("click", stopPico);
+  ["pi05", "pico"].forEach((scope) => {
+    $(`camera-open-${scope}`)?.addEventListener("click", activateSharedCameras);
+    $(`camera-close-${scope}`)?.addEventListener("click", deactivateSharedCameras);
+  });
   const oscCommand = (type, payload = {}) => {
     const current = session();
     const sequence = nextOscSequence();
@@ -798,8 +1068,10 @@
   };
   updateRightLabels();
   updateInputView();
+  applyAdapterSelection();
   refresh();
   setInterval(refresh, 500);
+  setInterval(refreshPi05Frames, 200);
   setInterval(heartbeat, 1000);
   setInterval(() => {
     const now = performance.now();

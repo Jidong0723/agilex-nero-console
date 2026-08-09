@@ -1061,6 +1061,23 @@ class OperationalSpaceServo:
         }
         return result
 
+    def request_shadow_hold(self, reason: str = "OSC shadow HOLD requested") -> dict[str, Any]:
+        """Brake a shadow session to HOLD_READY without touching hardware.
+
+        The session remains active so a deadman-style input adapter can resume
+        from a fresh absolute target when its button is pressed again.
+        """
+        with self.lock:
+            session = dict(self.session or {})
+            execution_mode = session.get("execution_mode", "shadow" if session.get("mode") == "shadow" else "hardware")
+            if not self._session_active() or execution_mode != "shadow":
+                raise RuntimeError("shadow HOLD requires an active shadow OSC session")
+            self._invalidate_motion(reason)
+            self._set_result(True, reason, robot_commands_sent=False)
+            self._bump_state()
+            return {"ok": True, "accepted": True, "reason": reason,
+                    "robot_commands_sent": False, "session_id": session.get("session_id")}
+
     def abandon_session_without_braking(self, epoch: int, reason: str) -> dict[str, Any]:
         """End a session after ownership revocation without sending a stop stream.
 

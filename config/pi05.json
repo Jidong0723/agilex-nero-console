@@ -1,0 +1,32 @@
+{
+  "schema_version": "nero.pi05-adapter.v1",
+  "cameras": {
+    "external": {"index": 0, "width": 640, "height": 480},
+    "wrist": {"index": 1, "width": 640, "height": 480},
+    "model_width": 224,
+    "model_height": 224
+  },
+  "model": {
+    "host": "127.0.0.1",
+    "port": 8000,
+    "request_timeout_s": 30.0,
+    "prompt": "place the fixed block into the fixed box",
+    "position_scale_m": [0.05, 0.05, 0.05],
+    "rotation_scale_rad": [0.5, 0.5, 0.5],
+    "rate_scale": 0.2
+  },
+  "connection": {
+    "ssh_forward_host": "127.0.0.1",
+    "ssh_forward_port": 8000,
+    "policy_host": "127.0.0.1",
+    "policy_port": 8000
+  },
+  "frames": {
+    "libero_to_nero": {
+      "translation_axis_sign": [-1, 1, 1],
+      "rotation_axis_sign": [-1, -1, 1]
+    }
+  },
+  "execution": {"period_s": 0.2, "replan_steps": 1, "max_chunk_steps": 128},
+  "gripper": {"switch_threshold": 0.5, "open_width_m": 0.085, "closed_width_m": 0.01, "force_n": 0.8}
+}
