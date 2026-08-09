@@ -37,6 +37,42 @@ Supported actions include `joint_target`, `cartesian_pose`, `cartesian_delta`, `
 
 The API is intended for trusted localhost clients. It is not an authenticated remote-control API.
 
+## Operational Space Controller
+
+`OperationalSpaceController` is the sole owner of the NERO CAN transport.
+New clients should use these endpoints rather than the legacy teleoperation or
+operator endpoints:
+
+- `POST /api/osc/session/start`: `{"client_id":"...","execution_mode":"shadow|hardware"}`.
+- `POST /api/osc/command`: command envelope with `session_id`, `client_id`,
+  monotonically increasing `sequence`, `type`, and `payload`.
+- `POST /api/osc/session/stop`: end the session through a safe HOLD handoff.
+- `GET /api/osc/state`: unified robot, TCP target, solver, authority, gripper,
+  feedback, and safety state.
+
+Supported OSC command types are `track_tcp`, `move_tcp`, `hold`, `stop`,
+`freedrive`, `gripper`, and compatibility-only `joint_target`. TCP commands
+use an absolute base-frame pose:
+
+```json
+{
+  "session_id": "...",
+  "client_id": "...",
+  "sequence": 1,
+  "type": "track_tcp",
+  "payload": {
+    "target_pose": {
+      "position_m": [0.20, 0.10, 0.30],
+      "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]
+    }
+  }
+}
+```
+
+OSC has no clutch, relative-pose, or anchor fields. Those are optional
+client-side input-adapter concepts; adapters translate them into absolute TCP
+targets before calling OSC.
+
 ## Pose teleoperation
 
 `POST /api/teleop/intent` uses clutch-scoped relative poses.  Send

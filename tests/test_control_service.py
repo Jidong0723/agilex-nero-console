@@ -11,6 +11,7 @@ from typing import Any
 from supervisor.control import (
     LeaseError,
     LeaseManager,
+    OperationalSpaceController,
     RobotControlBroker,
     candidate_tool_pose_from_flange,
 )
@@ -618,6 +619,42 @@ class BrokerPreemptionTests(unittest.TestCase):
             self.broker.command_gripper("open", None, 1.0, False)
 
         self.assertEqual(self.fake.hold_calls, 0)
+
+class OscFacadeTests(unittest.TestCase):
+    def test_osc_is_the_public_controller_and_hides_clutch_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = OperationalSpaceController({}, robot=FakeRobot(Path(directory)))  # type: ignore[arg-type]
+            try:
+                self.assertIsInstance(controller, OperationalSpaceController)
+
+                class FakeOscServo:
+                    def submit_absolute_target(self, body, *, mode):
+                        return {"accepted": True, "mode": mode, "target_pose": body["payload"]["target_pose"]}
+
+                    def status(self):
+                        return {
+                            "session": {"state": "ACTIVE", "id": "osc-1"},
+                            "clutch_active": True, "anchor_id": 9, "relative_pose": {"position_m": [1, 2, 3]},
+                            "reference_pose": {"position_m": [0.1, 0.2, 0.3], "orientation_xyzw": [0, 0, 0, 1]},
+                            "last_result": {}, "solver": {}, "workspace": {}, "diagnostics": {},
+                        }
+
+                    def stop_session(self, reason):
+                        return {"handoff": {"reason": reason}}
+
+                controller.osc_servo = FakeOscServo()  # type: ignore[assignment]
+                controller.teleop = controller.osc_servo
+                state = controller.osc_state()
+                self.assertNotIn("clutch_active", state)
+                self.assertNotIn("anchor_id", state)
+                result = controller.osc_command({
+                    "session_id": "osc-1", "client_id": "client", "sequence": 1, "type": "track_tcp",
+                    "payload": {"target_pose": {"position_m": [0.1, 0.2, 0.3], "orientation_xyzw": [0, 0, 0, 1]}},
+                })
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["result"]["mode"], "track_tcp")
+            finally:
+                controller.close()
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from supervisor.instance_lock import InstanceLock  # noqa: E402
 
 if TYPE_CHECKING:
-    from supervisor.control import RobotControlBroker
+    from supervisor.control import OperationalSpaceController
 
 
 WEB_ROOT = PROJECT_ROOT / "web" / "console"
@@ -46,19 +46,19 @@ class LeaseError(RuntimeError):
 
 def _backend_worker_main(connection: Any, config: str) -> None:
     """Own every SDK/CAN object in a disposable child process."""
-    broker = None
+    osc = None
     try:
-        from supervisor.control import RobotControlBroker
+        from supervisor.control import OperationalSpaceController
 
-        broker = RobotControlBroker(Path(config))
-        initial = broker.start()
+        osc = OperationalSpaceController(Path(config))
+        initial = osc.start()
         connection.send({"kind": "ready", "initial": initial})
         while True:
             request = connection.recv()
             if request.get("method") == "__close__":
                 break
             try:
-                method = getattr(broker, str(request["method"]))
+                method = getattr(osc, str(request["method"]))
                 result = method(*request.get("args", ()), **request.get("kwargs", {}))
                 connection.send({"kind": "result", "id": request["id"], "result": result})
             except BaseException as exc:
@@ -74,9 +74,9 @@ def _backend_worker_main(connection: Any, config: str) -> None:
         except (BrokenPipeError, EOFError, OSError):
             pass
     finally:
-        if broker is not None:
+        if osc is not None:
             try:
-                broker.close()
+                osc.close()
             except BaseException:
                 pass
         connection.close()
@@ -151,7 +151,7 @@ class ServiceRuntime:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._broker: RobotControlBroker | None = None
+        self._broker: OperationalSpaceController | None = None
         self._phase = "starting"
         self._error: str | None = None
         self._initial: dict[str, Any] | None = None
@@ -209,7 +209,7 @@ class ServiceRuntime:
             self._error = None
         print(json.dumps({"control_backend_ready": True, "initial": initial}, ensure_ascii=False, default=str), flush=True)
 
-    def require_broker(self) -> RobotControlBroker:
+    def require_broker(self) -> OperationalSpaceController:
         with self._lock:
             if self._broker is not None and self._phase == "ready":
                 return self._broker
@@ -656,6 +656,8 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 return self._json_ok(status)
             if parsed.path == "/api/broker/status":
                 return self._json_ok(self.broker.broker_status())
+            if parsed.path == "/api/osc/state":
+                return self._json_ok(self.broker.osc_state())
             if parsed.path == "/api/teleop/kinematics":
                 return self._json_ok(self.broker.teleop_kinematics())
             return self._static(parsed.path)
@@ -673,6 +675,15 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/actions":
                 return self._json_accepted(self.broker.submit_action_job(body))
+            if self.path == "/api/osc/session/start":
+                return self._json_ok(self.broker.osc_start(
+                    str(body.get("client_id", "anonymous")),
+                    str(body.get("execution_mode", "shadow")),
+                ))
+            if self.path == "/api/osc/command":
+                return self._json_ok(self.broker.osc_command(body))
+            if self.path == "/api/osc/session/stop":
+                return self._json_ok(self.broker.osc_stop(str(body.get("reason", "OSC session stopped"))))
             if self.path == "/api/teleop/session/start":
                 result = self.broker.teleop_start(
                         body.get("mode"),

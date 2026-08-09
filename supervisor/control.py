@@ -18,7 +18,7 @@ from .authority import (
 from nero_backend.robot import NeroRobot
 from motion.safety import arm_status_is_no_solution_only
 from shared.schemas import jsonable, now_iso
-from motion.teleop import TeleopController
+from motion.teleop import OperationalSpaceServo
 
 
 GRIPPER_TIP_CANDIDATE_OFFSET_M = (0.175, 0.0, -0.0235)
@@ -130,8 +130,8 @@ class LeaseManager:
         return min(120.0, max(5.0, float(ttl_s or self.default_ttl_s)))
 
 
-class RobotControlBroker:
-    """Sole USB-CAN owner shared by scripts and the local control page."""
+class OperationalSpaceController:
+    """Sole USB-CAN owner and unified operational-space control facade."""
 
     def __init__(self, config: Path | str | dict[str, Any], robot: NeroRobot | None = None) -> None:
         backend = robot or NeroRobot(config)
@@ -172,7 +172,10 @@ class RobotControlBroker:
         self._last_sdk_read_duration_ms: float | None = None
         teleop_path = Path(__file__).resolve().parents[1] / "config" / "teleop.json"
         teleop_config = json.loads(teleop_path.read_text(encoding="utf-8-sig")) if teleop_path.is_file() else {}
-        self.teleop = TeleopController(self, Path(__file__).resolve().parents[1], teleop_config)
+        self.osc_servo = OperationalSpaceServo(self, Path(__file__).resolve().parents[1], teleop_config)
+        # Legacy adapters and callers retain this name, but it is the same
+        # single OSC servo instance, never a second control loop.
+        self.teleop = self.osc_servo
 
     # ---- Sole transport-owner entry points ---------------------------------
     # Teleop and HTTP handlers deliberately use these methods rather than the
@@ -746,6 +749,82 @@ class RobotControlBroker:
         result = self.teleop.stop_session(reason)
         self._log("teleop_stop", reason=reason, result=result)
         return result
+
+    # ---- Public OSC facade -------------------------------------------------
+    # OSC accepts only base-frame absolute targets and mode/end-effector
+    # commands. Clutch and relative-pose handling live in legacy input
+    # adapters and never appear in this interface or its state.
+    def osc_start(
+        self,
+        client_id: str = "anonymous",
+        execution_mode: str = "shadow",
+    ) -> dict[str, Any]:
+        result = self.osc_servo.start_session(
+            execution_mode=execution_mode,
+            input_source="joystick",
+            client_id=client_id,
+        )
+        return {"ok": True, "state": self.osc_state(), "session": result.get("session", {})}
+
+    def osc_stop(self, reason: str = "OSC session stopped") -> dict[str, Any]:
+        result = self.hold(reason)
+        return {"ok": bool(result.get("ok")), "result": result, "state": self.osc_state()}
+
+    def osc_command(self, body: dict[str, Any]) -> dict[str, Any]:
+        command_type = str(body.get("type", "")).strip().lower()
+        payload = dict(body.get("payload") or {})
+        if command_type in {"track_tcp", "move_tcp"}:
+            result = self.osc_servo.submit_absolute_target(body, mode=command_type)
+        elif command_type in {"hold", "stop"}:
+            result = self.hold(str(payload.get("reason", "OSC HOLD requested")))
+        elif command_type == "freedrive":
+            result = self.freedrive(
+                str(payload.get("reason", "OSC FREEDRIVE requested")),
+                bool(payload.get("recover_emergency", False)),
+                bool(payload.get("preserve_gripper", False)),
+            )
+        elif command_type == "gripper":
+            width = payload.get("width_m")
+            result = self.command_gripper(
+                str(payload.get("mode", "")),
+                float(width) if width is not None else None,
+                float(payload.get("force_n", 1.0)),
+                bool(payload.get("preserve_on_freedrive", False)),
+            )
+        elif command_type == "joint_target":
+            token = str(body.get("token", ""))
+            result = self.execute(token, {"type": "joint_target", **payload}, body.get("timeout"))
+        else:
+            raise ValueError("OSC command type must be track_tcp, move_tcp, hold, stop, freedrive, gripper, or joint_target")
+        return {"ok": bool(result.get("ok", result.get("accepted", False))), "result": result, "state": self.osc_state()}
+
+    def osc_state(self) -> dict[str, Any]:
+        servo = dict(self.osc_servo.status())
+        # Deliberately exclude every legacy clutch/input-adapter concept.
+        for key in ("clutch_active", "anchor_id", "relative_pose", "tcp_anchor", "input_source", "pose_mapping_verified"):
+            servo.pop(key, None)
+        snapshot = self.status()
+        current_tcp = None
+        solver = dict((servo.get("last_result") or {}).get("solver") or {})
+        if isinstance(solver.get("tcp"), dict):
+            current_tcp = solver["tcp"]
+        return {
+            "state_sequence": servo.get("state_sequence", 0),
+            "session": servo.get("session"),
+            "current_tcp_pose": current_tcp,
+            "target_tcp_pose": servo.get("reference_pose"),
+            "intent": servo.get("intent"),
+            "last_result": servo.get("last_result"),
+            "solver": servo.get("solver"),
+            "workspace": servo.get("workspace"),
+            "diagnostics": servo.get("diagnostics"),
+            "control": snapshot.get("control"),
+            "robot": snapshot.get("robot"),
+            "gripper": snapshot.get("gripper"),
+            "authority": self.authority_status(snapshot.get("control")),
+            "active_action": snapshot.get("active_action"),
+            "feedback_ready": snapshot.get("feedback_ready"),
+        }
 
     def handoff_to_console(self, reason: str = "operator returned to the control console") -> dict[str, Any]:
         """Atomically transfer CPV teleoperation ownership to a Follower hold.
@@ -1388,3 +1467,8 @@ class RobotControlBroker:
             raise
         self._emit_action_event(action_id, "completed", requested_action, result, "operator")
         return result
+
+
+# Compatibility import for existing local integrations. New code must use
+# OperationalSpaceController; both names refer to the same sole CAN owner.
+RobotControlBroker = OperationalSpaceController

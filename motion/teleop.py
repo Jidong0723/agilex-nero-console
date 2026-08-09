@@ -638,8 +638,12 @@ class SafetySupervisor:
         return safe, not unsafe, None if not unsafe else "velocity clipped by final safety gate"
 
 
-class TeleopController:
-    """Fixed-rate pose teleop: Pink async, Ruckig and safety sync."""
+class OperationalSpaceServo:
+    """Fixed-rate operational-space servo: Pink, Ruckig and safety sync.
+
+    This is the sole Pink/Ruckig/CPV loop owned by OperationalSpaceController.
+    Legacy teleoperation is only an input adapter to this servo.
+    """
 
     def __init__(self, broker: Any, project_root: Path, config: dict[str, Any]) -> None:
         try:
@@ -669,6 +673,8 @@ class TeleopController:
         self.anchor_id = 0
         self.reference_revision = 0
         self.clutch_active = False
+        self.absolute_target_active = False
+        self.absolute_target_mode: str | None = None
         self.input_source: str | None = None
         self.tcp_anchor: dict[str, list[float]] | None = None
         self.reference_pose: dict[str, list[float]] | None = None
@@ -813,6 +819,8 @@ class TeleopController:
             ).start()
         self.intent = None
         self.clutch_active = False
+        self.absolute_target_active = False
+        self.absolute_target_mode = None
         self.anchor_id += 1
         self.reference_revision += 1
         self.tcp_anchor = None
@@ -830,6 +838,8 @@ class TeleopController:
             if self.session:
                 self.session["motion_epoch"] = self.motion_epoch
             self.intent = None
+            self.absolute_target_active = False
+            self.absolute_target_mode = None
             self.filtered_velocity = [0.0] * 6
             self.input_enabled = False
             self.feedback_sync_pending = True
@@ -1097,6 +1107,57 @@ class TeleopController:
             self.reference_revision += 1
             self._bump_state()
         return self.status()
+
+    def submit_absolute_target(self, body: dict[str, Any], *, mode: str) -> dict[str, Any]:
+        """Accept a base-frame TCP target without any clutch semantics."""
+        if mode not in {"track_tcp", "move_tcp"}:
+            raise ValueError("OSC target mode must be track_tcp or move_tcp")
+        with self.lock:
+            if not self._session_active():
+                raise RuntimeError("OSC session is not active")
+            client_id = str(body.get("client_id", "anonymous")).strip() or "anonymous"
+            if client_id != str(self.session.get("client_id", "anonymous")):
+                raise PermissionError("OSC command rejected: session belongs to another client")
+            sequence = int(body.get("sequence", -1))
+            if sequence <= int(self.session.get("sequence", 0)):
+                return {"accepted": False, "reason": "stale sequence", "accepted_sequence": self.session["sequence"], "session_id": self.session["session_id"]}
+            if str(body.get("session_id", self.session["session_id"])) != str(self.session["session_id"]):
+                raise PermissionError("OSC command rejected: session id mismatch")
+            if self.trajectory_state == "FAULT":
+                raise PermissionError(f"OSC command rejected: FAULT ({self.trajectory_brake_reason or 'trajectory fault'})")
+            payload = dict(body.get("payload") or body)
+            target = dict(payload.get("target_pose") or {})
+            reference = {
+                "position_m": _finite_vector(target.get("position_m"), 3, "target_pose.position_m"),
+                "orientation_xyzw": _unit_quaternion(target.get("orientation_xyzw"), "target_pose.orientation_xyzw"),
+            }
+            if not self._pose_in_workspace(reference):
+                raise PermissionError("OSC target is outside the configured workspace")
+            if self.trajectory_state == "HOLD_READY":
+                resumed, reason = self._resume_from_hold_locked()
+                if not resumed:
+                    raise PermissionError(f"OSC command rejected: cannot resume from HOLD_READY ({reason})")
+            self.session["sequence"] = sequence
+            self.reference_pose = reference
+            self.reference_revision += 1
+            self.intent = {
+                "sequence": sequence,
+                "host_monotonic_ns": time.monotonic_ns(),
+                "reference_revision": self.reference_revision,
+                "reference_pose": dict(reference),
+                "persistent": True,
+                "osc_mode": mode,
+            }
+            self.absolute_target_active = True
+            self.absolute_target_mode = mode
+            self._bump_state()
+            return {
+                "accepted": True,
+                "accepted_sequence": sequence,
+                "session_id": self.session["session_id"],
+                "target_pose": reference,
+                "mode": mode,
+            }
 
     def submit_intent(self, body: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
@@ -1370,8 +1431,11 @@ class TeleopController:
                 soft_stale = feedback_age > float(self.limits.get("feedback_soft_stale_s", 0.06))
                 hard_stale = feedback_age > float(self.limits.get("feedback_hard_stale_s", 0.15))
                 age = float("inf") if not intent else max(0.0, (time.monotonic_ns() - int(intent["host_monotonic_ns"])) / 1e9)
-                deadman = bool(self.clutch_active)
-                valid_input = bool(intent) and age <= float(self.limits.get("deadman_timeout_s", 0.25))
+                # OSC absolute targets are persistent setpoints. Clutch is a
+                # legacy input-adapter concern and is never required by OSC.
+                persistent_target = bool((intent or {}).get("persistent"))
+                deadman = bool(self.clutch_active or self.absolute_target_active)
+                valid_input = bool(intent) and (persistent_target or age <= float(self.limits.get("deadman_timeout_s", 0.25)))
                 with self.lock:
                     if self.session: self.session["last_input_age_s"] = age if math.isfinite(age) else None
                     explicit_nonzero = bool(self.clutch_active and intent)
@@ -1542,6 +1606,13 @@ class TeleopController:
                     self._set_result(gate_ok, result_reason, robot_commands_sent=True, solver=pink if pink and pink.get("ok") else None, ruckig=ruckig_info, supervisor=supervisor_report, gate_reason=gate_reason)
                 self.last_sent_velocity = list(final_velocity)
                 with self.lock:
+                    if (
+                        self.absolute_target_mode == "move_tcp"
+                        and pink and pink.get("ok")
+                        and float(pink.get("position_error_m", float("inf"))) <= float(self.config.get("osc", {}).get("move_position_tolerance_m", 0.004))
+                        and float(pink.get("orientation_error_rad", float("inf"))) <= float(self.config.get("osc", {}).get("move_orientation_tolerance_rad", 0.05))
+                    ):
+                        self._invalidate_motion("OSC move_tcp target reached")
                     if self.trajectory_state == "BRAKING" and settled:
                         self.trajectory_state, self.trajectory_brake_reason, self.feedback_sync_pending = "HOLD_READY", None, True
                         self.needs_resync = True
@@ -1568,3 +1639,7 @@ class TeleopController:
             self.broker.trigger_safety_fault(reason)
         self.last_sent_velocity = [0.0] * 7
         self._set_result(False, reason, robot_commands_sent=not shadow)
+
+
+# Backwards-compatible name for the legacy clutch input adapter and tests.
+TeleopController = OperationalSpaceServo

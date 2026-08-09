@@ -43,6 +43,7 @@
     rightMode: "zy",
     clutchActive: false,
     anchorId: null,
+    oscAnchor: null,
     relativePose: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
     lastPoseTick: performance.now(),
     resetPendingUntil: 0,
@@ -154,22 +155,20 @@
     const current = session();
     if (state.clutchActive || isPicoSession(current)) return;
     if (current.state !== "ACTIVE" || current.client_id !== clientId) return phase(`输入已拦截：${permissionReason()}`, true);
-    const sequence = (state.teleop?.intent?.sequence || current.sequence || 0) + 1;
-    const result = await api("/api/teleop/intent", "POST", { session_id: current.id, client_id: clientId, sequence, event: "clutch_begin", pose_scale: Number($("scale")?.value || 1) }, 1200);
-    state.anchorId = result.anchor_id;
+    const target = state.teleop?.target_tcp_pose;
+    if (!target?.position_m || !target?.orientation_xyzw) return phase("OSC 尚未提供当前 TCP 位姿", true);
+    state.oscAnchor = { position_m: [...target.position_m], orientation_xyzw: [...target.orientation_xyzw] };
+    state.anchorId = null;
     state.clutchActive = true;
     state.relativePose = { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] };
     state.lastPoseTick = performance.now();
-    if (state.teleop) state.teleop.intent = { ...(state.teleop.intent || {}), sequence: result.accepted_sequence };
     updateInputView(); render();
   }
 
   async function releaseClutch() {
     const current = session();
     if (!state.clutchActive) return;
-    const sequence = (state.teleop?.intent?.sequence || current.sequence || 0) + 1;
-    try { await api("/api/teleop/intent", "POST", { session_id: current.id, client_id: clientId, sequence, event: "clutch_release", anchor_id: state.anchorId, pose_scale: Number($("scale")?.value || 1) }, 1200); }
-    finally { state.clutchActive = false; state.anchorId = null; resetInput(false); render(); }
+    state.clutchActive = false; state.anchorId = null; resetInput(false); render();
   }
 
   async function toggleClutch() {
@@ -273,18 +272,22 @@
     const current = session();
     if (current.state !== "ACTIVE" || current.client_id !== clientId) return;
     if (!state.clutchActive || isPicoSession(current)) return;
-    const sequence = (state.teleop?.intent?.sequence || 0) + 1;
-    const result = await api("/api/teleop/intent", "POST", {
+    const anchor = state.oscAnchor || state.teleop?.target_tcp_pose;
+    if (!anchor?.position_m || !anchor?.orientation_xyzw) return;
+    const sequence = (state.teleop?.intent?.sequence || current.sequence || 0) + 1;
+    const targetPose = {
+      position_m: anchor.position_m.map((value, index) => value + state.relativePose.position_m[index]),
+      orientation_xyzw: quatMultiply(anchor.orientation_xyzw, state.relativePose.orientation_xyzw),
+    };
+    const result = await api("/api/osc/command", "POST", {
       session_id: current.id,
       client_id: clientId,
       sequence,
-      event: "pose",
-      anchor_id: state.anchorId,
-      relative_pose: state.relativePose,
-      pose_scale: Number($("scale")?.value || 1),
+      type: "track_tcp",
+      payload: { target_pose: targetPose },
     }, 250);
-    if (result?.accepted_sequence != null && state.teleop) {
-      state.teleop.intent = { ...(state.teleop.intent || {}), sequence: result.accepted_sequence };
+    if (result?.result?.accepted_sequence != null && state.teleop) {
+      state.teleop.intent = { ...(state.teleop.intent || {}), sequence: result.result.accepted_sequence };
     }
   }
 
@@ -547,18 +550,14 @@
     const resetPending = Date.now() < state.resetPendingUntil;
     const statusTimeout = resetPending ? 5000 : 900;
     try {
-      const [status, teleop, broker] = await Promise.all([
-        api("/api/status", "GET", undefined, statusTimeout),
-        api("/api/teleop/status", "GET", undefined, statusTimeout),
-        api("/api/broker/status", "GET", undefined, statusTimeout),
-      ]);
+      const osc = await api("/api/osc/state", "GET", undefined, statusTimeout);
       if (generation !== state.requestGeneration) return;
-      const sequence = Number(teleop.state_sequence || 0);
+      const sequence = Number(osc.state_sequence || osc.session?.sequence || 0);
       if (sequence < state.latestSequence) return;
       state.latestSequence = sequence;
-      state.status = status;
-      state.teleop = teleop;
-      state.broker = broker;
+      state.status = { control: osc.control, robot: osc.robot, gripper: osc.gripper, active_action: osc.active_action };
+      state.teleop = osc;
+      state.broker = osc.authority;
       if (resetPending) {
         state.resetPendingUntil = 0;
         $("maintenance-result").textContent = "\u63a7\u5236\u670d\u52a1\u5df2\u6062\u590d\u3002";
@@ -583,13 +582,14 @@
     const executionMode = $("execution-mode").value;
     const inputSource = $("input-source").value;
     try {
-      const result = await api("/api/teleop/session/start", "POST", { execution_mode: executionMode, input_source: inputSource, client_id: clientId }, 10000);
-      const sequence = Number(result.state_sequence || 0);
+      const result = await api("/api/osc/session/start", "POST", { execution_mode: executionMode, client_id: clientId }, 10000);
+      const osc = result.state;
+      const sequence = Number(osc?.state_sequence || osc?.session?.sequence || 0);
       if (sequence >= state.latestSequence) {
         state.latestSequence = sequence;
-        state.teleop = result;
+        state.teleop = osc;
       }
-      phase(result.session?.state === "ACTIVE" ? result.input_enabled ? "会话已启动，输入已启用" : "会话已启动，等待死手" : "会话未启动", result.session?.state !== "ACTIVE");
+      phase(osc?.session?.state === "ACTIVE" ? "OSC 会话已启动" : "OSC 会话未启动", osc?.session?.state !== "ACTIVE");
       render();
       await refresh();
     } catch (error) {
@@ -605,16 +605,13 @@
   async function stopSession() {
     state.requestGeneration += 1;
     resetInput(true);
-    try { state.teleop = await api("/api/teleop/session/stop", "POST", { reason: "operator stopped unified workbench session" }); render(); } catch (error) { phase(`停止失败：${error.message}`, true); }
+    try { state.teleop = (await api("/api/osc/session/stop", "POST", { reason: "operator stopped unified workbench session" })).state; render(); } catch (error) { phase(`停止失败：${error.message}`, true); }
   }
 
   async function heartbeat() {
     const current = session();
     if (current.state !== "ACTIVE" || current.client_id !== clientId || !current.id) return;
-    try {
-      const result = await api("/api/teleop/session/heartbeat", "POST", { session_id: current.id, client_id: clientId }, 500);
-      if (Number(result.state_sequence || 0) >= state.latestSequence) { state.latestSequence = Number(result.state_sequence || 0); state.teleop = result; render(); }
-    } catch (_) { /* refresh reports service status */ }
+    void current;
   }
 
   function renderHierarchy(data, teleop, broker, control, robot, diagnostic, current) {
@@ -700,20 +697,25 @@
   $("stop").onclick = stopSession;
   $("clutch")?.addEventListener("click", () => toggleClutch().catch((error) => phase(`离合切换失败：${error.message}`, true)));
   $("recenter").onclick = async () => { if (state.clutchActive) return phase("请先释放离合再重新居中", true); resetInput(false); try { state.teleop = await api("/api/teleop/session/recenter", "POST", {}); render(); } catch (error) { phase(`重新居中失败：${error.message}`, true); } };
-  $("hold").onclick = () => { resetInput(true); $("hold").disabled = true; api("/api/actions", "POST", { kind: "hold", reason: "operator requested HOLD" }).then((job) => { state.action = { ...job, kind: "hold" }; render(); }).catch((error) => phase(`HOLD失败：${error.message}`, true)); };
+  const oscCommand = (type, payload = {}) => {
+    const current = session();
+    const sequence = (state.teleop?.intent?.sequence || current.sequence || 0) + 1;
+    return api("/api/osc/command", "POST", { session_id: current.id, client_id: clientId, sequence, type, payload });
+  };
+  $("hold").onclick = () => { resetInput(false); $("hold").disabled = true; oscCommand("hold", { reason: "operator requested HOLD" }).then((result) => { state.teleop = result.state; render(); }).catch((error) => phase(`HOLD失败：${error.message}`, true)); };
   $("freedrive").onclick = () => {
     // Clear the local UI only.  FREEDRIVE must not first submit a zero
     // teleop intent, because that would start a P1/Ruckig braking path before
     // the dedicated direct Leader transition reaches the backend.
     resetInput(false);
     $("freedrive").disabled = true;
-    api("/api/actions", "POST", { kind: "freedrive", reason: "operator requested FREEDRIVE" })
-      .then((job) => { state.action = { ...job, kind: "freedrive" }; render(); })
+    oscCommand("freedrive", { reason: "operator requested FREEDRIVE" })
+      .then((result) => { state.teleop = result.state; render(); })
       .catch((error) => phase(`FREEDRIVE失败：${error.message}`, true));
   };
-  $("gripper-open").onclick = () => api("/api/actions", "POST", { kind: "gripper", mode: "open", force_n: Number($("gripper-force-input").value) });
-  $("gripper-grip").onclick = () => api("/api/actions", "POST", { kind: "gripper", mode: "grip", force_n: Number($("gripper-force-input").value) });
-  $("gripper-position").onclick = () => api("/api/actions", "POST", { kind: "gripper", mode: "position", width_m: Number($("gripper-width-input").value) / 1000, force_n: Number($("gripper-force-input").value) });
+  $("gripper-open").onclick = () => oscCommand("gripper", { mode: "open", force_n: Number($("gripper-force-input").value) });
+  $("gripper-grip").onclick = () => oscCommand("gripper", { mode: "grip", force_n: Number($("gripper-force-input").value) });
+  $("gripper-position").onclick = () => oscCommand("gripper", { mode: "position", width_m: Number($("gripper-width-input").value) / 1000, force_n: Number($("gripper-force-input").value) });
   $("reset-control").onclick = async () => {
     try {
       state.resetPendingUntil = Date.now() + 10000;

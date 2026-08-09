@@ -73,6 +73,31 @@ class PoseTeleopTests(unittest.TestCase):
         finally:
             self._close(controller)
 
+    def test_absolute_osc_target_resumes_without_clutch_state(self) -> None:
+        controller, solver = self._controller()
+        try:
+            controller._initialize_ruckig([0.0] * 7, 0.02)
+            controller.shadow_joints = [0.0] * 7
+            controller.posture_reference = [0.0] * 7
+            controller.session = {
+                "state": "ACTIVE", "session_id": "osc-session", "client_id": "osc-client",
+                "mode": "shadow", "execution_mode": "shadow", "sequence": 0,
+            }
+            controller.trajectory_state = "HOLD_READY"
+            result = controller.submit_absolute_target({
+                "session_id": "osc-session", "client_id": "osc-client", "sequence": 1,
+                "payload": {"target_pose": {"position_m": [0.0, 0.3, 0.2], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]}},
+            }, mode="track_tcp")
+            self.assertTrue(result["accepted"])
+            self.assertEqual(controller.trajectory_state, "RUNNING")
+            self.assertTrue(controller.absolute_target_active)
+            self.assertFalse(controller.clutch_active)
+            self.assertTrue(controller.intent["persistent"])
+            self.assertEqual(controller.intent["reference_pose"]["position_m"], [0.0, 0.3, 0.2])
+            self.assertEqual(solver.calls, [])
+        finally:
+            self._close(controller)
+
     def test_solver_result_from_previous_pose_revision_is_usable_within_anchor(self) -> None:
         client = KinematicsClient(Path(__file__).resolve().parents[1], self.config())
         client._solver_request_id = 3
