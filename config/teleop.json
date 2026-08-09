@@ -1,0 +1,79 @@
+﻿{
+  "schema_version": "nero.teleop.v1",
+  "solver": {
+    "python": ".conda/nero-kinematics/python.exe",
+    "script": "motion/teleop_kinematics_server.py",
+    "timeout_s": 10.0,
+    "startup_timeout_s": 12.0,
+    "dt_s": 0.02,
+    "ruckig_target_horizon_s": 0.1,
+    "ruckig_max_acceleration": 2.0,
+    "ruckig_max_jerk": 20.0,
+    "posture_cost": 0.05,
+    "damping_cost": 0.05,
+    "frame_position_cost": 10.0,
+    "frame_orientation_cost": 1.0,
+    "frame_gain": 0.1,
+    "feedback_limit_tolerance_rad": 0.05,
+    "hold_velocity_epsilon_rad_s": 0.005,
+    "hold_acceleration_epsilon_rad_s2": 0.02,
+    "urdf": "vendor/nero_description/nero_description.urdf"
+  },
+  "tcp": {
+    "offset_from_link7_m": [0.175, 0.0, -0.0235],
+    "verified": false,
+    "source": "NERO AGX gripper URDF candidate"
+  },
+  "pose_input": {
+    "position_axis_map": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+    "orientation_axis_map": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+    "mapping_verified": true,
+    "translation_gain": 1.0,
+    "rotation_gain": 1.0,
+    "max_relative_translation_m": 0.25,
+    "max_relative_rotation_rad": 1.0472,
+    "max_packet_translation_m": 0.05,
+    "max_packet_rotation_rad": 0.35
+  },
+  "shadow_initial_joints_rad": [-0.02, 0.5, -0.8, 1.2, 0.0, 0.2, 0.0],
+  "limits": {
+    "linear_speed_m_s": 0.06,
+    "angular_speed_rad_s": 0.45,
+    "joint_speed_rad_s": 0.45,
+    "velocity_error_warning_rad_s": 0.10,
+    "velocity_error_brake_rad_s": 0.25,
+    "velocity_error_fault_rad_s": 0.45,
+    "velocity_error_fault_cycles": 10,
+    "feedback_soft_stale_s": 0.06,
+    "feedback_hard_stale_s": 0.15,
+    "solver_stale_s": 0.10,
+    "max_stale_velocity_repeats": 3,
+    "input_filter_alpha": 0.35,
+    "deadman_timeout_s": 0.25,
+    "workspace_min_m": [-0.45, -0.45, -0.01],
+    "workspace_max_m": [0.45, 0.60, 0.70],
+    "min_flange_z_m": -0.01,
+    "singularity_condition_max": 2500.0
+  },
+  "joint_conventions": [
+    {"sdk_index": 1, "urdf_joint": "joint1", "sign": 1.0, "zero_offset_rad": 0.0, "unit_scale": 1.0},
+    {"sdk_index": 2, "urdf_joint": "joint2", "sign": 1.0, "zero_offset_rad": 0.0, "unit_scale": 1.0},
+    {"sdk_index": 3, "urdf_joint": "joint3", "sign": 1.0, "zero_offset_rad": 0.0, "unit_scale": 1.0},
+    {"sdk_index": 4, "urdf_joint": "joint4", "sign": 1.0, "zero_offset_rad": 0.0, "unit_scale": 1.0},
+    {"sdk_index": 5, "urdf_joint": "joint5", "sign": 1.0, "zero_offset_rad": 0.0, "unit_scale": 1.0},
+    {"sdk_index": 6, "urdf_joint": "joint6", "sign": 1.0, "zero_offset_rad": 0.0, "unit_scale": 1.0},
+    {"sdk_index": 7, "urdf_joint": "joint7", "sign": 1.0, "zero_offset_rad": 0.0, "unit_scale": 1.0}
+  ],
+  "safety_supervisor": {
+    "fixed_model_margin_rad": [0.03, 0.03, 0.03, 0.025, 0.03, 0.02, 0.02],
+    "controller_stop_reserve_rad": [0.02, 0.02, 0.02, 0.02, 0.02, 0.015, 0.015],
+    "controller_response_delay_s": 0.04
+  },
+  "runtime": {
+    "control_hz": 50,
+    "max_control_hz": 100,
+    "mode": "shadow",
+    "max_trajectory_points": 200
+  }
+}
+

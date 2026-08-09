@@ -1,0 +1,71 @@
+﻿{
+  "schema_version": 1,
+  "created_for": "phase3_lightweight_runtime",
+  "sdk": {
+    "robot": "NERO",
+    "firmware": "v120",
+    "interface": "agx_cando",
+    "channel": "0",
+    "bitrate": 1000000,
+    "local_loopback": false,
+    "receive_own_messages": false,
+    "effector": "agx_gripper"
+  },
+  "motion": {
+    "speed_percent": 3,
+    "feedback_timeout_s": 3.0,
+    "emergency_reset_settle_s": 0.8,
+    "emergency_recovery_feedback_timeout_s": 4.0,
+    "emergency_recovery_attempts": 2,
+    "enable_timeout_s": 8.0,
+    "motion_timeout_s": 25.0,
+    "joint_tolerance_rad": 0.035,
+    "position_tolerance_m": 0.004,
+    "orientation_tolerance_rad": 0.05,
+    "no_solution_clear_timeout_s": 2.0,
+    "gripper_settle_s": 0.0,
+    "gripper_open_width_m": 0.095,
+    "gripper_min_force_n": 0.2,
+    "gripper_verify_settle_s": 0.25,
+    "gripper_reset_settle_s": 0.2,
+    "gripper_enable_attempts": 3
+  },
+  "can_feedback_recovery": {
+    "enabled": false,
+    "silence_timeout_s": 3.0,
+    "verification_timeout_s": 3.0,
+    "max_attempts": 1
+  },
+  "safety": {
+    "allow_electronic_emergency_stop": false,
+    "min_flange_z_m": -0.01,
+    "workspace_min_xyz_m": [-0.45, -0.45, -0.01],
+    "workspace_max_xyz_m": [0.45, 0.60, 0.70],
+    "min_speed_percent": 1,
+    "max_speed_percent": 5,
+    "min_gripper_width_m": 0.0,
+    "max_gripper_width_m": 0.10,
+    "max_gripper_force_n": 3.0
+  },
+  "logging": {
+    "out_dir": "runtime/logs",
+    "scene_id": "phase3_runtime_baseline",
+    "model_version": "none"
+  },
+  "control_service": {
+    "url": "http://127.0.0.1:8765",
+    "lease_ttl_s": 30.0,
+    "startup_connect_timeout_s": 12.0,
+    "log_dir": "runtime/logs/control"
+  },
+  "pico_gateway": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 8768,
+    "pair_ttl_s": 120.0,
+    "message_timeout_s": 0.25,
+    "max_hz": 90,
+    "max_message_bytes": 4096
+  }
+}
+
