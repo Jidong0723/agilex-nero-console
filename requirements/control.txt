@@ -1,6 +1,5 @@
 numpy==2.5.1
 ruckig==0.12.2
 websockets==16.1.1
--e ../vendor/python-can-agx-cando
--e ../vendor/pyAgxArm
-
+-e vendor/python-can-agx-cando
+-e vendor/pyAgxArm
