@@ -109,7 +109,7 @@
     "feedback_hard_stale_s": 0.15,
     "solver_stale_s": 0.1,
     "max_stale_velocity_repeats": 0,
-    "input_filter_alpha": 1.0,
+    "input_filter_alpha": 0.5,
     "deadman_timeout_s": 0.25,
     "workspace_min_m": [
       -0.6,

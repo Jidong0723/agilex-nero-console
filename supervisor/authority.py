@@ -129,6 +129,8 @@ class HardwareTransportOwner:
         self._epoch = 0
         self._pending_epoch: int | None = None
         self._exclusive_category: str | None = None
+        self._active: dict[str, Any] | None = None
+        self._active_lock = threading.Lock()
         self._closed = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="nero-hardware-transport", daemon=True)
         self._thread.start()
@@ -223,6 +225,14 @@ class HardwareTransportOwner:
         if self._thread is not threading.current_thread():
             self._thread.join(timeout=1.0)
 
+    def diagnostics(self) -> dict[str, Any]:
+        """Return the current serial CAN dispatch without touching the SDK."""
+        with self._active_lock:
+            active = dict(self._active) if self._active else None
+        if active is not None:
+            active["age_ms"] = max(0.0, (time.monotonic_ns() - int(active["started_monotonic_ns"])) / 1e6)
+        return {"active": active, "queued": self._queue.qsize(), "epoch": self.epoch()}
+
     def _loop(self) -> None:
         while True:
             _, _, envelope = self._queue.get()
@@ -230,6 +240,12 @@ class HardwareTransportOwner:
                 return
             try:
                 dispatch_started_ns = time.monotonic_ns()
+                with self._active_lock:
+                    self._active = {
+                        "method": envelope["method"], "priority": envelope["priority"],
+                        "category": envelope["category"], "command_epoch": envelope["command_epoch"],
+                        "started_monotonic_ns": dispatch_started_ns,
+                    }
                 result = self._execute(
                     envelope["method"], envelope["args"], envelope["kwargs"],
                     envelope["priority"], envelope["command_epoch"],
@@ -248,6 +264,8 @@ class HardwareTransportOwner:
             except Exception as exc:  # deliver the original SDK error to caller
                 envelope["error"] = exc
             finally:
+                with self._active_lock:
+                    self._active = None
                 envelope["done"].set()
 
     def _execute(

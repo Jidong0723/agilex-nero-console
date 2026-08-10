@@ -296,8 +296,13 @@ class OperationalSpaceController:
         """Ask the independent service reset path to quarantine a stuck SDK call."""
         with self._transport_reset_lock:
             if self._transport_reset_scheduled:
+                self._log("transport_reset_already_scheduled", reason=reason)
                 return
             self._transport_reset_scheduled = True
+        # This record is intentionally written before the localhost reset
+        # request. The reset helper can kill this process moments later, so a
+        # post-request log entry is not reliable evidence of the trigger.
+        self._log("transport_reset_scheduled", reason=reason)
 
         def request_reset() -> None:
             try:
@@ -313,7 +318,7 @@ class OperationalSpaceController:
             except Exception:
                 # The external watchdog is best effort; the caller still
                 # reports the transport failure and the operator can use Reset.
-                pass
+                self._log("transport_reset_request_failed", reason=reason)
 
         threading.Thread(target=request_reset, name="transport-fault-reset", daemon=True).start()
 
@@ -475,7 +480,11 @@ class OperationalSpaceController:
                 dispatch_timeout_s=max(0.1, dispatch_timeout_s),
             )
         except TimeoutError as exc:
-            self._schedule_transport_reset(f"CPV position timeout: {exc}")
+            transport = self._transport_owner.diagnostics()
+            progress = getattr(self._transport_owner.backend, "cpv_dispatch_progress", lambda: {})()
+            detail = {"transport": transport, "cpv_progress": progress}
+            self._log("cpv_position_timeout", error=str(exc), diagnostics=detail)
+            self._schedule_transport_reset(f"CPV position timeout: {exc}; diagnostics={detail}")
             raise
 
     def begin_teleop_stop(self, reason: str) -> dict[str, Any]:
@@ -745,8 +754,13 @@ class OperationalSpaceController:
             # calls and block the backend's single CAN owner.
             teleop_session = self.teleop.status().get("session", {}) if self.teleop else {}
             teleop_state = teleop_session.get("state")
-            teleop_mode = teleop_session.get("mode")
-            if teleop_state in {"STARTING", "STOPPING"} or teleop_mode == "hardware":
+            # ``mode`` is an adapter-qualified compatibility value such as
+            # ``joystick_hardware``. The canonical execution selector is
+            # ``execution_mode``. Checking the old field left the expensive
+            # full P2 status sample active during CPV tracking, where it could
+            # hold the sole CAN owner long enough to time out a P1 batch.
+            execution_mode = teleop_session.get("execution_mode")
+            if teleop_state in {"STARTING", "STOPPING"} or execution_mode == "hardware":
                 time.sleep(self._status_monitor_interval_s)
                 continue
             try:
@@ -1392,7 +1406,11 @@ class OperationalSpaceController:
         return {"released": lease.public() if lease else None}
 
     def hold(self, reason: str = "operator requested hold") -> dict[str, Any]:
-        self._require_operational_control()
+        # HOLD removes motion authority; it must remain available while the
+        # full status cache is intentionally paused during hardware TRACK.
+        # The handoff itself reads/holds through the serial transport and is
+        # still rejected for a known disconnected or FAULT controller.
+        self._require_operational_control(allow_stale=True)
         result = self.handoff_to_console(reason)
         self._log("operator_hold", result=result)
         return result

@@ -43,6 +43,7 @@ class NeroRobot:
         self._command_lock = threading.RLock()
         self._transition_lock = threading.RLock()
         self._control_mode = "DISCONNECTED"
+        self._cpv_dispatch_progress: dict[str, Any] = {"state": "idle"}
         self._freedrive_backend: str | None = None
         self._last_control_reason = "not connected"
         self._leader_feedback_lock = threading.Lock()
@@ -868,6 +869,10 @@ class NeroRobot:
         if not all(math.isfinite(value) for value in values):
             raise ValueError("CPV position contains non-finite values")
         started_ns = time.monotonic_ns()
+        self._cpv_dispatch_progress = {
+            "state": "starting", "started_monotonic_ns": started_ns,
+            "joint_index": None, "joint_target_rad": None,
+        }
         joint_sent_ns: list[int] = []
         with self._command_lock:
             if not self._cpv_stream_started:
@@ -884,9 +889,18 @@ class NeroRobot:
             if move is None:
                 raise RuntimeError("NERO SDK does not expose move_cpv_pos")
             for index, value in enumerate(values, start=1):
+                self._cpv_dispatch_progress = {
+                    "state": "sending", "started_monotonic_ns": started_ns,
+                    "joint_index": index, "joint_target_rad": value,
+                    "sent_joint_count": len(joint_sent_ns),
+                }
                 move(joint_index=index, pos=value)
                 joint_sent_ns.append(time.monotonic_ns())
         finished_ns = time.monotonic_ns()
+        self._cpv_dispatch_progress = {
+            "state": "completed", "started_monotonic_ns": started_ns,
+            "finished_monotonic_ns": finished_ns, "sent_joint_count": len(joint_sent_ns),
+        }
         self._control_mode = "TELEOP_CPV"
         return {
             "ok": True,
@@ -898,6 +912,10 @@ class NeroRobot:
             "batch_duration_ms": (finished_ns - started_ns) / 1e6,
             "batch_skew_ms": ((max(joint_sent_ns) - min(joint_sent_ns)) / 1e6) if joint_sent_ns else 0.0,
         }
+
+    def cpv_dispatch_progress(self) -> dict[str, Any]:
+        """Non-blocking introspection for a potentially stuck CPV batch."""
+        return dict(self._cpv_dispatch_progress)
 
     def continuous_stream_active(self) -> bool:
         """Whether a CPV stream still owns the controller motion mode."""
