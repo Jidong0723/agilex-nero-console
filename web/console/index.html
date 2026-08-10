@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NERO Control Runtime</title>
-  <link rel="stylesheet" href="styles.css?v=hierarchy-v3">
+  <link rel="stylesheet" href="styles.css?v=hardware-feedback-v1">
 </head>
 <body>
   <header class="topbar">
@@ -31,11 +31,36 @@
       <aside class="right-column"><section class="panel workspace-panel"><div class="section-head compact"><div><p class="section-label">LIVE KINEMATICS</p><h2>三维反馈投影</h2></div><span class="projection-tag">反馈投影</span></div><canvas id="workspace" width="840" height="540" aria-label="NERO 三维反馈投影"></canvas><p class="note">显示 URDF 连杆、实际 TCP、黄色空心目标 TCP、工作区与最低高度面；这是运动学反馈，不是碰撞仿真。</p></section><section class="panel diagnostics-panel"><div class="section-head compact"><div><p class="section-label">OBSERVABILITY</p><h2>运行诊断</h2></div><span class="diagnostic-hint">只读</span></div><div class="diagnostics"><div><span>输入年龄</span><strong id="input-age">--</strong></div><div><span>IK 条件数</span><strong id="condition">--</strong></div><div><span>循环次数</span><strong id="loop-rate">--</strong></div><div><span>CPV 批次</span><strong id="cpv-count">--</strong></div><div><span>实际周期</span><strong id="period-ms">--</strong></div><div><span>求解器龄期</span><strong id="solver-age">--</strong></div><div><span>反馈龄期</span><strong id="feedback-age">--</strong></div><div><span>TCP 位置误差</span><strong id="tcp-position-error">--</strong></div><div><span>TCP 姿态误差</span><strong id="tcp-orientation-error">--</strong></div><div><span>安全闸门</span><strong id="gate-state">--</strong></div><div><span>轨迹状态</span><strong id="trajectory-state">--</strong></div></div></section></aside>
     </div>
 
-    <section class="panel backend-panel backend-bar"><div class="backend-bar-title"><p class="section-label">04 · NERO BACKEND</p><h2>硬件结果</h2><span class="section-note">Transport Owner 的最新只读反馈</span></div><span id="status-age" class="badge neutral">状态 --</span><div class="backend-summary"><div><span>控制器模式</span><strong id="controller-mode">--</strong></div><div><span>当前动作</span><strong id="active-action">无</strong></div><div><span>原因</span><strong id="reason">--</strong></div></div><div class="pose-row"><span>TCP 六维位姿</span><code id="tcp-pose-values">--</code></div><div id="joints" class="joint-grid"></div></section>
+    <section class="panel backend-panel hardware-feedback-card">
+      <div class="hardware-feedback-head">
+        <div>
+          <p class="section-label">04 · HARDWARE FEEDBACK</p>
+          <h2>硬件反馈结果</h2>
+          <p class="section-note">SDK 定义的硬件 TCP 与关节反馈；与 OSC 控制帧、目标帧明确分开。</p>
+        </div>
+        <div class="hardware-feedback-badges">
+          <span id="hardware-feedback-source" class="badge neutral">反馈 --</span>
+          <span id="status-age" class="badge neutral">龄期 --</span>
+        </div>
+      </div>
+      <div class="hardware-feedback-grid">
+        <div class="feedback-pose">
+          <span>SDK 硬件 TCP（基座坐标系）</span>
+          <code id="tcp-pose-values">--</code>
+          <small id="hardware-feedback-note">等待 OSC 反馈样本</small>
+        </div>
+        <div class="backend-summary">
+          <div><span>控制器模式</span><strong id="controller-mode">--</strong></div>
+          <div><span>当前动作</span><strong id="active-action">无</strong></div>
+          <div><span>状态说明</span><strong id="reason">--</strong></div>
+        </div>
+        <div id="joints" class="joint-grid"></div>
+      </div>
+    </section>
 
     <details class="maintenance"><summary><span>维护区</span><small>仅用于控制服务恢复，不属于日常操作</small></summary><div><p>重置只重启控制服务，不发送运动、夹爪、CPV、零力或急停命令。</p><button id="reset-control" class="button" type="button">重置控制服务</button><span id="maintenance-result" class="result"></span></div></details>
     <p id="tcp-reference-readout" class="result">当前 TCP：-- · 参考 TCP：--</p>
   </main>
-  <script src="app.js?v=control-copy-v2"></script>
+  <script src="app.js?v=hardware-feedback-v2"></script>
 </body>
 </html>

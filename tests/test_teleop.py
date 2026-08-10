@@ -274,7 +274,6 @@ class TeleopVelocityStreamTests(unittest.TestCase):
             "solver": {"dt_s": 0.02, "ruckig_max_acceleration": 2.0, "ruckig_max_jerk": 20.0, "urdf": str(ROOT / "vendor/nero_description/nero_description.urdf")},
             "runtime": {"control_hz": 50, "max_control_hz": 100},
             "limits": {
-                "linear_speed_m_s": 0.02,
                 "angular_speed_rad_s": 0.15,
                 "joint_speed_rad_s": 0.45,
                 "input_filter_alpha": 1.0,

@@ -86,6 +86,9 @@ class Solver:
         pin = self.pin
         started = time.perf_counter()
         q_feedback = finite_vector(request.get("joint_angles_rad"), 7, "joint_angles_rad")
+        measured_joint_angles = finite_vector(
+            request.get("measured_joint_angles_rad", q_feedback), 7, "measured_joint_angles_rad"
+        )
         target_position = finite_vector(request.get("target_position_m"), 3, "target_position_m")
         target_quaternion = finite_vector(request.get("target_orientation_xyzw"), 4, "target_orientation_xyzw")
         quaternion_norm = float(np.linalg.norm(np.asarray(target_quaternion, dtype=float)))
@@ -227,6 +230,10 @@ class Solver:
             "ok": True,
             "pink_joint_velocity_rad_s": dq.tolist(),
             "tcp": self.fk(q_feedback),
+            # This FK uses the exact CAN-feedback joint vector attached to the
+            # control sample.  It is telemetry only: Pink still solves from
+            # q_feedback, the delay-compensated control estimate.
+            "measured_tcp": self.fk(measured_joint_angles),
             "condition_number": condition,
             "jacobian_rank": jacobian_rank,
             "joint_velocity_norm": float(np.linalg.norm(dq)),
@@ -347,6 +354,8 @@ def main() -> int:
             "joint_state_rad": latest.get("joint_angles_rad"),
             "joint_state_monotonic_ns": latest.get("joint_state_monotonic_ns"),
             "motion_epoch": latest.get("motion_epoch"),
+            "osc_pink_requested_monotonic_ns": latest.get("osc_pink_requested_monotonic_ns"),
+            "osc_pink_written_monotonic_ns": latest.get("osc_pink_written_monotonic_ns"),
             "solver_monotonic_ns": started_ns,
             "solver_finished_monotonic_ns": time.monotonic_ns(),
         })

@@ -280,7 +280,7 @@ class Pi05InputAdapter:
 
     def _observation(self, osc: dict[str, Any], external: Any, wrist: Any) -> dict[str, Any]:
         import numpy as np
-        pose = (osc.get("execution") or {}).get("current_tcp_pose") or (osc.get("command") or {}).get("target_tcp")
+        pose = (osc.get("execution") or {}).get("measured_tcp_pose") or (osc.get("command") or {}).get("target_tcp")
         if not isinstance(pose, dict): raise RuntimeError("OSC did not publish a current TCP pose")
         position = _finite(pose.get("position_m"), 3, "TCP position")
         # π0.5's state receives its rotation-vector representation.  The current
@@ -325,7 +325,7 @@ class Pi05InputAdapter:
                 limit = min(len(rows), int(self.config["execution"]["replan_steps"]), int(self.config["execution"]["max_chunk_steps"]))
                 with self.lock:
                     self.state.update({"action_chunk": rows, "action_chunk_length": len(rows), "inference_ms": (time.monotonic()-started)*1000., "updated_at": time.time()})
-                base = (osc.get("command") or {}).get("target_tcp") or (osc.get("execution") or {}).get("current_tcp_pose")
+                base = (osc.get("command") or {}).get("target_tcp") or (osc.get("execution") or {}).get("measured_tcp_pose")
                 period_s = float(self.config["execution"]["period_s"])
                 next_step_at = started + period_s
                 for index, action in enumerate(rows[:limit]):

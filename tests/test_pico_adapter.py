@@ -11,7 +11,7 @@ class Broker:
         self.heartbeats = []
         self.state = {"session": {"state": "ACTIVE", "id": "osc-1", "client_id": "browser", "execution_mode": "shadow"},
                       "command": {"sequence": 10, "target_tcp": {"position_m": [0.1, 0.2, 0.3], "orientation_xyzw": [0, 0, 0, 1]}},
-                      "execution": {"current_tcp_pose": {"position_m": [0.1, 0.2, 0.3], "orientation_xyzw": [0, 0, 0, 1]}}}
+                      "execution": {"measured_tcp_pose": {"position_m": [0.1, 0.2, 0.3], "orientation_xyzw": [0, 0, 0, 1]}}}
     def osc_state(self): return self.state
     def osc_command(self, command): self.commands.append(command); return {"ok": True, "result": {"accepted": True}}
     def osc_heartbeat(self, client_id, session_id): self.heartbeats.append((client_id, session_id)); return {"ok": True}

@@ -72,7 +72,7 @@ OSC has no clutch, relative-pose, or anchor fields. Those are optional
 client-side input-adapter concepts; adapters translate them into absolute TCP
 targets before calling OSC.
 
-`GET /api/osc/state` publishes `execution.current_tcp_pose`,
+`GET /api/osc/state` publishes `execution.measured_tcp_pose`,
 `command.target_tcp`, and `diagnostics.tcp_error`. The error is expressed in the base frame as
 target-minus-current `position_vector_m`, its `position_norm_m`, and the
 shortest quaternion `orientation_angle_rad`. The top-level `robot` field is

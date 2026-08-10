@@ -113,7 +113,7 @@ class PicoInputAdapter:
     def anchor_begin(self, pose: dict[str, Any]) -> dict[str, Any]:
         position, orientation = _vector(pose.get("position_m"), 3, "controller position"), _normalise(_vector(pose.get("orientation_xyzw"), 4, "controller orientation"))
         osc = self.broker.osc_state()
-        tcp = (osc.get("execution") or {}).get("current_tcp_pose") or (osc.get("command") or {}).get("target_tcp")
+        tcp = (osc.get("execution") or {}).get("measured_tcp_pose") or (osc.get("command") or {}).get("target_tcp")
         if not isinstance(tcp, dict):
             raise RuntimeError("OSC did not publish a current TCP pose")
         with self.lock:

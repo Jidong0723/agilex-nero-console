@@ -110,8 +110,8 @@ Do not weaken these rules without controlled hardware validation.
 
 ## Configuration
 
-- [`config/runtime.json`](config/runtime.json): CAN interface, motion timeouts, workspace, speed, gripper limits, logging, and service settings.
-- [`config/teleop.json`](config/teleop.json): URDF, control frequency, deadman/staleness thresholds, input filtering, and Cartesian limits.
+- [`config/runtime.json`](config/runtime.json): CAN interface, motion timeouts, speed, gripper limits, logging, and service settings.
+- [`config/teleop.json`](config/teleop.json): URDF, control frequency, deadman/staleness thresholds, input filtering, and the sole Cartesian workspace limits.
 
 Defaults are intentionally conservative. Review every change with the physical workspace and tool geometry in mind.
 

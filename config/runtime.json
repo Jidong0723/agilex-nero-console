@@ -9,7 +9,8 @@
     "bitrate": 1000000,
     "local_loopback": false,
     "receive_own_messages": false,
-    "effector": "agx_gripper"
+    "effector": "agx_gripper",
+    "task_tcp_offset_from_flange_m": [0.175, 0.0, -0.0235]
   },
   "motion": {
     "feedback_timeout_s": 3.0,
@@ -31,9 +32,7 @@
   },
   "safety": {
     "allow_electronic_emergency_stop": false,
-    "min_flange_z_m": -0.01,
-    "workspace_min_xyz_m": [-0.45, -0.45, -0.01],
-    "workspace_max_xyz_m": [0.45, 0.60, 0.70],
+    "min_tcp_z_m": -0.01,
     "min_gripper_width_m": 0.0,
     "max_gripper_width_m": 0.10,
     "max_gripper_force_n": 3.0

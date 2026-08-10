@@ -59,6 +59,33 @@ class NeroRobot:
         self._gripper_requires_enable_clear = False
         self._cpv_stream_started = False
         self._connect_stage = "idle"
+        self._task_tcp_offset_m = self._configured_task_tcp_offset()
+
+    def _configured_task_tcp_offset(self) -> list[float]:
+        """Return the sole task-point offset shared by SDK feedback and OSC."""
+        offset = self.sdk_config.get("task_tcp_offset_from_flange_m")
+        if not isinstance(offset, (list, tuple)) or len(offset) != 3:
+            raise ValueError("sdk.task_tcp_offset_from_flange_m must contain three finite metres")
+        try:
+            values = [float(value) for value in offset]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("sdk.task_tcp_offset_from_flange_m must be numeric") from exc
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("sdk.task_tcp_offset_from_flange_m must be finite")
+        return values
+
+    def _apply_task_tcp_offset(self) -> dict[str, Any]:
+        """Apply the process-local SDK TCP setting after each connection."""
+        if self.robot is None:
+            raise RuntimeError("robot not connected")
+        setter = getattr(self.robot, "set_tcp_offset", None)
+        if not callable(setter):
+            raise RuntimeError("installed NERO SDK does not provide set_tcp_offset")
+        pose = [*self._task_tcp_offset_m, 0.0, 0.0, 0.0]
+        result = setter(pose)
+        if result is False:
+            raise RuntimeError("NERO SDK rejected task TCP offset")
+        return {"offset_from_flange_m": list(self._task_tcp_offset_m), "sdk_result": jsonable(result)}
 
     @property
     def connect_stage(self) -> str:
@@ -101,6 +128,8 @@ class NeroRobot:
         try:
             self._connect_stage = "open_sdk_can_bus"
             self.robot.connect()
+            self._connect_stage = "configure_task_tcp"
+            task_tcp = self._apply_task_tcp_offset()
             self._connect_stage = "initialize_gripper"
             self.gripper = self.robot.init_effector(self.robot.OPTIONS.EFFECTOR.AGX_GRIPPER)
             self._connect_stage = "wait_follower_feedback"
@@ -180,6 +209,7 @@ class NeroRobot:
             "firmware": call_safe("get_firmware", self.robot.get_firmware),
             "gripper_is_ok": call_safe("gripper.is_ok", self.gripper.is_ok),
             "feedback_ready": ready,
+            "task_tcp": task_tcp,
         }
 
     def disconnect(self) -> dict[str, Any]:
@@ -452,7 +482,7 @@ class NeroRobot:
         required = {
             "arm_status": self.robot.get_arm_status,
             "joint_angles": self.robot.get_joint_angles,
-            "flange_pose": self.robot.get_flange_pose,
+            "tcp_pose": self.robot.get_tcp_pose,
         }
         start = time.monotonic()
         last: dict[str, Any] = {}
@@ -468,20 +498,8 @@ class NeroRobot:
         raw = {
             "arm_status": call_safe("get_arm_status", self.robot.get_arm_status),
             "joint_angles": call_safe("get_joint_angles", self.robot.get_joint_angles),
-            "flange_pose": call_safe("get_flange_pose", self.robot.get_flange_pose),
             "joint_enable_status": call_safe("get_joints_enable_status_list", self.robot.get_joints_enable_status_list),
         }
-        # Derive TCP from the same flange sample whenever possible.  Calling
-        # SDK get_tcp_pose() separately can observe an older CAN feedback frame
-        # while the flange read has already advanced, making the UI appear
-        # frozen even though the robot is moving.
-        flange_values = self._float_list(as_list(unwrap_msg(raw["flange_pose"])), 6)
-        tcp_getter = getattr(self.robot, "get_flange2tcp_pose", None)
-        if flange_values is not None and callable(tcp_getter):
-            raw["tcp_pose"] = call_safe("get_flange2tcp_pose", lambda: tcp_getter(flange_values))
-            raw["tcp_pose_source"] = "derived_from_same_flange_feedback"
-        else:
-            raw["tcp_pose"] = call_safe("get_tcp_pose", self.robot.get_tcp_pose)
         motor_states: list[dict[str, Any]] = []
         driver_states: list[dict[str, Any]] = []
         if include_motor_states:
@@ -495,20 +513,24 @@ class NeroRobot:
             if leader is not None:
                 joint_values = leader["joint_angles_rad"]
                 raw["leader_joint_angles"] = leader
-                # In Leader mode NERO may keep the follower flange feedback
-                # unchanged while the live joint stream continues. Use the
-                # SDK FK result for the display/observation path only.
+                # In Leader mode NERO may keep follower pose feedback stale.
+                # Use SDK FK of live joints, then its configured task transform.
+                # The intermediate flange pose never leaves this adapter.
                 fk_result = call_safe("fk(leader_joint_angles)", lambda: self.robot.fk(joint_values))
                 fk_pose = self._float_list(as_list(fk_result.get("value")), 6) \
                     if fk_result.get("ok") else None
                 if fk_pose is not None:
-                    raw["flange_pose_sdk_fk"] = fk_pose
-                    raw["flange_pose_source"] = "sdk_fk_leader"
-                    raw["flange_pose"] = {"ok": True, "value": fk_pose}
+                    raw["tcp_pose"] = call_safe(
+                        "get_flange2tcp_pose(fk_leader_joints)",
+                        lambda: self.robot.get_flange2tcp_pose(fk_pose),
+                    )
+                    raw["tcp_pose_source"] = "sdk_tcp_from_leader_fk"
+        if "tcp_pose" not in raw:
+            raw["tcp_pose"] = call_safe("get_tcp_pose", self.robot.get_tcp_pose)
+            raw["tcp_pose_source"] = "sdk_tcp_from_follower_feedback"
         return RobotState(
             timestamp=now_iso(),
             joint_angles_rad=joint_values,
-            flange_pose=self._float_list(as_list(unwrap_msg(raw["flange_pose"])), 6),
             tcp_pose=self._float_list(as_list(unwrap_msg(raw["tcp_pose"])), 6),
             arm_status=unwrap_msg(raw["arm_status"]),
             joint_enable_status=as_list(unwrap_msg(raw["joint_enable_status"])),
@@ -520,7 +542,7 @@ class NeroRobot:
     def read_teleop_feedback(self) -> dict[str, Any]:
         """Return the minimal cached feedback set required by CPV velocity servo.
 
-        This intentionally avoids flange/TCP/driver status reads.  The SDK
+        This intentionally avoids pose/driver status reads.  The SDK
         updates joint and motor feedback from its CAN receive path, so the
         teleop cache thread can remain independent from the HTTP status path.
         """
@@ -528,6 +550,17 @@ class NeroRobot:
         raw_joints = call_safe("get_joint_angles", self.robot.get_joint_angles)
         raw_motors = call_joint_indexed("get_motor_states", self.robot.get_motor_states)
         joints = self._float_list(as_list(unwrap_msg(raw_joints)), 7)
+        joint_message = raw_joints.get("value") if isinstance(raw_joints, dict) else None
+        # ``call_safe`` makes SDK messages JSON-safe before they reach this
+        # adapter.  Their timestamp/hz metadata is therefore normally a dict,
+        # not an object with attributes.  Losing it made the feedback worker
+        # treat all post-startup hardware samples as stale.
+        if isinstance(joint_message, dict):
+            sdk_joint_timestamp = joint_message.get("timestamp")
+            joint_feedback_hz = joint_message.get("hz")
+        else:
+            sdk_joint_timestamp = getattr(joint_message, "timestamp", None)
+            joint_feedback_hz = getattr(joint_message, "hz", None)
         velocities: list[float | None] = []
         for motor in raw_motors:
             value = unwrap_msg(motor)
@@ -536,41 +569,13 @@ class NeroRobot:
         return {
             "joint_angles_rad": joints,
             "joint_velocity_rad_s": velocities if len(velocities) == 7 else None,
-            "timestamp_monotonic_ns": time.monotonic_ns(),
+            # These are metadata on the SDK's cached CAN message, not a new
+            # CAN request.  Keep both the device/SDK timestamp and when this
+            # process received the cached value.
+            "sdk_joint_timestamp": jsonable(sdk_joint_timestamp),
+            "joint_feedback_hz": joint_feedback_hz,
+            "received_at_monotonic_ns": time.monotonic_ns(),
         }
-
-    def read_teleop_joint_limits(self) -> dict[str, Any]:
-        """Return the conservative teleop envelope without indexed CAN reads.
-
-        The NERO USB-CAN adapter can spend several seconds servicing the
-        fourteen indexed limit queries.  Teleop already clamps commands below
-        this fixed controller envelope, so startup must not compete with CPV
-        feedback and motion traffic for those reads.
-        """
-        self._require_connected()
-        controller_limits = (
-            (-2.705260340591211, 2.705260340591211, 3.14),
-            (-1.7453292519943295, 1.7453292519943295, 3.14),
-            (-2.7576202181510405, 2.7576202181510405, 3.14),
-            (-1.0122909661567112, 2.1467549799530254, 3.14),
-            (-2.7576202181510405, 2.7576202181510405, 3.92),
-            (-0.7330382858376184, 0.9599310885968813, 3.92),
-            (-1.5707963267948966, 1.5707963267948966, 3.92),
-        )
-        rows = [
-            {
-                "joint_index": index,
-                "angle_velocity": {
-                    "min_angle_limit": lower,
-                    "max_angle_limit": upper,
-                    "max_joint_spd": speed,
-                },
-                "acceleration": {"max_joint_acc": 5.0},
-                "raw": {"source": "conservative NERO controller envelope"},
-            }
-            for index, (lower, upper, speed) in enumerate(controller_limits, start=1)
-        ]
-        return {"joints": rows, "timestamp_monotonic_ns": time.monotonic_ns()}
 
     def read_gripper(self) -> GripperState:
         self._require_connected()

@@ -15,7 +15,7 @@ class PoseTeleopTests(unittest.TestCase):
         return {
             "solver": {"dt_s": 0.02, "ruckig_max_acceleration": 2.0, "ruckig_max_jerk": 20.0, "urdf": str(Path(__file__).resolve().parents[1] / "vendor/nero_description/nero_description.urdf")},
             "runtime": {"control_hz": 50, "max_control_hz": 100},
-            "limits": {"joint_speed_rad_s": 0.45, "deadman_timeout_s": 1.0, "feedback_soft_stale_s": 1.0, "feedback_hard_stale_s": 2.0, "solver_stale_s": 1.0, "max_stale_velocity_repeats": 3, "workspace_min_m": [-0.45, -0.45, -0.01], "workspace_max_m": [0.45, 0.60, 0.70], "min_flange_z_m": -0.01},
+            "limits": {"joint_speed_rad_s": 0.45, "deadman_timeout_s": 1.0, "feedback_soft_stale_s": 1.0, "feedback_hard_stale_s": 2.0, "solver_stale_s": 1.0, "max_stale_velocity_repeats": 3, "workspace_min_m": [-0.45, -0.45, -0.01], "workspace_max_m": [0.45, 0.60, 0.70], "min_tcp_z_m": -0.01},
             "pose_input": {"mapping_verified": mapping_verified, "position_axis_map": [[1, 0, 0], [0, 1, 0], [0, 0, 1]], "orientation_axis_map": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]},
         }
 

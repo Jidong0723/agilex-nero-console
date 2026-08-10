@@ -127,11 +127,11 @@ def _pose(pose: dict[str, Any]) -> tuple[list[float], list[float]]:
 
 def run(static_only: bool = False) -> dict[str, Any]:
     config = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
-    limits = config["limits"]
     delta_position = [0.0, 0.0, 0.0] if static_only else DELTA_POSITION_M
     delta_rpy = [0.0, 0.0, 0.0] if static_only else DELTA_RPY_RAD
-    max_linear = float(limits["linear_speed_m_s"]) * 0.80
-    max_angular = float(limits["angular_speed_rad_s"]) * 0.80
+    # Benchmark input trajectory only; it is not an OSC runtime limit.
+    max_linear = 0.048
+    max_angular = float(config["limits"]["angular_speed_rad_s"]) * 0.80
     duration = (4.0 / 3.0) * max(
         _norm(delta_position) / max_linear,
         _norm(delta_rpy) / max_angular,
@@ -176,7 +176,7 @@ def run(static_only: bool = False) -> dict[str, Any]:
             timing = (snapshot.get("diagnostics") or {}).get("timing") or {}
             if isinstance(timing.get("actual_dt_s"), (int, float)):
                 control_periods_s.append(float(timing["actual_dt_s"]))
-            tcp = execution.get("current_tcp_pose")
+            tcp = execution.get("measured_tcp_pose")
             joints = execution.get("observed_joint_state_rad")
             if isinstance(tcp, dict) and isinstance(joints, list):
                 position, rotation = _pose(tcp)

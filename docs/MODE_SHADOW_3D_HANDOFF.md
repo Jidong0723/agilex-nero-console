@@ -117,7 +117,7 @@ reference_pose
 - URDF、TCP offset、FK。
 - Pink 关节速度求解。
 - Ruckig 速度/加速度轨迹。
-- 关节限制、workspace、flange 高度限制。
+- 关节限制、workspace、TCP 高度限制。
 - 延迟预算和最终安全门。
 - `HOLD_READY`、`RUNNING`、`BRAKING`、`FAULT` 状态。
 
@@ -372,7 +372,7 @@ shadow_initial_joints_rad
 1. workspace 底面。
 2. workspace 网格。
 3. X/Y/Z 坐标轴。
-4. 最低 flange 高度平面。
+4. 最低 TCP 高度平面。
 5. `link_positions_m` 连杆折线。
 6. 实际 TCP 点和姿态轴。
 7. `reference_pose` 的目标 TCP `T_ref`。

@@ -142,6 +142,21 @@
   const ctx = canvas?.getContext("2d");
   const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
   const fixed = (value, digits = 2) => Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : "--";
+  const controllerModeLabel = (value) => {
+    const code = Number(value);
+    const labels = {
+      0: "待机",
+      1: "CAN 指令控制",
+      2: "示教模式",
+      3: "以太网控制",
+      4: "Wi-Fi 控制",
+      5: "远程控制",
+      6: "联动示教输入",
+      7: "离线轨迹",
+      8: "TCP 控制",
+    };
+    return Number.isInteger(code) ? `${labels[code] || "未知控制模式"}（${code}）` : "--";
+  };
 
   async function api(path, method = "GET", body, timeout = method === "GET" ? 900 : 7000) {
     const controller = new AbortController();
@@ -493,6 +508,17 @@
     if (!result?.ok) {
       const acceptedSequence = Number(result?.result?.accepted_sequence);
       if (Number.isFinite(acceptedSequence)) state.oscSequence = Math.max(state.oscSequence, acceptedSequence);
+      const safeTarget = result?.result?.safe_target_pose;
+      if (result?.result?.recoverable && safeTarget?.position_m && safeTarget?.orientation_xyzw) {
+        // A one-shot workspace rejection must not trap the browser in an
+        // invalid accumulated relative pose. Re-anchor to OSC's last safe
+        // absolute target while keeping the active session and lease intact.
+        state.oscAnchor = {
+          position_m: [...safeTarget.position_m],
+          orientation_xyzw: [...safeTarget.orientation_xyzw],
+        };
+        resetInput(false);
+      }
       const reason = result?.result?.reason || result?.state?.diagnostics?.trajectory_brake_reason || "OSC 未接受该目标";
       throw new Error(`OSC 拒绝：${reason}`);
     }
@@ -582,7 +608,7 @@
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     const tcp = teleop?.diagnostics?.pink?.tcp || {};
     const links = Array.isArray(tcp.link_positions_m) ? tcp.link_positions_m : [];
-    const currentPose = teleop?.execution?.current_tcp_pose || null;
+    const currentPose = teleop?.execution?.measured_tcp_pose || teleop?.transport?.hardware_feedback?.tcp_pose || null;
     const position = Array.isArray(currentPose?.position_m) && currentPose.position_m.length === 3 && currentPose.position_m.every((value) => Number.isFinite(Number(value)))
       ? currentPose.position_m.map(Number)
       : (Array.isArray(tcp.position_m) && tcp.position_m.length === 3 && tcp.position_m.every((value) => Number.isFinite(Number(value))) ? tcp.position_m.map(Number) : null);
@@ -593,7 +619,7 @@
     const workspace = teleop?.workspace || {};
     const min = Array.isArray(workspace.min_xyz_m) ? workspace.min_xyz_m.map(Number) : [-0.45, -0.15, -0.02];
     const max = Array.isArray(workspace.max_xyz_m) ? workspace.max_xyz_m.map(Number) : [0.45, 0.60, 0.70];
-    const minZ = Number.isFinite(Number(workspace.min_flange_z_m)) ? Number(workspace.min_flange_z_m) : min[2];
+    const minZ = Number.isFinite(Number(workspace.min_tcp_z_m)) ? Number(workspace.min_tcp_z_m) : min[2];
     const span = Math.max(max[0] - min[0], max[1] - min[1], max[2] - minZ, 0.1);
     const scale = Math.min(canvas.width, canvas.height) * 0.72 / span;
     const project = ([x, y, z]) => ({
@@ -673,10 +699,14 @@
     const transport = teleop.transport || {};
     const command = teleop.command || {};
     const execution = teleop.execution || {};
-    const robot = teleop.robot || {};
+    const hardwareFeedback = transport.hardware_feedback || {};
     const current = session();
     const diagnostic = teleop.diagnostics || {};
     const timing = diagnostic.timing || {};
+    const executionFeedbackAge = finite(execution.feedback_age_s, NaN);
+    const hardwareFeedbackAge = finite(hardwareFeedback.feedback_age_s, NaN);
+    const timingFeedbackAge = finite(timing.feedback_age_s, NaN);
+    const feedbackAgeS = Number.isFinite(executionFeedbackAge) ? executionFeedbackAge : Number.isFinite(timingFeedbackAge) ? timingFeedbackAge : hardwareFeedbackAge;
     // A successful /api/status response already proves that the service is
     // online. This flag describes only the USB-CAN robot transport.
     badge("connection", transport.connected ? "\u786c\u4ef6\u5df2\u8fde\u63a5" : "\u786c\u4ef6\u672a\u8fde\u63a5", transport.connected ? "ok" : "warn");
@@ -684,7 +714,7 @@
     const modeLabel = current.state === "ACTIVE" ? `${adapterName} + ${isShadowSession(current) ? "影子" : "真机"}` : "未接入";
     badge("teleop-mode", modeLabel, current.state === "ACTIVE" && isShadowSession(current) ? "ok" : current.state === "ACTIVE" ? "warn" : "neutral");
     badge("session-state", current.state || "IDLE", current.state === "ACTIVE" ? "ok" : "neutral");
-    badge("feedback-state", Number.isFinite(finite(timing.feedback_age_s, NaN)) ? `反馈 ${Math.round(timing.feedback_age_s * 1000)} ms` : "反馈 --", transport.can_health?.ok ? "ok" : "warn");
+    badge("feedback-state", Number.isFinite(feedbackAgeS) ? `反馈 ${Math.round(feedbackAgeS * 1000)} ms` : "反馈 --", transport.can_health?.ok ? "ok" : "warn");
     badge("safety-state", `安全 ${broker.safety_state || diagnostic.trajectory_state || "--"}`, broker.safety_state === "FAULT" ? "fault" : "neutral");
     badge("writer-state", `Writer ${broker.arm_writer || "--"}`, broker.arm_writer === "SERVO" ? "ok" : "neutral");
     badge("servo-state", `Servo ${broker.servo_mode || "--"}`, broker.servo_mode === "TRACKING" ? "ok" : "neutral");
@@ -693,21 +723,15 @@
     phase(state.last_error || livePhase || inputStatus, Boolean(state.last_error));
     $("solver-badge").textContent = teleop.solver?.running ? "求解器在线" : "求解器空闲";
     $("solver-badge").className = `badge ${teleop.solver?.running ? "ok" : "neutral"}`;
-    $("status-age").textContent = Number.isFinite(finite(timing.feedback_age_s, NaN)) ? `反馈 ${Math.round(timing.feedback_age_s * 1000)} ms` : "反馈 --";
+    $("status-age").textContent = Number.isFinite(feedbackAgeS) ? `反馈 ${Math.round(feedbackAgeS * 1000)} ms` : "反馈 --";
     $("control-mode").textContent = `${broker.hardware_mode || "DISCONNECTED"} · ${broker.control_role || "NONE"}`;
-    $("controller-mode").textContent = robot.arm_status?.ctrl_mode ?? "--";
+    $("controller-mode").textContent = controllerModeLabel(hardwareFeedback.arm_status?.ctrl_mode);
     $("active-action").textContent = teleop.active_action?.type || "无";
     $("reason").textContent = transport.reason || diagnostic.safety_gate?.reason || diagnostic.trajectory_brake_reason || "--";
     const grip = teleop.gripper || {};
     $("gripper-width-value").textContent = grip.width_m == null ? "--" : `${fixed(grip.width_m * 1000, 1)} mm`;
     $("gripper-force").textContent = grip.force_n == null ? "--" : `${fixed(grip.force_n, 2)} N`;
     $("gripper-driver").textContent = grip.status?.foc_status?.driver_enable_status ? "已使能" : "--";
-    const formatPose = (pose) => {
-      if (!Array.isArray(pose) || pose.length !== 6 || !pose.every((value) => Number.isFinite(Number(value)))) return "--";
-      const values = pose.map(Number);
-      return `位置 [${values.slice(0, 3).map((value) => `${value.toFixed(4)} m`).join(", ")}] · 姿态 [${values.slice(3).map((value) => `${value.toFixed(4)} rad`).join(", ")}]`;
-    };
-    $("tcp-pose-values").textContent = formatPose(robot.tcp_pose);
     const formatAbsolutePose = (pose) => {
       const position = pose?.position_m;
       const orientation = pose?.orientation_xyzw;
@@ -715,9 +739,19 @@
       const rpy = eulerFromQuat(orientation).map((value) => `${value.toFixed(3)} rad`);
       return `位置 [${position.map((value) => `${Number(value).toFixed(3)} m`).join(", ")}] · RPY [${rpy.join(", ")}]`;
     };
+    const hardwarePose = hardwareFeedback.tcp_pose || execution.measured_tcp_pose || null;
+    $("tcp-pose-values").textContent = formatAbsolutePose(hardwarePose);
+    const hardwareSource = hardwareFeedback.tcp_source || "none";
+    const feedbackAgeMs = Number.isFinite(hardwareFeedbackAge) ? hardwareFeedbackAge : executionFeedbackAge;
+    const feedbackSourceText = hardwareSource === "sdk_tcp_from_leader_fk" ? "SDK TCP · Leader FK" : hardwareSource === "sdk_tcp_from_follower_feedback" ? "SDK TCP · Follower" : "反馈未就绪";
+    badge("hardware-feedback-source", feedbackSourceText, hardwarePose ? "ok" : "neutral");
+    const feedbackNote = $("hardware-feedback-note");
+    if (feedbackNote) feedbackNote.textContent = Number.isFinite(feedbackAgeMs)
+      ? `${hardwareFeedback.joint_feedback_source === "leader" ? "FREEDRIVE · Leader 关节反馈" : "SDK 只读硬件反馈"} · 反馈龄期 ${Math.round(feedbackAgeMs * 1000)} ms`
+      : "等待 OSC 控制循环发布有效反馈样本";
     const referenceLine = $("tcp-reference-readout");
-    if (referenceLine) referenceLine.textContent = `当前 TCP：${formatAbsolutePose(execution.current_tcp_pose)} · 目标 TCP：${formatAbsolutePose(command.target_tcp)}`;
-    const joints = robot.joint_angles_rad || [];
+    if (referenceLine) referenceLine.textContent = `实测 TCP（同一采样）：${formatAbsolutePose(execution.measured_tcp_pose)} · 目标 TCP（同一采样）：${formatAbsolutePose(command.target_tcp)}`;
+    const joints = hardwareFeedback.joint_angles_rad || execution.measured_joint_state_rad || [];
     $("joints").innerHTML = joints.map((value, index) => `<div><span>J${index + 1}</span><strong>${fixed(value * 180 / Math.PI, 2)}°</strong></div>`).join("") || "<span class='muted'>无关节反馈</span>";
     $("input-age").textContent = Number.isFinite(finite(current.last_input_age_s, NaN)) ? `${fixed(current.last_input_age_s, 2)} s` : "--";
     $("loop-rate").textContent = String(diagnostic.loop_count ?? "--");
@@ -726,8 +760,10 @@
     $("condition").textContent = Number.isFinite(finite(diagnostic.pink?.condition_number, NaN)) ? fixed(diagnostic.pink.condition_number, 1) : "--";
     $("period-ms").textContent = Number.isFinite(finite(timing.actual_dt_s, NaN)) ? `${fixed(timing.actual_dt_s * 1000, 1)} ms` : "--";
     $("solver-age").textContent = Number.isFinite(finite(timing.solver_age_s, NaN)) ? `${fixed(timing.solver_age_s * 1000, 0)} ms` : "--";
-    $("feedback-age").textContent = Number.isFinite(finite(timing.feedback_age_s, NaN)) ? `${fixed(timing.feedback_age_s * 1000, 0)} ms` : "--";
-    const tcpError = diagnostic.tcp_error || {};
+    $("feedback-age").textContent = Number.isFinite(feedbackAgeS) ? `${fixed(feedbackAgeS * 1000, 0)} ms` : "--";
+    // The headline error is deliberately physical/plant feedback against the
+    // target bound to the same OSC sample, never Pink's predicted FK error.
+    const tcpError = diagnostic.measured_tracking_error || diagnostic.tcp_error || {};
     $("tcp-position-error").textContent = Number.isFinite(finite(tcpError.position_norm_m, NaN)) ? `${fixed(tcpError.position_norm_m * 1000, 1)} mm` : "--";
     $("tcp-orientation-error").textContent = Number.isFinite(finite(tcpError.orientation_angle_rad, NaN)) ? `${fixed(tcpError.orientation_angle_rad * 180 / Math.PI, 1)}°` : "--";
     $("gate-state").textContent = timing.gate_limited === true ? "限速" : timing.gate_ok === true ? "通过" : timing.gate_ok === false ? "拒绝" : "--";
@@ -763,27 +799,36 @@
     // disconnected, initializing, or stuck.
     $("reset-control").disabled = Date.now() < state.resetPendingUntil;
     drawWorkspace(teleop);
-    renderHierarchy(teleop, broker, transport, robot, diagnostic, current);
+    renderHierarchy(teleop, broker, transport, hardwareFeedback, diagnostic, current);
     renderPi05();
     renderPico();
     renderCameraControls();
   }
 
-  async function refresh() {
+  async function refresh(includeAuxiliary = true) {
     if (state.refreshBusy) return;
     state.refreshBusy = true;
     const generation = state.requestGeneration;
     const resetPending = Date.now() < state.resetPendingUntil;
     const statusTimeout = resetPending ? 5000 : 900;
     try {
-      const [osc, pi05, pico] = await Promise.all([api("/api/osc/state", "GET", undefined, statusTimeout), api("/api/pi05/state", "GET", undefined, statusTimeout), api("/api/adapters/pico/state", "GET", undefined, statusTimeout)]);
+      const requests = [api("/api/osc/state", "GET", undefined, statusTimeout)];
+      if (includeAuxiliary) {
+        requests.push(
+          api("/api/pi05/state", "GET", undefined, statusTimeout),
+          api("/api/adapters/pico/state", "GET", undefined, statusTimeout),
+        );
+      }
+      const [osc, pi05, pico] = await Promise.all(requests);
       if (generation !== state.requestGeneration) return;
       const sequence = Number(osc.state_sequence || osc.session?.sequence || 0);
       if (sequence < state.latestSequence) return;
       state.latestSequence = sequence;
       state.teleop = osc;
-      state.pi05 = pi05;
-      state.pico = pico;
+      if (includeAuxiliary) {
+        state.pi05 = pi05;
+        state.pico = pico;
+      }
       if (resetPending) {
         state.resetPendingUntil = 0;
         $("maintenance-result").textContent = "\u63a7\u5236\u670d\u52a1\u5df2\u6062\u590d\u3002";
@@ -1078,7 +1123,10 @@
   updateInputView();
   applyAdapterSelection();
   refresh();
-  setInterval(refresh, 500);
+  // OSC state is cached and published without an SDK read, so the console
+  // can consume the same 50 Hz state cadence as the servo loop.
+  setInterval(() => { void refresh(false); }, 20);
+  setInterval(() => { void refresh(true); }, 500);
   setInterval(refreshPi05Frames, 200);
   setInterval(heartbeat, 1000);
   setInterval(() => {

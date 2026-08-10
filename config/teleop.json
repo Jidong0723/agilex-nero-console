@@ -17,22 +17,12 @@
     "frame_gain": 1.0,
     "frame_lm_damping": 0.0,
     "synchronous_response_budget_s": 0.019,
-    "target_prediction_horizon_s": 0.08,
     "joint_center_cost": 0.001,
     "joint_center_deadband": 0.7,
     "feedback_limit_tolerance_rad": 0.05,
     "hold_velocity_epsilon_rad_s": 0.005,
     "hold_acceleration_epsilon_rad_s2": 0.02,
     "urdf": "vendor/nero_description/nero_description.urdf"
-  },
-  "tcp": {
-    "offset_from_link7_m": [
-      0.175,
-      0.0,
-      -0.0235
-    ],
-    "verified": false,
-    "source": "NERO AGX gripper URDF candidate"
   },
   "osc": {
     "arrival_position_tolerance_m": 0.0005,
@@ -109,7 +99,6 @@
     0.0
   ],
   "limits": {
-    "linear_speed_m_s": 0.06,
     "angular_speed_rad_s": 0.45,
     "joint_speed_rad_s": 1.5,
     "velocity_error_warning_rad_s": 0.1,
@@ -123,17 +112,23 @@
     "input_filter_alpha": 1.0,
     "deadman_timeout_s": 0.25,
     "workspace_min_m": [
-      -0.45,
-      -0.45,
-      -0.01
+      -0.6,
+      -0.6,
+      0.0
     ],
     "workspace_max_m": [
-      0.45,
+      0.6,
       0.6,
       0.7
     ],
-    "min_flange_z_m": -0.01,
+    "min_tcp_z_m": 0.0,
     "singularity_condition_max": 2500.0
+  },
+  "hardware_limits": {
+    "lower_rad": [-2.705260340591211, -1.7453292519943295, -2.7576202181510405, -1.0122909661567112, -2.7576202181510405, -0.7330382858376184, -1.5707963267948966],
+    "upper_rad": [2.705260340591211, 1.7453292519943295, 2.7576202181510405, 2.1467549799530254, 2.7576202181510405, 0.9599310885968813, 1.5707963267948966],
+    "speed_rad_s": [3.14, 3.14, 3.14, 3.14, 3.92, 3.92, 3.92],
+    "acceleration_rad_s2": [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
   },
   "joint_conventions": [
     {
@@ -213,6 +208,12 @@
     "max_control_hz": 100,
     "mode": "shadow",
     "max_trajectory_points": 200
+  },
+  "diagnostics": {
+    "cycle_trace_capacity": 512,
+    "cycle_trace_tail": 32,
+    "response_joint_tolerance_rad": 0.02,
+    "response_timeout_s": 1.0
   },
   "hardware_readonly_calibration": {
     "source": "read_only_idle_can_probe",

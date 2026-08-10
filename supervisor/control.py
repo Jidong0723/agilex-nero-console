@@ -21,44 +21,34 @@ from motion.teleop import OperationalSpaceServo
 from .pi05_adapter import Pi05InputAdapter
 from .pico_adapter import PicoInputAdapter
 from .camera_resource import SharedCameraResource
+from .telemetry import TelemetryReader
+from .hardware_maintenance import HardwareMaintenance
 
-
-GRIPPER_TIP_CANDIDATE_OFFSET_M = (0.175, 0.0, -0.0235)
-
-
-def candidate_tool_pose_from_flange(flange_pose: Any) -> dict[str, Any] | None:
-    """Return the unverified gripper-tip candidate expressed in the base frame."""
-    if not isinstance(flange_pose, (list, tuple)) or len(flange_pose) != 6:
+def absolute_pose_from_sdk_rpy(tcp_pose: Any) -> dict[str, list[float]] | None:
+    """Convert the SDK's base-frame XYZ/RPY feedback into the public pose form."""
+    if not isinstance(tcp_pose, (list, tuple)) or len(tcp_pose) != 6:
         return None
     try:
-        values = [float(value) for value in flange_pose]
+        x, y, z, roll, pitch, yaw = (float(value) for value in tcp_pose)
     except (TypeError, ValueError):
         return None
-    if not all(math.isfinite(value) for value in values):
+    if not all(math.isfinite(value) for value in (x, y, z, roll, pitch, yaw)):
         return None
-    roll, pitch, yaw = values[3:]
-    cr, sr = math.cos(roll), math.sin(roll)
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    # Matches the project's RPY convention: Rz(yaw) @ Ry(pitch) @ Rx(roll).
-    rotation = (
-        (cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr),
-        (sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr),
-        (-sp, cp * sr, cp * cr),
-    )
-    offset = GRIPPER_TIP_CANDIDATE_OFFSET_M
-    position = [
-        values[index] + sum(rotation[index][axis] * offset[axis] for axis in range(3))
-        for index in range(3)
-    ]
+    # Rz(yaw) @ Ry(pitch) @ Rx(roll), matching the SDK/URDF convention used
+    # throughout this project.  The published quaternion is XYZW.
+    half_roll, half_pitch, half_yaw = roll / 2.0, pitch / 2.0, yaw / 2.0
+    cr, sr = math.cos(half_roll), math.sin(half_roll)
+    cp, sp = math.cos(half_pitch), math.sin(half_pitch)
+    cy, sy = math.cos(half_yaw), math.sin(half_yaw)
     return {
-        "position_m": position,
-        "rpy_rad": values[3:],
-        "offset_from_flange_m": list(offset),
-        "source": "NERO AGX gripper URDF candidate",
-        "verified": False,
+        "position_m": [x, y, z],
+        "orientation_xyzw": [
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+            cr * cp * cy + sr * sp * sy,
+        ],
     }
-
 
 class LeaseError(RuntimeError):
     pass
@@ -159,6 +149,8 @@ class OperationalSpaceController:
         self._transport_reset_scheduled = False
         self._hardware_transport_available = True
         self.robot = TransportRobotProxy(self._transport_owner, backend)
+        self.telemetry = TelemetryReader(self.robot)
+        self.maintenance = HardwareMaintenance(self.robot)
         self.supervisor = ControlSupervisor()
         self._status_cache: tuple[float, dict[str, Any]] | None = None
         self._active_action: dict[str, Any] | None = None
@@ -170,6 +162,23 @@ class OperationalSpaceController:
         self._last_sdk_read_duration_ms: float | None = None
         teleop_path = Path(__file__).resolve().parents[1] / "config" / "teleop.json"
         teleop_config = json.loads(teleop_path.read_text(encoding="utf-8-sig")) if teleop_path.is_file() else {}
+        task_tcp_offset = (config_data.get("sdk") or {}).get("task_tcp_offset_from_flange_m")
+        if task_tcp_offset is None:
+            # Dependency-injected fakes used by the non-hardware test suite
+            # commonly carry an empty config.  Their task geometry still
+            # resolves from the same project runtime source as production.
+            runtime_path = Path(__file__).resolve().parents[1] / "config" / "runtime.json"
+            runtime_defaults = json.loads(runtime_path.read_text(encoding="utf-8-sig"))
+            task_tcp_offset = (runtime_defaults.get("sdk") or {}).get("task_tcp_offset_from_flange_m")
+        if not isinstance(task_tcp_offset, list) or len(task_tcp_offset) != 3:
+            raise ValueError("runtime sdk.task_tcp_offset_from_flange_m must contain three values")
+        # The solver receives its task point only from runtime SDK config.
+        # Keeping it out of teleop.json prevents SDK/Pink transform drift.
+        teleop_config["tcp"] = {
+            "offset_from_link7_m": [float(value) for value in task_tcp_offset],
+            "verified": True,
+            "source": "runtime.sdk.task_tcp_offset_from_flange_m",
+        }
         self.osc_servo = OperationalSpaceServo(self, Path(__file__).resolve().parents[1], teleop_config)
         # Legacy adapters and callers retain this name, but it is the same
         # single OSC servo instance, never a second control loop.
@@ -308,28 +317,14 @@ class OperationalSpaceController:
 
         threading.Thread(target=request_reset, name="transport-fault-reset", daemon=True).start()
 
-    def read_teleop_joint_limits(self) -> dict[str, Any]:
-        return self.robot.read_teleop_joint_limits()
-
     def read_teleop_feedback(self) -> dict[str, Any]:
         # Feedback is advisory for the servo loop; P1 CPV output wins once
         # both requests have reached the single transport owner.
         return self.robot.call("p2", "read_teleop_feedback", category="teleop_feedback")
 
     def read_teleop_cpv_parameters(self) -> dict[str, Any]:
-        """Read, never modify, the vendor CPV settings through the sole owner."""
-        names = ("acc", "dcc", "cv", "pp", "kp", "ki")
-        started_ns = time.monotonic_ns()
-        values: dict[str, list[Any]] = {}
-        for name in names:
-            values[name] = [
-                self.robot.call("p2", "read_cpv_parameter", joint, name, category="teleop_cpv_read")
-                for joint in range(1, 8)
-            ]
-        missing = [f"{name}:J{joint + 1}" for name, row in values.items() for joint, value in enumerate(row) if value is None]
-        return {"status": "available" if not missing else "partial", "values": values, "missing": missing,
-                "read_started_monotonic_ns": started_ns,
-                "read_finished_monotonic_ns": time.monotonic_ns()}
+        """Compatibility facade for the hardware-maintenance diagnostic API."""
+        return self.maintenance.read_cpv_parameters()
 
     def sync_cpv_profile_to_osc_limits(self) -> dict[str, Any]:
         """Apply current OSC limits only while the arm is safely idle/HOLD."""
@@ -341,7 +336,7 @@ class OperationalSpaceController:
             raise RuntimeError(f"CPV profile can only change in HOLD (current mode={control.get('mode')})")
         readiness = self._cached_feedback_readiness()
         if not readiness.get("ok"):
-            # A full status snapshot includes flange, arm, and gripper reads.
+            # A full status snapshot includes TCP, arm, and gripper reads.
             # On some NERO firmware revisions it can take several seconds,
             # although the lightweight joint-feedback read remains current.
             # Do not weaken the freshness guard: validate that direct read
@@ -588,7 +583,6 @@ class OperationalSpaceController:
                     "control": offline_control,
                     "active_action": None,
                     "gripper": {"raw": {"ok": False, "error": offline_control["error"]}},
-                    "tool_pose_candidate": None,
                     "gripper_hold": {"supported": False, "active": False},
                     "broker": self.authority_status(offline_control),
                     "safety_priority": ["power_switch", "operator_takeover", "leased_action"],
@@ -681,7 +675,7 @@ class OperationalSpaceController:
         if not isinstance(robot, dict):
             return {"ok": False, "reason": "robot feedback is not available"}
         joints = robot.get("joint_angles_rad")
-        flange = robot.get("flange_pose")
+        tcp = robot.get("tcp_pose")
         arm_status = robot.get("arm_status")
         mode = control.get("mode")
         backend = control.get("freedrive_backend")
@@ -690,14 +684,14 @@ class OperationalSpaceController:
         valid_joints = isinstance(joints, list) and len(joints) == 7 and all(
             isinstance(value, (int, float)) and math.isfinite(value) for value in joints
         )
-        valid_flange = isinstance(flange, list) and len(flange) == 6 and all(
-            isinstance(value, (int, float)) and math.isfinite(value) for value in flange
+        valid_tcp = isinstance(tcp, list) and len(tcp) == 6 and all(
+            isinstance(value, (int, float)) and math.isfinite(value) for value in tcp
         )
         valid_leader = (
             mode == "FREEDRIVE"
             and backend in {"leader", "drag_teach"}
             and valid_joints
-            and valid_flange
+            and valid_tcp
             and isinstance(leader_age, (int, float))
             and math.isfinite(leader_age)
             and leader_age <= 0.5
@@ -709,29 +703,22 @@ class OperationalSpaceController:
                 "reason": "fresh Leader feedback is available; HOLD can exit zero-force mode",
             }
         valid_arm_status = isinstance(arm_status, dict) and arm_status.get("arm_status") is not None
-        if valid_joints and valid_flange and valid_arm_status:
+        if valid_joints and valid_tcp and valid_arm_status:
             return {"ok": True, "reason": "fresh follower feedback is available"}
-        if not (valid_joints and valid_flange and valid_arm_status):
+        if not (valid_joints and valid_tcp and valid_arm_status):
             missing = []
             if not valid_joints:
                 missing.append("seven joint angles")
-            if not valid_flange:
-                missing.append("flange pose")
+            if not valid_tcp:
+                missing.append("TCP pose")
             if not valid_arm_status:
                 missing.append("arm status")
             return {"ok": False, "reason": f"fresh NERO feedback is incomplete: {', '.join(missing)}"}
         return {"ok": True, "reason": "fresh follower feedback is available"}
 
     def _refresh_status_snapshot(self) -> dict[str, Any]:
-        started = time.monotonic()
-        control = self.robot.get_control_state()
-        robot_state = control.get("robot") or {}
-        tool_pose_candidate = candidate_tool_pose_from_flange(robot_state.get("flange_pose"))
-        try:
-            gripper = self.robot.read_gripper().to_dict()
-        except Exception as exc:
-            gripper = {"raw": {"ok": False, "error": f"{type(exc).__name__}: {exc}"}}
-        self._last_sdk_read_duration_ms = (time.monotonic() - started) * 1000.0
+        control, robot_state, gripper, duration_ms = self.telemetry.status_sample()
+        self._last_sdk_read_duration_ms = duration_ms
         lease = self.leases.current()
         snapshot = {
             "timestamp": now_iso(),
@@ -740,7 +727,6 @@ class OperationalSpaceController:
             "lease": lease.public() if lease else None,
             "active_action": self._active_action_public(),
             "gripper": gripper,
-            "tool_pose_candidate": tool_pose_candidate,
             "gripper_hold": self.robot.get_gripper_hold_state(),
             "broker": self.authority_status(control),
             "safety_priority": ["power_switch", "operator_takeover", "leased_action"],
@@ -791,7 +777,7 @@ class OperationalSpaceController:
             time.sleep(self._status_monitor_interval_s)
 
     def observation(self, include_motor_states: bool = False) -> dict[str, Any]:
-        return self.robot.get_observation(include_motor_states=include_motor_states).to_dict()
+        return self.telemetry.observation(include_motor_states)
 
     def health(self) -> dict[str, Any]:
         with self._jobs_lock:
@@ -927,24 +913,31 @@ class OperationalSpaceController:
             if isinstance(raw_session, dict) else raw_session
         )
         snapshot = self.status()
-        current_tcp = None
         execution_sample = dict(servo.get("execution_sample") or {})
         solver = dict((servo.get("last_result") or {}).get("solver") or {})
-        if isinstance(execution_sample.get("current_tcp_pose"), dict):
-            current_tcp = dict(execution_sample["current_tcp_pose"])
+        estimated_tcp = None
+        measured_tcp = None
+        if isinstance(execution_sample.get("estimated_tcp_pose"), dict):
+            estimated_tcp = dict(execution_sample["estimated_tcp_pose"])
+        if isinstance(execution_sample.get("measured_tcp_pose"), dict):
+            measured_tcp = dict(execution_sample["measured_tcp_pose"])
         elif isinstance(solver.get("tcp"), dict):
             try:
-                current_tcp = OperationalSpaceServo._pose_from_tcp(solver["tcp"])
+                estimated_tcp = OperationalSpaceServo._pose_from_tcp(solver["tcp"])
+                measured_tcp = estimated_tcp
             except (TypeError, ValueError):
-                current_tcp = None
+                estimated_tcp = None
+                measured_tcp = None
         target_tcp = servo.get("reference_pose")
         sampled_target = execution_sample.get("target_tcp") if isinstance(execution_sample.get("target_tcp"), dict) else target_tcp
-        tcp_tracking_error = self._tcp_tracking_error(current_tcp, sampled_target)
-        if isinstance(tcp_tracking_error, dict) and execution_sample:
-            tcp_tracking_error.update({
+        estimated_tracking_error = self._tcp_tracking_error(estimated_tcp, sampled_target)
+        measured_tracking_error = self._tcp_tracking_error(measured_tcp, sampled_target)
+        for tracking_error in (estimated_tracking_error, measured_tracking_error):
+            if isinstance(tracking_error, dict) and execution_sample:
+                tracking_error.update({
                 "sample_id": execution_sample.get("sample_id"),
                 "target_generation": execution_sample.get("target_generation"),
-            })
+                })
         raw_diagnostics = dict(servo.get("diagnostics") or {})
         last_result = dict(servo.get("last_result") or {})
         last_output = dict(servo.get("last_output") or {})
@@ -956,9 +949,15 @@ class OperationalSpaceController:
             # execution.  Keeping it here used to make hardware HOLD look like
             # simulated movement in the browser.
             execution_sample = {}
-            current_tcp = None
+            estimated_tcp = None
+            # ``execution.measured_tcp_pose`` always means the configured OSC
+            # control frame evaluated from the same joint sample as Pink.  No
+            # control sample exists while idle/FREEDRIVE, so never substitute
+            # the SDK's separately-defined TCP here.
+            measured_tcp = None
             sampled_target = None
-            tcp_tracking_error = None
+            estimated_tracking_error = None
+            measured_tracking_error = None
             last_output = {"status": "held", "final_joint_target_rad": None,
                            "final_joint_velocity_rad_s": [0.0] * 7, "sequence": 0,
                            "epoch": raw_diagnostics.get("motion_epoch")}
@@ -971,11 +970,16 @@ class OperationalSpaceController:
         }
         diagnostics = {
             "loop_count": raw_diagnostics.get("loop_count", 0),
-            "tcp_error": tcp_tracking_error,
+            # ``tcp_error`` is kept as the public compatibility alias, but it
+            # now has the unambiguous physical/plant meaning used by the UI.
+            "tcp_error": measured_tracking_error,
+            "estimated_tracking_error": estimated_tracking_error,
+            "measured_tracking_error": measured_tracking_error,
             "pink": pink,
             "ruckig": last_result.get("ruckig"),
             "safety_gate": gate,
             "timing": raw_diagnostics.get("timing", {}) if active_session else {},
+            "cycle_trace": raw_diagnostics.get("cycle_trace", {}),
             "state_estimator": raw_diagnostics.get("state_estimator", {}) if active_session else {},
             "shadow_transport": raw_diagnostics.get("shadow_transport", {"enabled": False}) if active_session else {"enabled": False},
             "trajectory_state": raw_diagnostics.get("trajectory_state"),
@@ -983,6 +987,19 @@ class OperationalSpaceController:
             "arrival": servo.get("arrival"),
         }
         recent_batches = list(raw_diagnostics.get("recent_cpv_batches") or [])
+        hardware_robot = snapshot.get("robot") or (snapshot.get("control") or {}).get("robot") or {}
+        hardware_raw = hardware_robot.get("raw") if isinstance(hardware_robot, dict) else {}
+        hardware_feedback = {
+            # Canonical task TCP from the SDK's configured transform. It is
+            # available at all times, including FREEDRIVE.
+            "tcp_pose": absolute_pose_from_sdk_rpy(hardware_robot.get("tcp_pose")) if isinstance(hardware_robot, dict) else None,
+            "tcp_source": hardware_raw.get("tcp_pose_source") if isinstance(hardware_raw, dict) else None,
+            "joint_angles_rad": hardware_robot.get("joint_angles_rad") if isinstance(hardware_robot, dict) else None,
+            "arm_status": hardware_robot.get("arm_status") if isinstance(hardware_robot, dict) else None,
+            "joint_feedback_source": (snapshot.get("control") or {}).get("joint_feedback_source"),
+            "timestamp": hardware_robot.get("timestamp") if isinstance(hardware_robot, dict) else None,
+            "feedback_age_s": snapshot.get("status_age_s"),
+        }
         observed_joints = execution_sample.get("joint_state_rad")
         if not isinstance(observed_joints, list):
             observed_joints = last_output.get("final_joint_target_rad") if shadow else (snapshot.get("robot") or {}).get("joint_angles_rad")
@@ -999,7 +1016,7 @@ class OperationalSpaceController:
             "state_sequence": servo.get("state_sequence", 0),
             "session": session,
             "command": {
-                "target_tcp": target_tcp if active_session else None,
+                "target_tcp": sampled_target if active_session else None,
                 "target_generation": servo.get("reference_revision", execution_sample.get("target_generation")),
                 "final_joint_target_rad": last_output.get("final_joint_target_rad"),
                 "final_joint_velocity_rad_s": last_output.get("final_joint_velocity_rad_s"),
@@ -1019,8 +1036,9 @@ class OperationalSpaceController:
                 "observed_source": "simulated_cpv_feedback" if shadow else "measured_can_feedback" if active_session else "none",
                 "output_count": raw_diagnostics.get("output_count", 0),
                 "accepting_targets": bool(servo.get("input_enabled")),
-                "current_tcp_pose": current_tcp,
-                "feedback_age_s": execution_sample.get("feedback_age_s"),
+                "estimated_tcp_pose": estimated_tcp,
+                "measured_tcp_pose": measured_tcp,
+                "feedback_age_s": execution_sample.get("feedback_age_s") if active_session else None,
                 "estimated_feedback_delay_s": execution_sample.get("estimated_feedback_delay_s"),
                 "solver_latency_s": execution_sample.get("solver_latency_s"),
                 "dispatch_interval_s": execution_sample.get("dispatch_interval_s"),
@@ -1030,7 +1048,7 @@ class OperationalSpaceController:
                 "connected": bool((snapshot.get("control") or {}).get("connected")),
                 "reason": (snapshot.get("control") or {}).get("reason"),
                 "can_health": snapshot.get("feedback_ready"),
-                "latest_hardware_feedback": snapshot.get("robot"),
+                "hardware_feedback": hardware_feedback,
                 "participation": "shadow_simulated" if shadow else "active" if active_session else "not_participating",
                 "cpv_dispatch_count": raw_diagnostics.get("cpv_dispatch_count", 0),
                 "last_cpv_dispatch": None if shadow else (recent_batches[-1] if recent_batches else None),
@@ -1038,7 +1056,6 @@ class OperationalSpaceController:
             },
             "solver": servo.get("solver"),
             "workspace": servo.get("workspace"),
-            "robot": snapshot.get("robot") or (snapshot.get("control") or {}).get("robot"),
             "gripper": snapshot.get("gripper"),
             "authority": self.authority_status(snapshot.get("control")),
             "active_action": snapshot.get("active_action"),
@@ -1221,10 +1238,15 @@ class OperationalSpaceController:
                 return {"ok": False, "reason": "teleop workers did not stop", "transition": transition}
 
             requested = {"type": "follower_hold", "reason": reason, "handoff": True}
-            hold = self._run_observed_operator_action(
-                requested,
-                lambda: self._transport_follower_hold(reason, int(transition["control_epoch"])),
-            )
+            def follower_hold() -> dict[str, Any]:
+                try:
+                    return self.robot.call("p2", "hold_follower_without_position_target", reason,
+                                           command_epoch=int(transition["control_epoch"]),
+                                           category="follower_hold_transition").to_dict()
+                finally:
+                    self._transport_owner.complete_epoch_transition(
+                        int(transition["control_epoch"]), "follower_hold_transition")
+            hold = self._run_observed_operator_action(requested, follower_hold)
             if hold.get("ok"):
                 self._set_authority(
                     ArmWriter.SERVO,
@@ -1257,7 +1279,11 @@ class OperationalSpaceController:
         teleop = self.teleop.stop_session(f"{reason}: brake before mode transition")
         if not teleop.get("handoff", {}).get("servo_stopped", False):
             return {"ok": False, "reason": "teleop servo did not stop", "teleop": teleop}
-        cpv_stop = self._transport_stop_cpv_for_mode_transition(reason)
+        try:
+            cpv_stop = self.robot.call("p2", "stop_cpv_for_mode_transition", reason,
+                                       category="mode_transition_cpv_stop")
+        except Exception as exc:
+            cpv_stop = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         if not cpv_stop.get("ok"):
             return {"ok": False, "reason": "CPV did not stop", "teleop": teleop, "cpv_stop": cpv_stop}
         revoked = self.leases.release(force=True)
@@ -1267,20 +1293,6 @@ class OperationalSpaceController:
             "cpv_stop": cpv_stop,
             "revoked_lease": revoked.public() if revoked else None,
         }
-
-    def _transport_follower_hold(self, reason: str, command_epoch: int) -> dict[str, Any]:
-        try:
-            return self.robot.call(
-                "p2",
-                "hold_follower_without_position_target",
-                reason,
-                command_epoch=command_epoch,
-                category="follower_hold_transition",
-            ).to_dict()
-        finally:
-            self._transport_owner.complete_epoch_transition(
-                command_epoch, "follower_hold_transition"
-            )
 
     def teleop_recenter(self) -> dict[str, Any]:
         return self.teleop.recenter()
@@ -1449,13 +1461,17 @@ class OperationalSpaceController:
                 "recover_emergency": recover_emergency,
                 "preserve_gripper": preserve_gripper,
             }
-            result = self._run_observed_operator_action(
-                requested,
-                lambda: self._transport_enter_freedrive(
-                    reason, recover_emergency, preserve_gripper,
-                    int(transition["control_epoch"]),
-                ),
-            )
+            def enter_freedrive() -> dict[str, Any]:
+                try:
+                    return self.robot.call("p2", "enter_freedrive", reason,
+                                           recover_emergency=recover_emergency,
+                                           preserve_gripper=preserve_gripper,
+                                           command_epoch=int(transition["control_epoch"]),
+                                           category="freedrive_transition").to_dict()
+                finally:
+                    self._transport_owner.complete_epoch_transition(
+                        int(transition["control_epoch"]), "freedrive_transition")
+            result = self._run_observed_operator_action(requested, enter_freedrive)
             if result.get("ok"):
                 self._set_authority(ArmWriter.NONE, ServoMode.SUSPENDED, "official FREEDRIVE active")
             else:
@@ -1473,37 +1489,6 @@ class OperationalSpaceController:
             result=result,
         )
         return result
-
-    def _transport_stop_cpv_for_mode_transition(self, reason: str) -> dict[str, Any]:
-        try:
-            return self.robot.call(
-                "p2", "stop_cpv_for_mode_transition", reason,
-                category="mode_transition_cpv_stop",
-            )
-        except Exception as exc:
-            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-
-    def _transport_enter_freedrive(
-        self,
-        reason: str,
-        recover_emergency: bool,
-        preserve_gripper: bool,
-        command_epoch: int,
-    ) -> dict[str, Any]:
-        try:
-            return self.robot.call(
-                "p2",
-                "enter_freedrive",
-                reason,
-                recover_emergency=recover_emergency,
-                preserve_gripper=preserve_gripper,
-                command_epoch=command_epoch,
-                category="freedrive_transition",
-            ).to_dict()
-        finally:
-            self._transport_owner.complete_epoch_transition(
-                command_epoch, "freedrive_transition"
-            )
 
     def command_gripper(
         self,

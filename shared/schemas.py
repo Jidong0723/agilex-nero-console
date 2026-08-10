@@ -90,7 +90,6 @@ def as_list(value: Any) -> list[Any] | None:
 class RobotState:
     timestamp: str
     joint_angles_rad: list[float] | None = None
-    flange_pose: list[float] | None = None
     tcp_pose: list[float] | None = None
     arm_status: dict[str, Any] | None = None
     joint_enable_status: list[bool] | None = None

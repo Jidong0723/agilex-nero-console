@@ -135,6 +135,7 @@ def _score(track_position_m: list[float], track_orientation_rad: list[float], ho
 
 def run(settings: dict[str, float]) -> dict[str, Any]:
     config = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+    runtime_config = json.loads((ROOT / "config" / "runtime.json").read_text(encoding="utf-8-sig"))
     solver_config = config["solver"]
     settings = {
         "posture_cost": float(solver_config.get("posture_cost", 0.005)),
@@ -149,20 +150,19 @@ def run(settings: dict[str, float]) -> dict[str, Any]:
     }
     solver = Solver(
         ROOT / solver_config["urdf"],
-        [float(value) for value in config["tcp"]["offset_from_link7_m"]],
+        [float(value) for value in runtime_config["sdk"]["task_tcp_offset_from_flange_m"]],
         DT_S,
     )
     q_start = np.asarray(config["shadow_initial_joints_rad"], dtype=float)
     p_start, r_start = _pose(solver, q_start)
     p_goal = p_start + DELTA_POSITION_M
     r_goal = r_start @ _rotation_from_rpy(DELTA_RPY_RAD)
-    limits = config["limits"]
-    max_linear = float(limits["linear_speed_m_s"]) * 0.80
-    max_angular = float(limits["angular_speed_rad_s"]) * 0.80
+    # Benchmark input trajectory only; it is not an OSC runtime limit.
+    max_linear = 0.048
+    max_angular = float(config["limits"]["angular_speed_rad_s"]) * 0.80
     duration = max(
-        # ``linear_speed_m_s`` and ``angular_speed_rad_s`` are TCP vector
-        # limits.  A 6D move therefore consumes each scalar budget by the
-        # norm of its translation/rotation vector, then synchronizes both.
+        # The benchmark synchronizes translation and rotation using the norm
+        # of each 6D input component; these are test-trajectory rates only.
         float(np.linalg.norm(DELTA_POSITION_M)) / max_linear,
         float(np.linalg.norm(DELTA_RPY_RAD)) / max_angular,
     ) * (4.0 / 3.0)

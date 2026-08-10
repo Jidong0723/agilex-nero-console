@@ -105,6 +105,7 @@ class FakeSdkRobot:
         self.gripper: FakeGripper | None = None
         self.gripper_fail_after_leader = False
         self.drag_teach = False
+        self.tcp_offset: list[float] | None = None
 
     def get_leader_joint_angles(self):
         self.leader_timestamp += 1
@@ -128,11 +129,15 @@ class FakeSdkRobot:
             motion_status=0, trajectory_num=0, err_status={},
         ))
 
-    def get_flange_pose(self):
-        return SimpleNamespace(msg=[0.0, 0.2, 0.3, 0.0, 0.0, 0.0])
-
     def get_tcp_pose(self):
         return SimpleNamespace(msg=[0.0, 0.2, 0.3, 0.0, 0.0, 0.0])
+
+    def set_tcp_offset(self, pose):
+        self.tcp_offset = list(pose)
+
+    def get_flange2tcp_pose(self, flange):
+        values = list(flange)
+        return SimpleNamespace(msg=[float(values[0]) + 0.01, *values[1:]])
 
     def fk(self, joints):
         return [float(joints[0]), 0.2, 0.3, 0.0, 0.0, 0.0]
@@ -233,6 +238,7 @@ class FakeSdkRobot:
 class RobotModeTests(unittest.TestCase):
     def make_robot(self) -> tuple[NeroRobot, FakeSdkRobot]:
         robot = NeroRobot({
+            "sdk": {"task_tcp_offset_from_flange_m": [0.175, 0.0, -0.0235]},
             "motion": {"gripper_verify_settle_s": 0.0, "gripper_hold_verify_s": 0.0},
             "safety": {},
             "logging": {},
@@ -345,14 +351,21 @@ class RobotModeTests(unittest.TestCase):
         feedback = robot.read_teleop_feedback()
         self.assertEqual(feedback["joint_angles_rad"], sdk.follower_values)
         self.assertEqual(feedback["joint_velocity_rad_s"], sdk.motor_velocity)
-        self.assertIsInstance(feedback["timestamp_monotonic_ns"], int)
+        self.assertIsInstance(feedback["received_at_monotonic_ns"], int)
 
-    def test_freedrive_state_uses_sdk_fk_for_live_flange_pose(self) -> None:
+    def test_freedrive_state_uses_sdk_fk_for_live_task_tcp(self) -> None:
         robot, sdk = self.make_robot()
         sdk.leader_values[0] = 0.9
         state = robot.read_state()
-        self.assertEqual(state.flange_pose[0], 0.9)
-        self.assertEqual(state.raw["flange_pose_source"], "sdk_fk_leader")
+        self.assertEqual(state.tcp_pose[0], 0.91)
+        self.assertEqual(state.raw["tcp_pose_source"], "sdk_tcp_from_leader_fk")
+        self.assertNotIn("flange_pose", state.to_dict())
+
+    def test_task_tcp_offset_is_applied_to_each_sdk_instance(self) -> None:
+        robot, sdk = self.make_robot()
+        configured = robot._apply_task_tcp_offset()
+        self.assertEqual(sdk.tcp_offset, [0.175, 0.0, -0.0235, 0.0, 0.0, 0.0])
+        self.assertEqual(configured["offset_from_flange_m"], [0.175, 0.0, -0.0235])
 
     def test_emergency_recovery_requires_explicit_confirmation(self) -> None:
         robot, sdk = self.make_robot()

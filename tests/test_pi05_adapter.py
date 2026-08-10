@@ -38,7 +38,7 @@ class _Broker:
 
     def osc_state(self):
         return {"session": dict(self.session), "command": {"target_tcp": {"position_m": [0., 0., .3], "orientation_xyzw": [0., 0., 0., 1.]}},
-                "execution": {"current_tcp_pose": {"position_m": [0., 0., .3], "orientation_xyzw": [0., 0., 0., 1.]}}, "gripper": {"width_m": .02}}
+                "execution": {"measured_tcp_pose": {"position_m": [0., 0., .3], "orientation_xyzw": [0., 0., 0., 1.]}}, "gripper": {"width_m": .02}}
 
     def osc_command(self, command):
         self.commands.append(command)

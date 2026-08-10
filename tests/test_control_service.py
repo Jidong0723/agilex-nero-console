@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import tempfile
-import math
 import threading
 import time
 import unittest
@@ -13,7 +12,7 @@ from supervisor.control import (
     LeaseManager,
     OperationalSpaceController,
     RobotControlBroker,
-    candidate_tool_pose_from_flange,
+    absolute_pose_from_sdk_rpy,
 )
 from shared.schemas import ExecutedAction, GripperState, now_iso
 
@@ -101,14 +100,14 @@ class FakeRobot:
     def get_control_state(self) -> dict[str, Any]:
         robot = None if getattr(self, "feedback_unavailable", False) else {
             "joint_angles_rad": [0.0] * 7,
-            "flange_pose": [0.0] * 6,
+            "tcp_pose": [0.0] * 6,
             "arm_status": {"arm_status": 0},
             "joint_enable_status": [True] * 7,
         }
         if getattr(self, "leader_only_feedback", False):
             robot = {
                 "joint_angles_rad": [0.0] * 7,
-                "flange_pose": [0.0] * 6,
+                "tcp_pose": [0.0] * 6,
                 "arm_status": None,
                 "joint_enable_status": [False] * 7,
             }
@@ -172,28 +171,6 @@ class LeaseManagerTests(unittest.TestCase):
         leases.acquire("script-a")
         with self.assertRaises(LeaseError):
             leases.release("wrong-token")
-
-
-class CandidateToolPoseTests(unittest.TestCase):
-    def test_zero_rotation_applies_candidate_offset(self) -> None:
-        pose = candidate_tool_pose_from_flange([0.1, 0.2, 0.3, 0.0, 0.0, 0.0])
-        self.assertIsNotNone(pose)
-        assert pose is not None
-        for actual, expected in zip(pose["position_m"], [0.275, 0.2, 0.2765]):
-            self.assertAlmostEqual(actual, expected, places=7)
-        self.assertFalse(pose["verified"])
-
-    def test_yaw_rotates_offset_in_base_frame(self) -> None:
-        pose = candidate_tool_pose_from_flange([0.0, 0.0, 0.0, 0.0, 0.0, math.pi / 2])
-        self.assertIsNotNone(pose)
-        assert pose is not None
-        self.assertAlmostEqual(pose["position_m"][0], 0.0, places=7)
-        self.assertAlmostEqual(pose["position_m"][1], 0.175, places=7)
-        self.assertAlmostEqual(pose["position_m"][2], -0.0235, places=7)
-
-    def test_invalid_flange_pose_returns_none(self) -> None:
-        for value in (None, [0.0] * 5, [0.0, 0.0, 0.0, 0.0, 0.0, float("nan")]):
-            self.assertIsNone(candidate_tool_pose_from_flange(value))
 
 
 class BrokerPreemptionTests(unittest.TestCase):
@@ -279,6 +256,7 @@ class BrokerPreemptionTests(unittest.TestCase):
         self.assertEqual(self.fake.cpv_stop_calls, 1)
         self.assertEqual(self.fake.follower_hold_calls, 0)
         self.assertEqual(self.fake.hold_calls, 0)
+
         self.assertEqual(self.fake.events[-3:], ["preempt", "cpv_stop", "freedrive"])
         self.assertIn("teleop_brake", result)
         self.assertTrue(result["cpv_stop"]["cpv_zero_confirmed"])
@@ -442,6 +420,15 @@ class BrokerPreemptionTests(unittest.TestCase):
 
         self.assertEqual(self.fake.hold_calls, 0)
 
+class HardwareFeedbackPoseTests(unittest.TestCase):
+    def test_sdk_rpy_feedback_has_public_xyzw_pose(self) -> None:
+        pose = absolute_pose_from_sdk_rpy([0.1, -0.2, 0.3, 0.0, 0.0, 0.0])
+        self.assertEqual(pose, {
+            "position_m": [0.1, -0.2, 0.3],
+            "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        })
+
+
 class OscFacadeTests(unittest.TestCase):
     def test_osc_is_the_public_controller_and_hides_clutch_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -458,6 +445,15 @@ class OscFacadeTests(unittest.TestCase):
                             "session": {"state": "ACTIVE", "id": "osc-1", "input_source": "legacy-adapter"},
                             "clutch_active": True, "anchor_id": 9, "relative_pose": {"position_m": [1, 2, 3]},
                             "reference_pose": {"position_m": [0.1, 0.2, 0.3], "orientation_xyzw": [0, 0, 0, 1]},
+                            "execution_sample": {
+                                "sample_id": 41,
+                                "target_generation": 7,
+                                "target_tcp": {"position_m": [0.1, 0.2, 0.3], "orientation_xyzw": [0, 0, 0, 1]},
+                                "estimated_tcp_pose": {"position_m": [0.02, 0.2, 0.3], "orientation_xyzw": [0, 0, 0, 1]},
+                                "measured_tcp_pose": {"position_m": [0.01, 0.2, 0.3], "orientation_xyzw": [0, 0, 0, 1]},
+                                "measured_joint_state_rad": [0.05] * 7,
+                                "feedback_age_s": 0.012,
+                            },
                             "last_result": {"solver": {"tcp": {
                                 "position_m": [0.0, 0.2, 0.3],
                                 "rotation": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
@@ -482,12 +478,18 @@ class OscFacadeTests(unittest.TestCase):
                 self.assertNotIn("clutch_active", state)
                 self.assertNotIn("anchor_id", state)
                 self.assertNotIn("input_source", state["session"])
-                self.assertEqual(state["robot"]["joint_angles_rad"], [0.0] * 7)
-                self.assertEqual(state["execution"]["current_tcp_pose"]["position_m"], [0.0, 0.2, 0.3])
+                self.assertEqual(state["transport"]["hardware_feedback"]["joint_angles_rad"], [0.0] * 7)
+                self.assertNotIn("robot", state)
+                self.assertEqual(state["execution"]["estimated_tcp_pose"]["position_m"], [0.02, 0.2, 0.3])
+                self.assertEqual(state["execution"]["measured_tcp_pose"]["position_m"], [0.01, 0.2, 0.3])
+                self.assertEqual(state["execution"]["measured_joint_state_rad"], [0.05] * 7)
+                self.assertEqual(state["execution"]["sample_id"], 41)
                 self.assertEqual(state["execution"]["observed_source"], "simulated_cpv_feedback")
                 self.assertEqual(state["execution"]["output_count"], 7)
                 self.assertEqual(state["command"]["output_status"], "limited")
-                self.assertAlmostEqual(state["diagnostics"]["tcp_error"]["position_norm_m"], 0.1)
+                self.assertAlmostEqual(state["diagnostics"]["tcp_error"]["position_norm_m"], 0.09)
+                self.assertAlmostEqual(state["diagnostics"]["measured_tracking_error"]["position_norm_m"], 0.09)
+                self.assertAlmostEqual(state["diagnostics"]["estimated_tracking_error"]["position_norm_m"], 0.08)
                 self.assertAlmostEqual(state["diagnostics"]["tcp_error"]["orientation_angle_rad"], 0.0)
                 self.assertEqual(state["diagnostics"]["pink"]["condition_number"], 12.5)
                 self.assertEqual(state["transport"]["participation"], "shadow_simulated")
