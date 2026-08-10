@@ -16,7 +16,6 @@ from .authority import (
     ServoMode, ServoWriteRevoked, TransportRobotProxy,
 )
 from nero_backend.robot import NeroRobot
-from motion.safety import arm_status_is_no_solution_only
 from shared.schemas import jsonable, now_iso
 from motion.teleop import OperationalSpaceServo
 from .pi05_adapter import Pi05InputAdapter
@@ -155,10 +154,6 @@ class OperationalSpaceController:
         self._handoff_lock = threading.RLock()
         self._authority_epoch_lock = threading.RLock()
         self._status_lock = threading.Lock()
-        # The SDK/CAN object is not assumed thread-safe. Every active SDK call
-        # goes through this one transport lock, including feedback reads.
-        self._transport_lock = threading.RLock()
-        self._robot_read_lock = self._transport_lock
         self._transport_owner = HardwareTransportOwner(backend)
         self._transport_reset_lock = threading.Lock()
         self._transport_reset_scheduled = False
@@ -205,7 +200,7 @@ class OperationalSpaceController:
         elif not connected or raw_mode in {"DISCONNECTED", "NONE"}:
             hardware_mode = "DISCONNECTED"
         else:
-            # HOLD, FOLLOWER and TELEOP_CPV_VELOCITY are hardware execution
+            # HOLD, FOLLOWER and TELEOP_CPV are hardware execution
             # details within the same Follower control role.
             hardware_mode = "HOLD"
 
@@ -259,7 +254,7 @@ class OperationalSpaceController:
     def prepare_teleop_hardware(self) -> dict[str, Any]:
         """Enter a fresh SERVO/HOLDING epoch without allowing old CPV output."""
         self._require_operational_control(allow_stale=True)
-        with self._handoff_lock, self._transport_lock:
+        with self._handoff_lock:
             mode = self.robot.get_control_state().get("mode")
             if mode == "FREEDRIVE":
                 self._set_authority(ArmWriter.MODE_TRANSITION, ServoMode.SUSPENDED, "exit FREEDRIVE for teleop", advance_epoch=True)
@@ -314,19 +309,131 @@ class OperationalSpaceController:
         threading.Thread(target=request_reset, name="transport-fault-reset", daemon=True).start()
 
     def read_teleop_joint_limits(self) -> dict[str, Any]:
-        with self._transport_lock:
-            return self.robot.read_teleop_joint_limits()
+        return self.robot.read_teleop_joint_limits()
 
     def read_teleop_feedback(self) -> dict[str, Any]:
-        with self._transport_lock:
-            # Feedback is advisory for the servo loop; CPV output must win
-            # whenever both requests are queued on the single CAN owner.
-            return self.robot.call("p2", "read_teleop_feedback", category="teleop_feedback")
+        # Feedback is advisory for the servo loop; P1 CPV output wins once
+        # both requests have reached the single transport owner.
+        return self.robot.call("p2", "read_teleop_feedback", category="teleop_feedback")
+
+    def read_teleop_cpv_parameters(self) -> dict[str, Any]:
+        """Read, never modify, the vendor CPV settings through the sole owner."""
+        names = ("acc", "dcc", "cv", "pp", "kp", "ki")
+        started_ns = time.monotonic_ns()
+        values: dict[str, list[Any]] = {}
+        for name in names:
+            values[name] = [
+                self.robot.call("p2", "read_cpv_parameter", joint, name, category="teleop_cpv_read")
+                for joint in range(1, 8)
+            ]
+        missing = [f"{name}:J{joint + 1}" for name, row in values.items() for joint, value in enumerate(row) if value is None]
+        return {"status": "available" if not missing else "partial", "values": values, "missing": missing,
+                "read_started_monotonic_ns": started_ns,
+                "read_finished_monotonic_ns": time.monotonic_ns()}
+
+    def sync_cpv_profile_to_osc_limits(self) -> dict[str, Any]:
+        """Apply current OSC limits only while the arm is safely idle/HOLD."""
+        session = self.osc_servo.status().get("session") or {}
+        if session.get("state") == "ACTIVE":
+            raise RuntimeError("stop the active OSC session before changing the CPV profile")
+        control = self.status().get("control") or {}
+        if control.get("mode") != "HOLD":
+            raise RuntimeError(f"CPV profile can only change in HOLD (current mode={control.get('mode')})")
+        readiness = self._cached_feedback_readiness()
+        if not readiness.get("ok"):
+            # A full status snapshot includes flange, arm, and gripper reads.
+            # On some NERO firmware revisions it can take several seconds,
+            # although the lightweight joint-feedback read remains current.
+            # Do not weaken the freshness guard: validate that direct read
+            # through the same serialized CAN owner before changing profile.
+            feedback = self.read_teleop_feedback()
+            joints = feedback.get("joint_angles_rad") if isinstance(feedback, dict) else None
+            if not (
+                isinstance(joints, list)
+                and len(joints) == 7
+                and all(isinstance(value, (int, float)) and math.isfinite(value) for value in joints)
+            ):
+                raise RuntimeError(
+                    "fresh hardware feedback is required: "
+                    f"{readiness.get('reason', 'minimal joint feedback unavailable')}"
+                )
+        speed = float(self.osc_servo.limits.get("joint_speed_rad_s", 1.5))
+        acceleration = float(self.osc_servo.config.get("solver", {}).get("ruckig_max_acceleration", 5.0))
+        result = self.robot.call("p0", "configure_cpv_profile", speed, acceleration, acceleration,
+                                 category="cpv_profile_configuration")
+        profile = self.read_teleop_cpv_parameters()
+        if profile.get("status") != "available":
+            raise RuntimeError(f"CPV profile was written but complete read-back is unavailable: {profile.get('missing')}")
+        return {"ok": True, "requested": {"cv_rad_s": speed, "acc_rad_s2": acceleration, "dcc_rad_s2": acceleration},
+                "result": result, "readback": profile}
+
+    @staticmethod
+    def _telemetry_percentile(values: list[float], fraction: float) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        index = min(len(ordered) - 1, max(0, math.ceil(len(ordered) * fraction) - 1))
+        return float(ordered[index])
+
+    def collect_readonly_hardware_telemetry(self, sample_count: int = 50) -> dict[str, Any]:
+        """Measure CAN read latency without changing robot control state.
+
+        This is deliberately unavailable while OSC tracking is active: a
+        telemetry probe must not contend with live CPV writes.  It measures
+        parameter-query and feedback-read transport timing, not actuator
+        response to a new position target.
+        """
+        count = max(10, min(200, int(sample_count)))
+        if (self.osc_servo.status().get("session") or {}).get("state") == "ACTIVE":
+            raise RuntimeError("stop the active OSC session before read-only hardware telemetry")
+        readiness = self._cached_feedback_readiness()
+        if not readiness.get("ok"):
+            raise RuntimeError(f"fresh hardware feedback is required: {readiness.get('reason', 'unknown')}")
+        cpv = self.read_teleop_cpv_parameters()
+        samples: list[dict[str, Any]] = []
+        previous_started_ns: int | None = None
+        for _ in range(count):
+            started_ns = time.perf_counter_ns()
+            feedback = self.read_teleop_feedback()
+            finished_ns = time.perf_counter_ns()
+            samples.append({
+                "requested_perf_counter_ns": started_ns,
+                "received_perf_counter_ns": finished_ns,
+                "read_duration_s": max(0.0, (finished_ns - started_ns) / 1e9),
+                "inter_request_s": None if previous_started_ns is None else max(0.0, (started_ns - previous_started_ns) / 1e9),
+                "feedback_timestamp_monotonic_ns": feedback.get("timestamp_monotonic_ns"),
+            })
+            previous_started_ns = started_ns
+            # Avoid monopolising the single CAN owner. This does not infer a
+            # controller cycle; it merely samples a representative idle bus.
+            time.sleep(0.02)
+        durations = [float(row["read_duration_s"]) for row in samples]
+        intervals = [float(row["inter_request_s"]) for row in samples if row["inter_request_s"] is not None]
+        p50_duration = self._telemetry_percentile(durations, 0.50) or 0.0
+        p95_duration = self._telemetry_percentile(durations, 0.95) or p50_duration
+        p50_interval = self._telemetry_percentile(intervals, 0.50) or 0.02
+        p95_interval = self._telemetry_percentile(intervals, 0.95) or p50_interval
+        # The device feedback timestamp is known to be read-complete in the
+        # current SDK. This is an observation-delay estimate, not a claim of
+        # physical servo response latency.
+        feedback_delay_s = max(0.001, min(0.15, p95_duration + 0.5 * p95_interval))
+        feedback_jitter_s = max(0.0, min(0.05, p95_duration - p50_duration))
+        calibration = {
+            "source": "read_only_idle_can_probe",
+            "sample_count": count,
+            "feedback_delay_s": feedback_delay_s,
+            "feedback_jitter_s": feedback_jitter_s,
+            "actuator_response_identified": False,
+            "actuator_response_note": "requires an explicitly authorized CPV position-response experiment",
+        }
+        return {"status": "available", "collected_at": now_iso(), "cpv_parameters": cpv,
+                "feedback": {"read_duration_p50_s": p50_duration, "read_duration_p95_s": p95_duration,
+                             "inter_request_p50_s": p50_interval, "inter_request_p95_s": p95_interval,
+                             "samples": samples}, "calibration": calibration}
 
     def teleop_stream_active(self) -> bool:
-        with self._transport_lock:
-            value = self.robot.continuous_stream_active
-            return bool(value() if callable(value) else value)
+        value = self.robot.continuous_stream_active
+        return bool(value() if callable(value) else value)
 
     def grant_teleop_tracking(self, session_id: str, epoch: int) -> bool:
         state = self.supervisor.snapshot()
@@ -353,29 +460,28 @@ class OperationalSpaceController:
         if len(values) != 7 or not all(math.isfinite(value) for value in values):
             self.trigger_safety_fault("non-finite or malformed servo position")
             raise ValueError("servo position must contain seven finite values")
-        with self._transport_lock:
-            if not guard():
-                raise ServoWriteRevoked("SERVO write authority was revoked before transport dispatch")
-            # The same guard is evaluated again by Transport Owner immediately
-            # before the SDK call, so an old P1 batch cannot survive an epoch
-            # revocation while it waits in the queue.  If the vendor call
-            # blocks, quarantine the whole service instead of letting a
-            # partially dispatched velocity batch survive into a new session.
-            dispatch_timeout_s = float(
-                self.robot.config.get("control_service", {}).get(
-                    "servo_position_dispatch_timeout_s",
-                    self.robot.config.get("control_service", {}).get("servo_velocity_dispatch_timeout_s", 0.75),
-                )
+        if not guard():
+            raise ServoWriteRevoked("SERVO write authority was revoked before transport dispatch")
+        # The same guard is evaluated again by Transport Owner immediately
+        # before the SDK call, so an old P1 batch cannot survive an epoch
+        # revocation while it waits in the queue.  If the vendor call blocks,
+        # quarantine the whole service instead of letting a partially
+        # dispatched position batch survive into a new session.
+        dispatch_timeout_s = float(
+            self.robot.config.get("control_service", {}).get(
+                "servo_position_dispatch_timeout_s",
+                self.robot.config.get("control_service", {}).get("servo_velocity_dispatch_timeout_s", 0.75),
             )
-            try:
-                return self.robot.call(
-                    "p1", "send_cpv_position", values, command_epoch=epoch,
-                    category="servo_position", execute_guard=guard,
-                    dispatch_timeout_s=max(0.1, dispatch_timeout_s),
-                )
-            except TimeoutError as exc:
-                self._schedule_transport_reset(f"CPV position timeout: {exc}")
-                raise
+        )
+        try:
+            return self.robot.call(
+                "p1", "send_cpv_position", values, command_epoch=epoch,
+                category="servo_position", execute_guard=guard,
+                dispatch_timeout_s=max(0.1, dispatch_timeout_s),
+            )
+        except TimeoutError as exc:
+            self._schedule_transport_reset(f"CPV position timeout: {exc}")
+            raise
 
     def begin_teleop_stop(self, reason: str) -> dict[str, Any]:
         """Atomically invalidate old output while leaving SERVO able to brake."""
@@ -396,17 +502,16 @@ class OperationalSpaceController:
             state = self._set_authority(ArmWriter.SAFETY, ServoMode.STOPPING, reason, advance_epoch=True)
             self.teleop.freeze_for_authority_change(int(state["control_epoch"]), reason)
             try:
-                with self._transport_lock:
-                    safety_timeout_s = float(
-                        self.robot.config.get("control_service", {}).get(
-                        "safety_position_dispatch_timeout_s",
-                        self.robot.config.get("control_service", {}).get("safety_velocity_dispatch_timeout_s", 0.2),
-                        )
+                safety_timeout_s = float(
+                    self.robot.config.get("control_service", {}).get(
+                    "safety_position_dispatch_timeout_s",
+                    self.robot.config.get("control_service", {}).get("safety_velocity_dispatch_timeout_s", 0.2),
                     )
-                    batch = self.robot.call(
-                        "p0", "prime_cpv_position_from_feedback",
-                        dispatch_timeout_s=max(0.05, safety_timeout_s),
-                    )
+                )
+                batch = self.robot.call(
+                    "p0", "prime_cpv_position_from_feedback",
+                    dispatch_timeout_s=max(0.05, safety_timeout_s),
+                )
             except Exception as exc:
                 batch = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             final = self._set_authority(ArmWriter.SAFETY, ServoMode.HOLDING, f"FAULT: {reason}")
@@ -442,12 +547,6 @@ class OperationalSpaceController:
                 "connected": False,
                 "error": error_text,
                 "connect_stage": connect_stage,
-                "can_feedback_recovery": {
-                    "status": "unavailable",
-                    "enabled": False,
-                    "frame_sent": False,
-                    "reason": "USB-CAN connection is unavailable",
-                },
             }
             if isinstance(exc, TimeoutError):
                 # A vendor/CAN call already executing in a Python thread cannot
@@ -482,13 +581,11 @@ class OperationalSpaceController:
                 "reason": "USB-CAN connection is unavailable",
                 "error": startup_error,
                 "robot": {},
-                "can_feedback_recovery": result.get("can_feedback_recovery", {}),
             }
             with self._status_lock:
                 self._status_cache = (time.monotonic(), {
                     "timestamp": now_iso(),
                     "control": offline_control,
-                    "can_feedback_recovery": offline_control["can_feedback_recovery"],
                     "active_action": None,
                     "gripper": {"raw": {"ok": False, "error": offline_control["error"]}},
                     "tool_pose_candidate": None,
@@ -504,10 +601,6 @@ class OperationalSpaceController:
         if self._hardware_transport_available:
             self._status_monitor = threading.Thread(target=self._status_loop, name="nero-status-monitor", daemon=True)
             self._status_monitor.start()
-        recovery = result.get("can_feedback_recovery", {})
-        self._log("can_feedback_probe", result=recovery)
-        if recovery.get("frame_sent"):
-            self._log("can_feedback_recovery", result=recovery)
         self._log("service_start", result=result)
         return result
 
@@ -618,12 +711,6 @@ class OperationalSpaceController:
         valid_arm_status = isinstance(arm_status, dict) and arm_status.get("arm_status") is not None
         if valid_joints and valid_flange and valid_arm_status:
             return {"ok": True, "reason": "fresh follower feedback is available"}
-        recovery = control.get("can_feedback_recovery")
-        if isinstance(recovery, dict) and recovery.get("status") == "failed":
-            return {
-                "ok": False,
-                "reason": "startup CAN feedback recovery did not observe known NERO feedback",
-            }
         if not (valid_joints and valid_flange and valid_arm_status):
             missing = []
             if not valid_joints:
@@ -637,21 +724,19 @@ class OperationalSpaceController:
 
     def _refresh_status_snapshot(self) -> dict[str, Any]:
         started = time.monotonic()
-        with self._robot_read_lock:
-            control = self.robot.get_control_state()
-            robot_state = control.get("robot") or {}
-            tool_pose_candidate = candidate_tool_pose_from_flange(robot_state.get("flange_pose"))
-            try:
-                gripper = self.robot.read_gripper().to_dict()
-            except Exception as exc:
-                gripper = {"raw": {"ok": False, "error": f"{type(exc).__name__}: {exc}"}}
+        control = self.robot.get_control_state()
+        robot_state = control.get("robot") or {}
+        tool_pose_candidate = candidate_tool_pose_from_flange(robot_state.get("flange_pose"))
+        try:
+            gripper = self.robot.read_gripper().to_dict()
+        except Exception as exc:
+            gripper = {"raw": {"ok": False, "error": f"{type(exc).__name__}: {exc}"}}
         self._last_sdk_read_duration_ms = (time.monotonic() - started) * 1000.0
         lease = self.leases.current()
         snapshot = {
             "timestamp": now_iso(),
             "control": control,
             "robot": robot_state,
-            "can_feedback_recovery": control.get("can_feedback_recovery", {}),
             "lease": lease.public() if lease else None,
             "active_action": self._active_action_public(),
             "gripper": gripper,
@@ -706,8 +791,7 @@ class OperationalSpaceController:
             time.sleep(self._status_monitor_interval_s)
 
     def observation(self, include_motor_states: bool = False) -> dict[str, Any]:
-        with self._robot_read_lock:
-            return self.robot.get_observation(include_motor_states=include_motor_states).to_dict()
+        return self.robot.get_observation(include_motor_states=include_motor_states).to_dict()
 
     def health(self) -> dict[str, Any]:
         with self._jobs_lock:
@@ -821,11 +905,8 @@ class OperationalSpaceController:
                 float(payload.get("force_n", 1.0)),
                 bool(payload.get("preserve_on_freedrive", False)),
             )
-        elif command_type == "joint_target":
-            token = str(body.get("token", ""))
-            result = self.execute(token, {"type": "joint_target", **payload}, body.get("timeout"))
         else:
-            raise ValueError("OSC command type must be track_tcp, move_tcp, hold, stop, freedrive, gripper, or joint_target")
+            raise ValueError("OSC command type must be track_tcp, move_tcp, hold, stop, freedrive, or gripper")
         response = {"ok": bool(result.get("ok", result.get("accepted", False))), "result": result}
         # Continuous target updates can arrive at the servo rate.  Returning
         # the full state (including raw CAN feedback) for every update turns
@@ -867,8 +948,20 @@ class OperationalSpaceController:
         raw_diagnostics = dict(servo.get("diagnostics") or {})
         last_result = dict(servo.get("last_result") or {})
         last_output = dict(servo.get("last_output") or {})
-        execution_mode = str((session or {}).get("execution_mode") or "shadow")
+        active_session = bool(isinstance(session, dict) and session.get("state") == "ACTIVE")
+        execution_mode = str((session or {}).get("execution_mode") or "shadow") if active_session else "idle"
         shadow = execution_mode == "shadow"
+        if not active_session:
+            # A stopped shadow sample is historical data, never current robot
+            # execution.  Keeping it here used to make hardware HOLD look like
+            # simulated movement in the browser.
+            execution_sample = {}
+            current_tcp = None
+            sampled_target = None
+            tcp_tracking_error = None
+            last_output = {"status": "held", "final_joint_target_rad": None,
+                           "final_joint_velocity_rad_s": [0.0] * 7, "sequence": 0,
+                           "epoch": raw_diagnostics.get("motion_epoch")}
         pink = dict(last_result.get("solver") or {})
         gate = {
             "status": last_output.get("status", "held"),
@@ -882,7 +975,9 @@ class OperationalSpaceController:
             "pink": pink,
             "ruckig": last_result.get("ruckig"),
             "safety_gate": gate,
-            "timing": raw_diagnostics.get("timing", {}),
+            "timing": raw_diagnostics.get("timing", {}) if active_session else {},
+            "state_estimator": raw_diagnostics.get("state_estimator", {}) if active_session else {},
+            "shadow_transport": raw_diagnostics.get("shadow_transport", {"enabled": False}) if active_session else {"enabled": False},
             "trajectory_state": raw_diagnostics.get("trajectory_state"),
             "trajectory_brake_reason": raw_diagnostics.get("trajectory_brake_reason"),
             "arrival": servo.get("arrival"),
@@ -891,12 +986,20 @@ class OperationalSpaceController:
         observed_joints = execution_sample.get("joint_state_rad")
         if not isinstance(observed_joints, list):
             observed_joints = last_output.get("final_joint_target_rad") if shadow else (snapshot.get("robot") or {}).get("joint_angles_rad")
+        measured_joints = execution_sample.get("measured_joint_state_rad") if active_session else (snapshot.get("robot") or {}).get("joint_angles_rad")
+        estimated_joints = execution_sample.get("estimated_joint_state_rad") if active_session else None
+        commanded_joints = last_output.get("final_joint_target_rad")
+        joint_error = None
+        if isinstance(commanded_joints, list) and isinstance(measured_joints, list) and len(commanded_joints) == len(measured_joints) == 7:
+            error = [float(command) - float(measured) for command, measured in zip(commanded_joints, measured_joints)]
+            joint_error = {"per_joint_rad": error, "max_abs_rad": max(abs(value) for value in error),
+                           "norm_rad": math.sqrt(sum(value * value for value in error))}
         return {
             "schema_version": "nero.osc.v2",
             "state_sequence": servo.get("state_sequence", 0),
             "session": session,
             "command": {
-                "target_tcp": target_tcp,
+                "target_tcp": target_tcp if active_session else None,
                 "target_generation": servo.get("reference_revision", execution_sample.get("target_generation")),
                 "final_joint_target_rad": last_output.get("final_joint_target_rad"),
                 "final_joint_velocity_rad_s": last_output.get("final_joint_velocity_rad_s"),
@@ -908,9 +1011,12 @@ class OperationalSpaceController:
                 "mode": execution_mode,
                 "sample_id": execution_sample.get("sample_id"),
                 "sample_monotonic_ns": execution_sample.get("sample_monotonic_ns"),
-                "commanded_joint_state_rad": last_output.get("final_joint_target_rad"),
+                "commanded_joint_state_rad": commanded_joints,
                 "observed_joint_state_rad": observed_joints,
-                "observed_source": "simulated_final_output" if shadow else "measured_can_feedback",
+                "measured_joint_state_rad": measured_joints,
+                "estimated_joint_state_rad": estimated_joints,
+                "joint_target_error": joint_error,
+                "observed_source": "simulated_cpv_feedback" if shadow else "measured_can_feedback" if active_session else "none",
                 "output_count": raw_diagnostics.get("output_count", 0),
                 "accepting_targets": bool(servo.get("input_enabled")),
                 "current_tcp_pose": current_tcp,
@@ -925,9 +1031,10 @@ class OperationalSpaceController:
                 "reason": (snapshot.get("control") or {}).get("reason"),
                 "can_health": snapshot.get("feedback_ready"),
                 "latest_hardware_feedback": snapshot.get("robot"),
-                "participation": "not_participating" if shadow else "active",
+                "participation": "shadow_simulated" if shadow else "active" if active_session else "not_participating",
                 "cpv_dispatch_count": raw_diagnostics.get("cpv_dispatch_count", 0),
                 "last_cpv_dispatch": None if shadow else (recent_batches[-1] if recent_batches else None),
+                "cpv_parameters": raw_diagnostics.get("cpv_parameters", {"status": "not_read"}),
             },
             "solver": servo.get("solver"),
             "workspace": servo.get("workspace"),
@@ -936,6 +1043,59 @@ class OperationalSpaceController:
             "authority": self.authority_status(snapshot.get("control")),
             "active_action": snapshot.get("active_action"),
         }
+
+    def osc_calibrate_readonly_hardware(self, sample_count: int = 50) -> dict[str, Any]:
+        """Persist only the feedback-latency portion measurable without motion."""
+        telemetry = self.collect_readonly_hardware_telemetry(sample_count)
+        calibration = dict(telemetry["calibration"])
+        feedback = dict(telemetry["feedback"])
+        shadow = self.osc_servo.config.setdefault("shadow_transport", {})
+        estimator = self.osc_servo.config.setdefault("state_estimator", {})
+        shadow["feedback_delay_s"] = calibration["feedback_delay_s"]
+        shadow["feedback_jitter_s"] = calibration["feedback_jitter_s"]
+        cpv_values = dict((telemetry.get("cpv_parameters") or {}).get("values") or {})
+        def conservative_limit(name: str) -> float | None:
+            values = cpv_values.get(name)
+            if not isinstance(values, list):
+                return None
+            finite = [float(value) for value in values if value is not None and math.isfinite(float(value)) and float(value) > 0.0]
+            return min(finite) if len(finite) == 7 else None
+        cpv_speed = conservative_limit("cv")
+        cpv_acceleration = conservative_limit("acc")
+        # CPV telemetry is an observation of the controller profile, not an
+        # authority to rewrite the configured OSC / shadow safety envelope.
+        # In particular, a NERO power cycle can briefly report its firmware
+        # default CV before OSC reapplies the requested 1.5 rad/s profile.
+        estimator["max_prediction_s"] = max(
+            0.02,
+            min(0.15, calibration["feedback_delay_s"] + float(feedback["inter_request_p95_s"])),
+        )
+        self.osc_servo.config["hardware_readonly_calibration"] = {
+            **calibration,
+            "feedback_read_duration_p50_s": feedback["read_duration_p50_s"],
+            "feedback_read_duration_p95_s": feedback["read_duration_p95_s"],
+            "feedback_inter_request_p95_s": feedback["inter_request_p95_s"],
+            "cpv_parameters": dict(telemetry["cpv_parameters"]),
+            "applied_at": now_iso(),
+        }
+        config_path = Path(__file__).resolve().parents[1] / "config" / "teleop.json"
+        temporary = config_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(self.osc_servo.config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(config_path)
+        return {"ok": True, "telemetry": telemetry, "applied": {
+            "shadow_transport": {"feedback_delay_s": shadow["feedback_delay_s"], "feedback_jitter_s": shadow["feedback_jitter_s"],
+                                 "max_joint_speed_rad_s": shadow.get("max_joint_speed_rad_s"),
+                                 "max_joint_acceleration_rad_s2": shadow.get("max_joint_acceleration_rad_s2")},
+            "cpv_profile_limits": {"max_joint_speed_rad_s": cpv_speed, "max_joint_acceleration_rad_s2": cpv_acceleration},
+            "state_estimator": {"max_prediction_s": estimator["max_prediction_s"]},
+            "actuator_response_identified": False,
+        }, "state": self.osc_state()}
+
+    def osc_sync_cpv_profile_to_osc_limits(self) -> dict[str, Any]:
+        """Official SDK configuration write, constrained to current OSC limits."""
+        written = self.sync_cpv_profile_to_osc_limits()
+        calibration = self.osc_calibrate_readonly_hardware(20)
+        return {"ok": True, "written": written, "calibration": calibration["applied"], "state": self.osc_state()}
 
     # π0.5 stays outside OSC: this adapter reads OSC state and only returns
     # standard OSC commands.  It never receives a transport/robot handle.
@@ -1109,19 +1269,18 @@ class OperationalSpaceController:
         }
 
     def _transport_follower_hold(self, reason: str, command_epoch: int) -> dict[str, Any]:
-        with self._transport_lock:
-            try:
-                return self.robot.call(
-                    "p2",
-                    "hold_follower_without_position_target",
-                    reason,
-                    command_epoch=command_epoch,
-                    category="follower_hold_transition",
-                ).to_dict()
-            finally:
-                self._transport_owner.complete_epoch_transition(
-                    command_epoch, "follower_hold_transition"
-                )
+        try:
+            return self.robot.call(
+                "p2",
+                "hold_follower_without_position_target",
+                reason,
+                command_epoch=command_epoch,
+                category="follower_hold_transition",
+            ).to_dict()
+        finally:
+            self._transport_owner.complete_epoch_transition(
+                command_epoch, "follower_hold_transition"
+            )
 
     def teleop_recenter(self) -> dict[str, Any]:
         return self.teleop.recenter()
@@ -1166,10 +1325,9 @@ class OperationalSpaceController:
                 job["started_at"] = now_iso()
                 job["started_monotonic"] = time.monotonic()
             operator_action = None
-            if kind != "execute":
-                with self._action_lock:
-                    operator_action = {"id": action_id, "owner": "operator", "type": kind, "started_at": job["started_at"], "preempt_requested": False, "preempt_reason": None}
-                    self._active_action = operator_action
+            with self._action_lock:
+                operator_action = {"id": action_id, "owner": "operator", "type": kind, "started_at": job["started_at"], "preempt_requested": False, "preempt_reason": None}
+                self._active_action = operator_action
             try:
                 result = self._run_submitted_action(kind, body, timeout)
                 with self._jobs_lock:
@@ -1194,8 +1352,6 @@ class OperationalSpaceController:
         return {"action_id": action_id, "status": "queued", "deduplicated": False}
 
     def _run_submitted_action(self, kind: str, body: dict[str, Any], timeout: float) -> dict[str, Any]:
-        if kind == "execute":
-            return self.execute(str(body.get("token", "")), dict(body.get("action", {})), timeout).get("result", {})
         reason = str(body.get("reason", "operator request from local control page"))
         if kind == "hold":
             return self.hold(reason)
@@ -1223,79 +1379,6 @@ class OperationalSpaceController:
         self._log("lease_released", owner=lease.owner if lease else None)
         return {"released": lease.public() if lease else None}
 
-    def execute(self, token: str, action: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
-        mode = self.robot.get_control_state().get("mode")
-        if mode == "FAULT":
-            state = self.robot.read_state()
-            recovery_allowed = (
-                action.get("type") == "cartesian_pose"
-                and arm_status_is_no_solution_only(state.arm_status)
-                and state.joint_enable_status == [True] * 7
-            )
-            if not recovery_allowed:
-                self._require_operational_control()
-        else:
-            self._require_operational_control()
-        lease = self.leases.require(token, max(30.0, float(timeout or 25.0) + 5.0))
-        preempt_epoch = self.robot.preempt_epoch()
-        action_id = secrets.token_urlsafe(8)
-        with self._action_lock:
-            if self._active_action is not None:
-                raise LeaseError(
-                    f"another action is already running for {self._active_action['owner']}"
-                )
-            self._active_action = {
-                "id": action_id,
-                "owner": lease.owner,
-                "type": str(action.get("type", "unknown")),
-                "started_at": now_iso(),
-                "preempt_requested": False,
-                "preempt_reason": None,
-            }
-        self._log("action_requested", owner=lease.owner, action=action)
-        self._emit_action_event(action_id, "requested", action, owner=lease.owner)
-        try:
-            if mode == "FREEDRIVE" and action.get("type") != "stop":
-                self._log(
-                    "freedrive_auto_exit_requested",
-                    owner=lease.owner,
-                    action=action,
-                    reason="explicit action requested while in FREEDRIVE",
-                )
-                transition = self.robot.hold_follower_without_position_target(
-                    "automatic Leader/FREEDRIVE exit before explicit action"
-                ).to_dict()
-                self._log("freedrive_auto_exit", owner=lease.owner, result=transition)
-                if not transition.get("ok"):
-                    result = {
-                        "ok": False,
-                        "reason": "FREEDRIVE auto-exit failed; action was not dispatched",
-                        "freedrive_auto_exit": transition,
-                    }
-                    self._log("action_completed", owner=lease.owner, action=action, result=result)
-                    self._emit_action_event(action_id, "completed", action, result, lease.owner)
-                    return result
-                preempt_epoch = self.robot.preempt_epoch()
-            result = self.robot.execute_action(
-                action, timeout=timeout, expected_preempt_epoch=preempt_epoch
-            ).to_dict()
-            self._log("action_completed", owner=lease.owner, action=action, result=result)
-            self._emit_action_event(action_id, "completed", action, result, lease.owner)
-            return result
-        except Exception as exc:
-            self._emit_action_event(
-                action_id,
-                "failed",
-                action,
-                {"ok": False, "reason": f"{type(exc).__name__}: {exc}"},
-                lease.owner,
-            )
-            raise
-        finally:
-            with self._action_lock:
-                if self._active_action and self._active_action.get("id") == action_id:
-                    self._active_action = None
-
     def hold(self, reason: str = "operator requested hold") -> dict[str, Any]:
         self._require_operational_control()
         result = self.handoff_to_console(reason)
@@ -1310,9 +1393,7 @@ class OperationalSpaceController:
         requested = {"type": "recover-stale-leader", "reason": reason}
         result = self._run_observed_operator_action(
             requested,
-            lambda: self.robot.hold_position(
-                reason, recover_stale_leader=True
-            ).to_dict(),
+            lambda: self.robot.hold_follower_without_position_target(reason).to_dict(),
         )
         self._log("stale_leader_recovery", revoked=revoked, result=result)
         return result
@@ -1394,14 +1475,13 @@ class OperationalSpaceController:
         return result
 
     def _transport_stop_cpv_for_mode_transition(self, reason: str) -> dict[str, Any]:
-        with self._transport_lock:
-            try:
-                return self.robot.call(
-                    "p2", "stop_cpv_for_mode_transition", reason,
-                    category="mode_transition_cpv_stop",
-                )
-            except Exception as exc:
-                return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        try:
+            return self.robot.call(
+                "p2", "stop_cpv_for_mode_transition", reason,
+                category="mode_transition_cpv_stop",
+            )
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
     def _transport_enter_freedrive(
         self,
@@ -1410,21 +1490,20 @@ class OperationalSpaceController:
         preserve_gripper: bool,
         command_epoch: int,
     ) -> dict[str, Any]:
-        with self._transport_lock:
-            try:
-                return self.robot.call(
-                    "p2",
-                    "enter_freedrive",
-                    reason,
-                    recover_emergency=recover_emergency,
-                    preserve_gripper=preserve_gripper,
-                    command_epoch=command_epoch,
-                    category="freedrive_transition",
-                ).to_dict()
-            finally:
-                self._transport_owner.complete_epoch_transition(
-                    command_epoch, "freedrive_transition"
-                )
+        try:
+            return self.robot.call(
+                "p2",
+                "enter_freedrive",
+                reason,
+                recover_emergency=recover_emergency,
+                preserve_gripper=preserve_gripper,
+                command_epoch=command_epoch,
+                category="freedrive_transition",
+            ).to_dict()
+        finally:
+            self._transport_owner.complete_epoch_transition(
+                command_epoch, "freedrive_transition"
+            )
 
     def command_gripper(
         self,
@@ -1558,7 +1637,13 @@ class OperationalSpaceController:
             # heartbeat is therefore a real ownership lease: terminate the
             # session through the same official Follower/HOLD path rather
             # than leaving an ACTIVE session waiting for a later reconnect.
-            if self.osc_servo.heartbeat_expired():
+            osc_session = self.osc_servo.status().get("session") or {}
+            pico_pairing_shadow = (
+                osc_session.get("state") == "ACTIVE"
+                and osc_session.get("execution_mode") == "shadow"
+                and self.pico.snapshot().get("state") == "PAIRING"
+            )
+            if self.osc_servo.heartbeat_expired() and not pico_pairing_shadow:
                 reason = "OSC session heartbeat expired"
                 try:
                     result = self.hold(reason)

@@ -195,7 +195,7 @@ feedback_age = now - feedback.timestamp
 最终速度通过：
 
 ```python
-broker.send_servo_velocity(final_velocity, session_id, epoch)
+broker.send_servo_position(final_joint_target, session_id, epoch)
 ```
 
 完整链路：
@@ -205,7 +205,7 @@ TeleopController
   -> RobotControlBroker
   -> HardwareTransportOwner
   -> TransportRobotProxy
-  -> NeroRobot.send_cpv_velocity()
+  -> NeroRobot.send_cpv_position()
   -> pyAgxArm SDK
   -> CAN / CPV
 ```
@@ -251,7 +251,7 @@ qd = self.trajectory["velocity_rad_s"]
 feedback_age = 0.0
 ```
 
-经过同样的 Pink、安全门和 Ruckig 后，不调用 `send_servo_velocity()`，而是使用最终安全速度积分：
+经过同样的 Pink、安全门和 Ruckig 后，使用最终安全速度积分得到的位置目标：
 
 ```python
 self.shadow_joints = [
@@ -406,7 +406,7 @@ y_screen = base_y - (z - minZ) * scale * 0.88 - (x + y) * scale * 0.28
 
 1. 判断执行目标时优先看 `execution_mode`，不要只看旧的 `mode` 字符串。
 2. 判断输入来源时看 `input_source`；PICO 不自动代表真机。
-3. 判断是否真实写入时看 `send_servo_velocity()` 和 `robot_commands_sent`。
+3. 判断是否真实写入时看 `send_servo_position()` 和 `robot_commands_sent`。
 4. 影子模式仍然运行 Pink、Ruckig 和 SafetySupervisor，不是简单的输入回放。
 5. Canvas 的机械臂链条主要来自 `teleop.last_result.solver.tcp`，不是直接来自 `control.robot.tcp_pose`。
 6. 真机文本 TCP 和 Canvas TCP 经过不同数据路径，短时间内可能存在采样延迟差异。
@@ -420,7 +420,7 @@ motion/teleop.py::TeleopController.start_session()
 motion/teleop.py::TeleopController._loop()
 motion/teleop.py::TeleopController._start_feedback_worker()
 supervisor/control.py::RobotControlBroker.prepare_teleop_hardware()
-supervisor/control.py::RobotControlBroker.send_servo_velocity()
+supervisor/control.py::OperationalSpaceController.send_servo_position()
 nero_backend/robot.py::read_state()
 nero_backend/robot.py::read_teleop_feedback()
 motion/teleop.py::KinematicsClient

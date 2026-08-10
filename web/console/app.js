@@ -15,6 +15,10 @@
         label.parentElement?.insertBefore(inputLabel, label.nextSibling);
       }
     }
+    const diagnostics = document.querySelector(".diagnostics");
+    if (diagnostics && !$("observed-source")) {
+      diagnostics.insertAdjacentHTML("beforeend", '<div><span>反馈来源</span><strong id="observed-source">--</strong></div><div><span>关节目标误差</span><strong id="joint-target-error">--</strong></div>');
+    }
   }
   ensureSelectionControls();
   document.querySelector(".intent-readout span")?.replaceChildren("当前摇杆输入");
@@ -728,6 +732,10 @@
     $("tcp-orientation-error").textContent = Number.isFinite(finite(tcpError.orientation_angle_rad, NaN)) ? `${fixed(tcpError.orientation_angle_rad * 180 / Math.PI, 1)}°` : "--";
     $("gate-state").textContent = timing.gate_limited === true ? "限速" : timing.gate_ok === true ? "通过" : timing.gate_ok === false ? "拒绝" : "--";
     $("trajectory-state").textContent = diagnostic.trajectory_state || "--";
+    const source = execution.observed_source || "--";
+    $("observed-source").textContent = source === "simulated_cpv_feedback" ? "影子 CPV 模拟" : source === "measured_can_feedback" ? "CAN 实测" : "--";
+    const jointTargetError = execution.joint_target_error || {};
+    $("joint-target-error").textContent = Number.isFinite(finite(jointTargetError.max_abs_rad, NaN)) ? `${fixed(jointTargetError.max_abs_rad * 180 / Math.PI, 2)}°` : "--";
     const active = current.state === "ACTIVE";
     // A visibility change or a recoverable request error deliberately clears
     // only this browser's adapter state.  The OSC session may still be

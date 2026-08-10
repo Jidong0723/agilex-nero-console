@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from motion.teleop import JointConvention, JointLimitAuthority, SafetySupervisor, TeleopController
+from motion.teleop import JointConvention, JointLimitAuthority, SafetySupervisor, ShadowCpvPlant, TeleopController
 from supervisor.authority import (
     ArmWriter, CommandRevoked, ControlSupervisor, HardwareTransportOwner, ServoMode,
     ServoWriteRevoked,
@@ -80,13 +80,6 @@ class FakeRobot:
         motors = [{"velocity": 0.0} for _ in range(7)] if include_motor_states else []
         return SimpleNamespace(joint_angles_rad=[0.0] * 7, motor_states=motors)
 
-    def send_cpv_velocity(self, velocity: list[float]) -> dict[str, Any]:
-        self.velocities.append(list(velocity))
-        if len(self.velocities) >= 4 and self.controller is not None:
-            self.controller.stop_event.set()
-        now = time.monotonic_ns()
-        return {"batch_duration_ms": 0.1, "batch_skew_ms": 0.02, "finished_monotonic_ns": now}
-
     def send_cpv_position(self, joints: list[float]) -> dict[str, Any]:
         self.positions.append(list(joints))
         if len(self.positions) >= 4 and self.controller is not None:
@@ -128,6 +121,9 @@ class FakeBroker:
     def read_teleop_feedback(self) -> dict[str, Any]:
         return {"joint_angles_rad": [0.0] * 7, "joint_velocity_rad_s": [0.0] * 7, "timestamp_monotonic_ns": time.monotonic_ns()}
 
+    def read_teleop_cpv_parameters(self) -> dict[str, Any]:
+        return {"status": "available", "values": {"acc": [2.0] * 7}}
+
     def teleop_stream_active(self) -> bool:
         return self.robot.continuous_stream_active()
 
@@ -146,11 +142,6 @@ class FakeBroker:
     def servo_can_write(self, session_id: str, epoch: int) -> bool:
         del session_id
         return self.writer == "SERVO" and epoch == self.epoch
-
-    def send_servo_velocity(self, velocity: list[float], session_id: str, epoch: int) -> dict[str, Any]:
-        if not self.servo_can_write(session_id, epoch):
-            raise ServoWriteRevoked("servo writer revoked")
-        return self.robot.send_cpv_velocity(velocity)
 
     def send_servo_position(self, joints: list[float], session_id: str, epoch: int) -> dict[str, Any]:
         if not self.servo_can_write(session_id, epoch):
@@ -259,6 +250,22 @@ class TeleopPositionDispatchTests(unittest.TestCase):
         self.assertEqual(controller.status()["last_result"]["ruckig"]["mode"], "bypassed")
 
 
+class ShadowCpvPlantTests(unittest.TestCase):
+    def test_delays_feedback_and_respects_acceleration(self) -> None:
+        plant = ShadowCpvPlant({"dispatch_delay_s": 0.02, "feedback_delay_s": 0.04,
+                                "position_time_constant_s": 0.01, "max_joint_speed_rad_s": 2.0,
+                                "max_joint_acceleration_rad_s2": 5.0}, [0.0] * 7)
+        plant.dispatch([1.0] * 7, 0.0)
+        q0, qd0, _ = plant.advance(0.02, 0.0)
+        self.assertEqual(q0, [0.0] * 7)
+        self.assertEqual(qd0, [0.0] * 7)
+        plant.advance(0.02, 0.02)
+        q, qd, _ = plant.advance(0.02, 0.06)
+        self.assertGreater(q[0], 0.0)
+        self.assertLessEqual(qd[0], 5.0 * 0.02 + 1e-9)
+        self.assertEqual(plant.diagnostics()["output_count"], 1)
+
+
 @unittest.skip("Superseded by pose-clutch coverage in tests.test_pose_teleop")
 class TeleopVelocityStreamTests(unittest.TestCase):
     @staticmethod
@@ -340,7 +347,7 @@ class TeleopVelocityStreamTests(unittest.TestCase):
                     controller._feedback_thread.join(timeout=1.0)
                 controller.solver.close()
 
-    def test_hardware_stream_uses_only_cpv_velocity(self) -> None:
+    def test_hardware_stream_uses_only_cpv_positions(self) -> None:
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
             controller = TeleopController(broker, Path(temp), self.config())
@@ -367,11 +374,10 @@ class TeleopVelocityStreamTests(unittest.TestCase):
             }
             controller._feedback = {"joints": [0.0] * 7, "velocities": [0.0] * 7, "monotonic_ns": time.monotonic_ns()}
             controller._loop()
-        self.assertGreaterEqual(len(broker.robot.velocities), 4)
+        self.assertGreaterEqual(len(broker.robot.positions), 4)
         self.assertGreaterEqual(len(solver.calls), 4)
-        self.assertTrue(all(len(value) == 7 for value in broker.robot.velocities))
-        self.assertEqual(controller.cpv_send_count, len(broker.robot.velocities))
-        self.assertNotIn("cpv_speed_percent", controller.status()["last_result"])
+        self.assertTrue(all(len(value) == 7 for value in broker.robot.positions))
+        self.assertEqual(controller.cpv_send_count, len(broker.robot.positions))
 
     def test_zero_target_does_not_activate_unstarted_controller(self) -> None:
         broker = FakeBroker()

@@ -18,6 +18,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
+def control_python(project_root: Path) -> Path:
+    executable = project_root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if not executable.is_file():
+        raise RuntimeError(f"control Python is unavailable: {executable}")
+    return executable.resolve()
+
+
 def pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -201,7 +208,7 @@ class ResetHandler(BaseHTTPRequestHandler):
             old_pid = candidate_pids[0] if candidate_pids else 0
         helper = self.project_root / "scripts" / "nero_control_service_restart.py"
         command = [
-            sys.executable,
+            str(self.service_python),
             str(helper),
             "--old-pid",
             str(old_pid),
@@ -278,10 +285,9 @@ def main() -> int:
         raise SystemExit("watchdog must use port 8767")
     if str(args.project_root) not in sys.path:
         sys.path.insert(0, str(args.project_root))
-    default_service_python = args.project_root / ".venv" / "Scripts" / "python.exe"
-    service_python = args.service_python or (default_service_python if default_service_python.is_file() else Path(sys.executable))
-    if not service_python.is_file():
-        raise SystemExit(f"control-service Python is unavailable: {service_python}")
+    service_python = control_python(args.project_root)
+    if args.service_python is not None and args.service_python.resolve() != service_python:
+        raise SystemExit(f"watchdog refuses non-project control Python: {args.service_python}")
     from supervisor.instance_lock import InstanceLock
 
     lock = InstanceLock(args.project_root / "runtime" / "nero_control_watchdog.lock", "nero-control-watchdog")

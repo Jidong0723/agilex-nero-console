@@ -1,6 +1,10 @@
 .venv/
 .conda/
 runtime/
+.mamba/
+build/
+dist/
+*.dist-info/
 __pycache__/
 **/__pycache__/
 *.py[cod]
@@ -18,6 +22,3 @@ htmlcov/
 _local_tmp/
 agilex-nero-console.zip
 agilex-nero-console-main/
-
-# Local Mamba package cache/environment is not part of project snapshots.
-.mamba/

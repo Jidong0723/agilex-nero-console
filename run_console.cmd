@@ -5,7 +5,8 @@ if not exist ".venv\Scripts\python.exe" (
   echo Control Runtime is not installed. Run setup.ps1 first.
   exit /b 1
 )
-".venv\Scripts\python.exe" "scripts\nero_control_server.py"
+set "PYTHONPATH=%~dp0src;%PYTHONPATH%"
+".venv\Scripts\python.exe" -m nero_console serve
 set "NERO_EXIT_CODE=%ERRORLEVEL%"
 if not "%NERO_EXIT_CODE%"=="0" (
   echo.

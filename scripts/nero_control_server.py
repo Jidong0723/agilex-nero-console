@@ -17,24 +17,29 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.error import URLError
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 VENDOR_ROOT = PROJECT_ROOT / "vendor"
 if str(VENDOR_ROOT) not in sys.path:
     sys.path.insert(0, str(VENDOR_ROOT))
 
 from supervisor.instance_lock import InstanceLock  # noqa: E402
+from nero_console.runtime import assert_control_interpreter, control_python  # noqa: E402
 
 if TYPE_CHECKING:
     from supervisor.control import OperationalSpaceController
 
 
 WEB_ROOT = PROJECT_ROOT / "web" / "console"
+CONTROL_PYTHON = control_python(PROJECT_ROOT)
 _RESET_LOCK = threading.Lock()
 _RESET_PENDING = False
 
@@ -51,6 +56,24 @@ def _backend_worker_main(connection: Any, config: str) -> None:
     """Own every SDK/CAN object in a disposable child process."""
     osc = None
     try:
+        # Windows ``spawn`` may otherwise start from the base interpreter of a
+        # virtual environment.  Reassert the project import roots in the
+        # hardware owner itself: this process must import the vendored NERO
+        # SDK, never a globally installed package with the same name.
+        worker_root = Path(__file__).resolve().parents[1]
+        # ``spawn`` on Windows can otherwise inherit the base interpreter of
+        # a virtual environment.  The process below owns the SDK/CAN handle,
+        # so fail closed instead of silently using globally installed modules.
+        assert_control_interpreter(worker_root)
+        for import_root in (
+            worker_root,
+            worker_root / "vendor",
+            worker_root / "vendor" / "pyAgxArm",
+            worker_root / ".venv" / "Lib" / "site-packages",
+        ):
+            import_text = str(import_root)
+            if import_root.is_dir() and import_text not in sys.path:
+                sys.path.insert(0, import_text)
         from supervisor.control import OperationalSpaceController
 
         osc = OperationalSpaceController(Path(config))
@@ -169,6 +192,11 @@ class ServiceRuntime:
                 broker = broker_factory(config)
                 initial = broker.start()
             else:
+                # ``multiprocessing`` defaults to ``sys._base_executable`` on
+                # Windows venvs. That loses this project's site-packages and
+                # can import an incompatible global ``pyAgxArm``. Hardware
+                # workers must use the same interpreter as this service.
+                multiprocessing.set_executable(str(CONTROL_PYTHON))
                 context = multiprocessing.get_context("spawn")
                 parent_connection, child_connection = context.Pipe()
                 process = context.Process(
@@ -275,7 +303,7 @@ def schedule_service_reset() -> dict[str, Any]:
             return {"status": "already_scheduled", "robot_commands_sent": False}
         _RESET_PENDING = True
     command = [
-        sys.executable,
+        str(CONTROL_PYTHON),
         str(Path(__file__).resolve().with_name("nero_control_service_restart.py")),
         "--old-pid",
         str(os.getpid()),
@@ -284,7 +312,7 @@ def schedule_service_reset() -> dict[str, Any]:
         "--service-script",
         str(Path(__file__).resolve()),
         "--service-python",
-        sys.executable,
+        str(CONTROL_PYTHON),
         "--config",
         str(PROJECT_ROOT / "config" / "runtime.json"),
         "--host",
@@ -337,7 +365,7 @@ def ensure_reset_watchdog() -> None:
         if probe.connect_ex(("127.0.0.1", 8767)) == 0:
             return
     command = [
-        sys.executable,
+        str(CONTROL_PYTHON),
         str(Path(__file__).resolve().with_name("nero_control_watchdog.py")),
         "--project-root",
         str(PROJECT_ROOT),
@@ -345,6 +373,8 @@ def ensure_reset_watchdog() -> None:
         str(Path(__file__).resolve()),
         "--config",
         str(PROJECT_ROOT / "config" / "runtime.json"),
+        "--service-python",
+        str(CONTROL_PYTHON),
         "--port",
         "8767",
     ]
@@ -629,8 +659,11 @@ class PicoGateway:
                 pass
         finally:
             with self._lock:
-                self._connection_active = False
-                if self._pair:
+                # An obsolete or rejected socket must never tear down a newer
+                # successfully paired socket.  Only the connection that owns
+                # the current paired session may clear its gateway state.
+                if paired_session and self._pair and str(self._pair.get("session_id")) == paired_session:
+                    self._connection_active = False
                     self._pair["paired"] = False
             if paired_session:
                 try:
@@ -668,6 +701,10 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 return self._json_ok(self.broker.broker_status())
             if parsed.path == "/api/osc/state":
                 return self._json_ok(self.broker.osc_state())
+            if parsed.path == "/api/osc/telemetry/read-only":
+                query = parse_qs(parsed.query)
+                samples = int((query.get("samples") or [50])[0])
+                return self._json_ok(self.broker.osc_calibrate_readonly_hardware(samples))
             if parsed.path == "/api/pi05/state":
                 return self._json_ok(self.broker.pi05_state())
             if parsed.path == "/api/cameras/state":
@@ -722,6 +759,8 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     str(body.get("client_id", "anonymous")),
                     str(body.get("session_id", "")),
                 ))
+            if self.path == "/api/osc/cpv-profile/sync":
+                return self._json_ok(self.broker.osc_sync_cpv_profile_to_osc_limits())
             if self.path == "/api/pi05/config":
                 return self._json_ok(self.broker.pi05_update_config(body))
             if self.path in {"/api/cameras/config", "/api/pi05/cameras/config"}:
@@ -756,7 +795,10 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 if result.get("session", {}).get("input_source") == "pico":
                     if self.pico_gateway is None:
                         raise RuntimeError("PICO WebSocket gateway is unavailable")
-                    result["pico_gateway"] = self.pico_gateway.create_pairing(str(result["session"]["id"]))
+                    result["pico_gateway"] = self.pico_gateway.create_pairing(
+                        str(result["session"]["id"]),
+                        str(result["session"].get("client_id", body.get("client_id", "anonymous"))),
+                    )
                 return self._json_ok(result)
             if self.path == "/api/teleop/intent":
                 return self._json_ok(self.broker.teleop_intent(body))
@@ -781,12 +823,6 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 return self._json_ok(self.broker.renew(str(body.get("token", "")), body.get("ttl_s")))
             if self.path == "/api/lease/release":
                 return self._json_ok(self.broker.release(str(body.get("token", ""))))
-            if self.path == "/api/action":
-                return self._json_ok(
-                    self.broker.execute(
-                        str(body.get("token", "")), dict(body.get("action", {})), body.get("timeout")
-                    )
-                )
             reason = str(body.get("reason", "operator request from local control page"))
             if self.path == "/api/safety/hold":
                 return self._json_ok(self.broker.hold(reason))
@@ -881,6 +917,7 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
+    assert_control_interpreter(PROJECT_ROOT)
     parser = argparse.ArgumentParser(description="Local NERO shared-control service and safety console.")
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "runtime.json")
     parser.add_argument("--host", default="127.0.0.1")

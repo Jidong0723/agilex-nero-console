@@ -25,7 +25,15 @@ The two environments are intentionally separate:
 - `.venv` runs the Web service, NERO SDK, CANDO backend, and Ruckig control loop.
 - `.conda/nero-kinematics` runs Pinocchio and Pink in an isolated subprocess.
 
-Do not upload or copy either environment between computers. Virtual environments contain absolute paths and platform-specific binaries. Recreate them from `requirements.txt` and `environment-kinematics.yml` on every workstation.
+Do not upload or copy either environment between computers. Virtual environments contain absolute paths and platform-specific binaries. Recreate them from `requirements.txt` and `environment-kinematics.yml` on every workstation. The service, watchdog, reset helper and spawned hardware worker always use the project `.venv`; only the solver uses `.conda/nero-kinematics`.
+
+Run the no-motion preflight before connecting hardware:
+
+```powershell
+.\.venv\Scripts\python.exe -m nero_console doctor
+```
+
+It reports interpreter paths, dependency origins and CANDO enumeration without sending a motion command.
 
 ## Start
 

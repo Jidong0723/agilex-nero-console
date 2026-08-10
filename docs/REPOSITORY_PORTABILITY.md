@@ -34,7 +34,7 @@ The workstation still needs its normal external prerequisites: Python 3.12, Cond
 
 ## Scope boundary
 
-`pico_unity_client/` is an optional, separate Unity project for the PICO companion application. It is not required to run the desktop Web console, HTTP API, shadow mode, or hardware control. Keep it as a separate repository or intentionally add it later only when distributing the APK source as well; it is not automatically moved or included in the Web-control handoff.
+The repository retains the PICO WebSocket protocol and server-side adapter, but does not bundle a Unity client. An external client may implement the documented protocol without changing the Web console, OSC, or CAN ownership model.
 
 ## Before publishing
 

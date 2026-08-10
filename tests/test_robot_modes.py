@@ -99,8 +99,8 @@ class FakeSdkRobot:
         self.motion_mode_calls = 0
         self.motion_modes: list[str] = []
         self.cartesian_calls: list[tuple[str, list[float]]] = []
-        self.cpv_velocity_calls: list[tuple[int, float]] = []
         self.cpv_position_calls: list[tuple[int, float]] = []
+        self.cpv_profile = {"acc": [1.0] * 7, "dcc": [1.0] * 7, "cv": [0.1] * 7}
         self.motor_velocity = [0.01 * index for index in range(1, 8)]
         self.gripper: FakeGripper | None = None
         self.gripper_fail_after_leader = False
@@ -140,14 +140,29 @@ class FakeSdkRobot:
     def get_joints_enable_status_list(self):
         return list(self.enable_status)
 
-    def set_speed_percent(self, value):
-        return None
-
     def set_motion_mode(self, value):
         self.motion_mode_calls += 1
         self.motion_modes.append(value)
         self.events.append(f"motion:{value}")
         return None
+
+    def set_cpv_acc(self, joint_index, acc, timeout=1.0):
+        self.cpv_profile["acc"][int(joint_index) - 1] = float(acc); return True
+
+    def set_cpv_dcc(self, joint_index, dcc, timeout=1.0):
+        self.cpv_profile["dcc"][int(joint_index) - 1] = float(dcc); return True
+
+    def set_cpv_cv(self, joint_index, cv, timeout=1.0):
+        self.cpv_profile["cv"][int(joint_index) - 1] = float(cv); return True
+
+    def get_cpv_acc(self, joint_index, timeout=1.0, min_interval=0.0):
+        return self.cpv_profile["acc"][int(joint_index) - 1]
+
+    def get_cpv_dcc(self, joint_index, timeout=1.0, min_interval=0.0):
+        return self.cpv_profile["dcc"][int(joint_index) - 1]
+
+    def get_cpv_cv(self, joint_index, timeout=1.0, min_interval=0.0):
+        return self.cpv_profile["cv"][int(joint_index) - 1]
 
     def move_p(self, target):
         self.cartesian_calls.append(("point", list(target)))
@@ -160,10 +175,6 @@ class FakeSdkRobot:
         self.targets.append(list(target))
         if self.mode == "follower":
             self.follower_values = list(target)
-
-    def move_cpv_vel(self, joint_index, vel):
-        self.events.append(f"cpv:{int(joint_index)}:{float(vel):.3f}")
-        self.cpv_velocity_calls.append((int(joint_index), float(vel)))
 
     def move_cpv_pos(self, joint_index, pos):
         self.events.append(f"cpv-pos:{int(joint_index)}:{float(pos):.3f}")
@@ -235,6 +246,15 @@ class RobotModeTests(unittest.TestCase):
         robot._freedrive_backend = "leader"
         return robot, sdk
 
+    def test_configure_cpv_profile_acknowledges_and_reads_back_all_joints(self) -> None:
+        robot, sdk = self.make_robot()
+        result = robot.configure_cpv_profile(2.0, 5.0, 5.0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(sdk.cpv_profile["cv"], [2.0] * 7)
+        self.assertEqual(sdk.cpv_profile["acc"], [5.0] * 7)
+        self.assertEqual(sdk.cpv_profile["dcc"], [5.0] * 7)
+        self.assertEqual(len(result["joints"]), 7)
+
     def test_freedrive_state_uses_live_leader_angles(self) -> None:
         robot, sdk = self.make_robot()
         first = robot.read_state().joint_angles_rad
@@ -242,17 +262,6 @@ class RobotModeTests(unittest.TestCase):
         second = robot.read_state().joint_angles_rad
         self.assertEqual(first, [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
         self.assertEqual(second[0], 0.9)
-
-    def test_cartesian_linear_dispatches_official_move_l(self) -> None:
-        robot, sdk = self.make_robot()
-        robot._control_mode = "HOLD"
-        result = robot._move_cartesian_pose(
-            [0.0, 0.2, 0.3, 0.0, 0.0, 0.0], 2, 0.2,
-            motion_mode="linear",
-        )
-        self.assertTrue(result["ok"], result)
-        self.assertEqual(sdk.motion_modes[-1], sdk.OPTIONS.MOTION_MODE.L)
-        self.assertEqual(sdk.cartesian_calls[-1][0], "linear")
 
     def test_cpv_position_sends_joint_targets_in_joint_order(self) -> None:
         robot, sdk = self.make_robot()
@@ -344,79 +353,6 @@ class RobotModeTests(unittest.TestCase):
         state = robot.read_state()
         self.assertEqual(state.flange_pose[0], 0.9)
         self.assertEqual(state.raw["flange_pose_source"], "sdk_fk_leader")
-
-    def test_hold_from_freedrive_targets_latest_leader_pose(self) -> None:
-        robot, sdk = self.make_robot()
-        sdk.leader_values = [0.12, -0.22, 0.32, 0.42, -0.52, 0.62, -0.72]
-        result = robot.hold_position("test")
-        self.assertTrue(result.ok, result.result)
-        self.assertEqual(sdk.targets[-1], sdk.leader_values)
-        self.assertEqual(robot.get_control_state()["mode"], "HOLD")
-
-    def test_explicit_stale_leader_recovery_uses_follower_pose(self) -> None:
-        robot, sdk = self.make_robot()
-        robot._control_mode = "FAULT"
-        robot._freedrive_backend = "leader"
-        sdk.follower_values = [0.21, -0.31, 0.41, -0.51, 0.61, -0.71, 0.81]
-        robot._wait_fresh_leader_feedback = lambda timeout: None  # type: ignore[method-assign]
-
-        result = robot.hold_position("supported recovery", recover_stale_leader=True)
-
-        self.assertTrue(result.ok, result.result)
-        self.assertEqual(sdk.targets[-1], sdk.follower_values)
-        self.assertEqual(sdk.mode, "follower")
-        self.assertTrue(result.result["stale_leader_recovery"])
-
-    def test_hold_from_drag_teach_exits_teaching_and_holds_follower_pose(self) -> None:
-        robot, sdk = self.make_robot()
-        robot._freedrive_backend = "drag_teach"
-        sdk.drag_teach = True
-        sdk.follower_values = [0.11, -0.21, 0.31, 0.41, -0.51, 0.61, -0.71]
-
-        result = robot.hold_position("test drag hold")
-
-        self.assertTrue(result.ok, result.result)
-        self.assertIn("drag-stop", sdk.events)
-        self.assertEqual(sdk.targets[-1], sdk.follower_values)
-        self.assertEqual(robot.get_control_state()["mode"], "HOLD")
-        self.assertIsNone(robot._freedrive_backend)
-
-    def test_hold_from_drag_teach_does_not_send_gripper_commands(self) -> None:
-        robot, sdk = self.make_robot()
-        robot._control_mode = "HOLD"
-        robot._freedrive_backend = None
-        grip = robot.command_gripper("grip", force_n=1.0)
-        self.assertTrue(grip["ok"], grip)
-        robot._control_mode = "FREEDRIVE"
-        robot._freedrive_backend = "drag_teach"
-        sdk.drag_teach = True
-        sdk.gripper.width = 0.02
-        sdk.gripper.force = 0.0
-
-        result = robot.hold_position("restore after drag")
-
-        self.assertTrue(result.ok, result.result)
-        self.assertNotIn("gripper-enable-clear", sdk.gripper.events)
-        self.assertEqual(robot.get_control_state()["mode"], "HOLD")
-
-    def test_gripper_failure_does_not_affect_arm_hold_transition(self) -> None:
-        robot, sdk = self.make_robot()
-        robot.motion_config["gripper_restore_timeout_s"] = 0.0
-        robot._control_mode = "HOLD"
-        robot._freedrive_backend = None
-        grip = robot.command_gripper("grip", force_n=1.0)
-        self.assertTrue(grip["ok"], grip)
-        robot._control_mode = "FREEDRIVE"
-        robot._freedrive_backend = "drag_teach"
-        sdk.drag_teach = True
-        sdk.gripper.fail_commands = True
-        sdk.gripper.enabled = False
-
-        result = robot.hold_position("hold despite gripper failure")
-
-        self.assertTrue(result.ok, result.result)
-        self.assertEqual(robot.get_control_state()["mode"], "HOLD")
-        self.assertNotIn("gripper_restore", result.result)
 
     def test_emergency_recovery_requires_explicit_confirmation(self) -> None:
         robot, sdk = self.make_robot()

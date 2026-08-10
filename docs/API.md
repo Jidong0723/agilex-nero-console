@@ -18,7 +18,6 @@ Success responses use `{"ok": true, "data": {}}`; errors use `{"ok": false, "err
 - `POST /api/lease/acquire` — `{"owner":"client","ttl_s":30}`.
 - `POST /api/lease/renew` — `{"token":"...","ttl_s":30}`.
 - `POST /api/lease/release` — `{"token":"..."}`.
-- `POST /api/action` — `{"token":"...","action":{...},"timeout":25}`.
 
 Supported actions include `joint_target`, `cartesian_pose`, `cartesian_delta`, `gripper`, and `stop`. Values remain subject to server-side safety checks.
 

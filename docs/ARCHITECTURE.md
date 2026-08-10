@@ -25,9 +25,26 @@ NeroRobot backend
 pyAgxArm -> python-can -> CANDO -> NERO / AGX gripper
 ```
 
-## Main modules
+## Runtime and module boundaries
 
-- `scripts/nero_control_server.py`: localhost HTTP/static-file server and process entry point.
+`src/nero_console/` is the public package boundary. It owns the `nero-console`
+CLI, deterministic environment discovery, and future application/domain/
+infrastructure/adapters namespaces. Existing modules below remain compatible
+implementation modules while callers migrate to the package boundary.
+
+- `application`: HTTP service lifecycle and OSC use cases.
+- `domain`: OSC commands, state snapshots, safety and authority concepts.
+- `infrastructure`: runtime discovery, process boundaries, CAN/SDK and solver transport.
+- `adapters`: browser, pi0.5 and external PICO input adaptation.
+
+The runtime is intentionally split: `.venv`/Python 3.12 owns the HTTP service,
+watchdog, reset helper, SDK and CAN; `.conda/nero-kinematics`/Python 3.11 owns
+only Pinocchio/Pink. A service started by global Python is rejected before it
+can construct hardware transport.
+
+## Compatible implementation modules
+
+- `scripts/nero_control_server.py`: compatible localhost HTTP/static-file server entry point.
 - `supervisor/control.py`: Operational Space Controller, CAN ownership, leases, preemption, action lifecycle, HOLD/FREEDRIVE handoff, and status snapshots.
 - `supervisor/authority.py`: current hardware writer, servo mode, and monotonically increasing authority epoch.
 - `nero_backend/robot.py`: NERO SDK access, feedback, mode transitions, CPV, joint/Cartesian motion, and gripper commands.

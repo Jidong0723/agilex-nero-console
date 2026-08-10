@@ -21,4 +21,5 @@ if (-not (Test-Path $venvPython)) {
 Push-Location $root
 try { & $venvPython -m pip install -r 'requirements.txt' }
 finally { Pop-Location }
+& $venvPython -m pip install -e $root
 Write-Host 'Control Runtime Python environment is ready.'

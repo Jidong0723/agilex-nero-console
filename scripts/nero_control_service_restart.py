@@ -192,8 +192,13 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--wait-timeout", type=float, default=15.0)
     args = parser.parse_args()
-    if not args.service_python.is_file():
-        raise SystemExit(f"control-service Python is unavailable: {args.service_python}")
+    expected_python = args.project_root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if not expected_python.is_file():
+        raise SystemExit(f"project control Python is unavailable: {expected_python}")
+    expected_python = expected_python.resolve()
+    if args.service_python.resolve() != expected_python:
+        raise SystemExit(f"restart refuses non-project control Python: {args.service_python}")
+    args.service_python = expected_python
 
     # The watchdog returns its HTTP response before killing the old process.
     # Give that response a short grace period, then make reset unconditional:

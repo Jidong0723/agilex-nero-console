@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agilex-nero-console"
+version = "0.1.0"
+description = "Safety-oriented local OSC console for the AgileX NERO arm"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = {file = "LICENSE"}
+authors = [{name = "AgileX NERO Console contributors"}]
+dependencies = ["numpy==2.5.1", "ruckig==0.12.2", "websockets==16.1.1"]
+
+[project.optional-dependencies]
+pi05 = ["msgpack>=1.0.5", "opencv-python>=4.8,<4.12", "cv2-enumerate-cameras>=1.3.3"]
+dev = []
+
+[project.scripts]
+nero-console = "nero_console.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

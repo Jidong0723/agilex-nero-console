@@ -1,4 +1,4 @@
-﻿{
+{
   "schema_version": "nero.teleop.v1",
   "solver": {
     "python": ".conda/nero-kinematics/python.exe",
@@ -17,7 +17,7 @@
     "frame_gain": 1.0,
     "frame_lm_damping": 0.0,
     "synchronous_response_budget_s": 0.019,
-    "target_prediction_horizon_s": 0.03,
+    "target_prediction_horizon_s": 0.08,
     "joint_center_cost": 0.001,
     "joint_center_deadband": 0.7,
     "feedback_limit_tolerance_rad": 0.05,
@@ -26,7 +26,11 @@
     "urdf": "vendor/nero_description/nero_description.urdf"
   },
   "tcp": {
-    "offset_from_link7_m": [0.175, 0.0, -0.0235],
+    "offset_from_link7_m": [
+      0.175,
+      0.0,
+      -0.0235
+    ],
     "verified": false,
     "source": "NERO AGX gripper URDF candidate"
   },
@@ -38,13 +42,55 @@
     "arrival_timeout_s": 10.0
   },
   "state_estimator": {
-    "max_prediction_s": 0.15,
+    "max_prediction_s": 0.03274775,
     "correction_time_constant_s": 0.2,
     "max_correction_rad_s": 0.5
   },
+  "shadow_transport": {
+    "enabled": true,
+    "dispatch_delay_s": 0.01,
+    "dispatch_jitter_s": 0.002,
+    "feedback_delay_s": 0.011232049999999999,
+    "feedback_jitter_s": 0.00020129999999999996,
+    "position_time_constant_s": 0.06,
+    "max_joint_speed_rad_s": 1.5,
+    "max_joint_acceleration_rad_s2": 5.0
+  },
   "pose_input": {
-    "position_axis_map": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-    "orientation_axis_map": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+    "position_axis_map": [
+      [
+        1.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        1.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "orientation_axis_map": [
+      [
+        1.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        1.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
     "mapping_verified": true,
     "translation_gain": 1.0,
     "rotation_gain": 1.0,
@@ -53,38 +99,112 @@
     "max_packet_translation_m": 0.05,
     "max_packet_rotation_rad": 0.35
   },
-  "shadow_initial_joints_rad": [-0.02, 0.5, -0.8, 1.2, 0.0, 0.2, 0.0],
+  "shadow_initial_joints_rad": [
+    -0.02,
+    0.5,
+    -0.8,
+    1.2,
+    0.0,
+    0.2,
+    0.0
+  ],
   "limits": {
     "linear_speed_m_s": 0.06,
     "angular_speed_rad_s": 0.45,
-    "joint_speed_rad_s": 2.0,
-    "velocity_error_warning_rad_s": 0.10,
+    "joint_speed_rad_s": 1.5,
+    "velocity_error_warning_rad_s": 0.1,
     "velocity_error_brake_rad_s": 0.25,
     "velocity_error_fault_rad_s": 0.45,
     "velocity_error_fault_cycles": 10,
     "feedback_soft_stale_s": 0.06,
     "feedback_hard_stale_s": 0.15,
-    "solver_stale_s": 0.10,
+    "solver_stale_s": 0.1,
     "max_stale_velocity_repeats": 0,
     "input_filter_alpha": 1.0,
     "deadman_timeout_s": 0.25,
-    "workspace_min_m": [-0.45, -0.45, -0.01],
-    "workspace_max_m": [0.45, 0.60, 0.70],
+    "workspace_min_m": [
+      -0.45,
+      -0.45,
+      -0.01
+    ],
+    "workspace_max_m": [
+      0.45,
+      0.6,
+      0.7
+    ],
     "min_flange_z_m": -0.01,
     "singularity_condition_max": 2500.0
   },
   "joint_conventions": [
-    {"sdk_index": 1, "urdf_joint": "joint1", "sign": 1.0, "zero_offset_rad": 0.0, "unit_scale": 1.0},
-    {"sdk_index": 2, "urdf_joint": "joint2", "sign": 1.0, "zero_offset_rad": 0.0, "unit_scale": 1.0},
-    {"sdk_index": 3, "urdf_joint": "joint3", "sign": 1.0, "zero_offset_rad": 0.0, "unit_scale": 1.0},
-    {"sdk_index": 4, "urdf_joint": "joint4", "sign": 1.0, "zero_offset_rad": 0.0, "unit_scale": 1.0},
-    {"sdk_index": 5, "urdf_joint": "joint5", "sign": 1.0, "zero_offset_rad": 0.0, "unit_scale": 1.0},
-    {"sdk_index": 6, "urdf_joint": "joint6", "sign": 1.0, "zero_offset_rad": 0.0, "unit_scale": 1.0},
-    {"sdk_index": 7, "urdf_joint": "joint7", "sign": 1.0, "zero_offset_rad": 0.0, "unit_scale": 1.0}
+    {
+      "sdk_index": 1,
+      "urdf_joint": "joint1",
+      "sign": 1.0,
+      "zero_offset_rad": 0.0,
+      "unit_scale": 1.0
+    },
+    {
+      "sdk_index": 2,
+      "urdf_joint": "joint2",
+      "sign": 1.0,
+      "zero_offset_rad": 0.0,
+      "unit_scale": 1.0
+    },
+    {
+      "sdk_index": 3,
+      "urdf_joint": "joint3",
+      "sign": 1.0,
+      "zero_offset_rad": 0.0,
+      "unit_scale": 1.0
+    },
+    {
+      "sdk_index": 4,
+      "urdf_joint": "joint4",
+      "sign": 1.0,
+      "zero_offset_rad": 0.0,
+      "unit_scale": 1.0
+    },
+    {
+      "sdk_index": 5,
+      "urdf_joint": "joint5",
+      "sign": 1.0,
+      "zero_offset_rad": 0.0,
+      "unit_scale": 1.0
+    },
+    {
+      "sdk_index": 6,
+      "urdf_joint": "joint6",
+      "sign": 1.0,
+      "zero_offset_rad": 0.0,
+      "unit_scale": 1.0
+    },
+    {
+      "sdk_index": 7,
+      "urdf_joint": "joint7",
+      "sign": 1.0,
+      "zero_offset_rad": 0.0,
+      "unit_scale": 1.0
+    }
   ],
   "safety_supervisor": {
-    "fixed_model_margin_rad": [0.03, 0.03, 0.03, 0.025, 0.03, 0.02, 0.02],
-    "controller_stop_reserve_rad": [0.02, 0.02, 0.02, 0.02, 0.02, 0.015, 0.015],
+    "fixed_model_margin_rad": [
+      0.03,
+      0.03,
+      0.03,
+      0.025,
+      0.03,
+      0.02,
+      0.02
+    ],
+    "controller_stop_reserve_rad": [
+      0.02,
+      0.02,
+      0.02,
+      0.02,
+      0.02,
+      0.015,
+      0.015
+    ],
     "controller_response_delay_s": 0.04,
     "feedback_limit_tolerance_rad": 0.05
   },
@@ -93,6 +213,79 @@
     "max_control_hz": 100,
     "mode": "shadow",
     "max_trajectory_points": 200
+  },
+  "hardware_readonly_calibration": {
+    "source": "read_only_idle_can_probe",
+    "sample_count": 10,
+    "feedback_delay_s": 0.011232049999999999,
+    "feedback_jitter_s": 0.00020129999999999996,
+    "actuator_response_identified": false,
+    "actuator_response_note": "requires an explicitly authorized CPV position-response experiment",
+    "feedback_read_duration_p50_s": 0.0002729,
+    "feedback_read_duration_p95_s": 0.0004742,
+    "feedback_inter_request_p95_s": 0.0215157,
+    "cpv_parameters": {
+      "status": "available",
+      "values": {
+        "acc": [
+          5.0,
+          5.0,
+          5.0,
+          5.0,
+          5.0,
+          5.0,
+          5.0
+        ],
+        "dcc": [
+          5.0,
+          5.0,
+          5.0,
+          5.0,
+          5.0,
+          5.0,
+          5.0
+        ],
+        "cv": [
+          0.09,
+          0.09,
+          0.089,
+          0.089,
+          0.09,
+          0.09,
+          0.09
+        ],
+        "pp": [
+          5.0,
+          5.0,
+          5.0,
+          5.0,
+          5.0,
+          5.0,
+          5.0
+        ],
+        "kp": [
+          0.8,
+          0.8,
+          0.7000000000000001,
+          0.7000000000000001,
+          0.8,
+          0.8,
+          0.8
+        ],
+        "ki": [
+          60.0,
+          60.0,
+          40.0,
+          40.0,
+          40.0,
+          40.0,
+          40.0
+        ]
+      },
+      "missing": [],
+      "read_started_monotonic_ns": 1956625000000,
+      "read_finished_monotonic_ns": 1956968000000
+    },
+    "applied_at": "2026-08-10T18:35:42.456"
   }
 }
-

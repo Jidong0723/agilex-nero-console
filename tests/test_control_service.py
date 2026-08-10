@@ -37,12 +37,10 @@ class FakeRobot:
         self.events: list[str] = []
         self.execute_calls = 0
         self.estop_calls = 0
+        self.cpv_parameter_reads: list[tuple[int, str]] = []
         self.gripper_hold = {
             "supported": False, "active": False, "mode": None,
             "target_width_m": None, "force_n": None, "alarm": None,
-        }
-        self.can_feedback_recovery = {
-            "status": "not_needed", "enabled": True, "frame_sent": False,
         }
 
     def connect(self) -> dict[str, Any]:
@@ -59,27 +57,6 @@ class FakeRobot:
         self.reason = reason
         self.events.append("preempt")
         self.preempted.set()
-
-    def execute_action(
-        self, action: dict[str, Any], timeout: float | None = None, expected_preempt_epoch: int | None = None
-    ) -> ExecutedAction:
-        self.execute_calls += 1
-        if expected_preempt_epoch != self.epoch:
-            return ExecutedAction(now_iso(), action, None, False, False, "PREEMPTED_BY_OPERATOR")
-        started = time.monotonic()
-        while action.get("block") and time.monotonic() - started < 1.0:
-            if self.preempted.wait(0.01):
-                return ExecutedAction(now_iso(), action, action, False, True, "PREEMPTED_BY_OPERATOR")
-        return ExecutedAction(now_iso(), action, action, True, True)
-
-    def hold_position(self, reason: str, recover_stale_leader: bool = False) -> ExecutedAction:
-        self.hold_calls += 1
-        self.events.append("hold")
-        if self.hold_should_fail:
-            return ExecutedAction(now_iso(), {"type": "hold"}, {"type": "hold"}, False, True, "simulated hold failure")
-        self.mode = "HOLD"
-        self.freedrive_backend = None
-        return ExecutedAction(now_iso(), {"type": "hold"}, {"type": "hold"}, True, True, reason)
 
     def hold_follower_without_position_target(self, reason: str) -> ExecutedAction:
         self.follower_hold_calls += 1
@@ -142,10 +119,13 @@ class FakeRobot:
             "reason": self.reason,
             "connected": True,
             "robot": robot,
-            "can_feedback_recovery": dict(self.can_feedback_recovery),
             "leader_feedback_age_s": 0.0 if getattr(self, "leader_only_feedback", False) else None,
             "leader_feedback_hz": 220.0 if getattr(self, "leader_only_feedback", False) else None,
         }
+
+    def read_cpv_parameter(self, joint_index: int, name: str) -> float:
+        self.cpv_parameter_reads.append((joint_index, name))
+        return float(joint_index)
 
     def get_observation(self, include_motor_states: bool = False) -> Any:
         raise NotImplementedError
@@ -239,6 +219,13 @@ class BrokerPreemptionTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(self.broker.action_status(first["action_id"])["status"], "completed")
 
+    def test_cpv_parameter_snapshot_is_read_only_and_serialized(self) -> None:
+        snapshot = self.broker.read_teleop_cpv_parameters()
+        self.assertEqual(snapshot["status"], "available")
+        self.assertEqual(len(self.fake.cpv_parameter_reads), 42)
+        self.assertEqual(snapshot["values"]["acc"], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+        self.assertEqual(self.fake.execute_calls, 0)
+
     def test_start_remains_running_when_usb_can_connect_fails(self) -> None:
         self.broker.close()
         self.fake.connect = lambda: (_ for _ in ()).throw(RuntimeError("USB-CAN channel 0 unavailable"))  # type: ignore[method-assign]
@@ -279,41 +266,6 @@ class BrokerPreemptionTests(unittest.TestCase):
         self.assertEqual(self.broker.teleop_status()["session"]["state"], "IDLE")
         blocked.set()
 
-    def test_operator_hold_preempts_active_script_and_revokes_lease(self) -> None:
-        lease = self.broker.acquire("long-script")
-        output: dict[str, Any] = {}
-
-        def run_action() -> None:
-            output.update(self.broker.execute(lease["token"], {"type": "joint_target", "block": True}))
-
-        thread = threading.Thread(target=run_action)
-        thread.start()
-        time.sleep(0.03)
-        result = self.broker.hold("operator pressed hold")
-        thread.join(1.0)
-        self.assertTrue(result["ok"])
-        self.assertIn("PREEMPTED_BY_OPERATOR", output["reason"])
-        self.assertIsNone(self.broker.status()["lease"])
-        self.assertEqual(self.fake.mode, "HOLD")
-        self.assertEqual(self.fake.estop_calls, 0)
-
-    def test_operator_freedrive_preempts_active_script_and_revokes_lease(self) -> None:
-        lease = self.broker.acquire("long-script")
-        output: dict[str, Any] = {}
-
-        def run_action() -> None:
-            output.update(self.broker.execute(lease["token"], {"type": "joint_target", "block": True}))
-
-        thread = threading.Thread(target=run_action)
-        thread.start()
-        time.sleep(0.03)
-        result = self.broker.freedrive("operator requested manual takeover")
-        thread.join(1.0)
-        self.assertTrue(result["ok"])
-        self.assertIn("PREEMPTED_BY_OPERATOR", output["reason"])
-        self.assertIsNone(self.broker.status()["lease"])
-        self.assertEqual(self.fake.mode, "FREEDRIVE")
-
     def test_freedrive_brakes_then_waits_for_cpv_stop_before_leader_transition(self) -> None:
         original_handoff = self.broker.handoff_to_console
         try:
@@ -336,40 +288,10 @@ class BrokerPreemptionTests(unittest.TestCase):
         self.assertEqual(authority["servo_mode"], "SUSPENDED")
         self.assertFalse(self.broker.servo_can_write("old-session", 0))
 
-    def test_freedrive_rejects_missing_startup_feedback_before_a_job_or_enable_attempt(self) -> None:
-        self.fake.feedback_unavailable = True
-        self.fake.can_feedback_recovery = {
-            "status": "failed", "enabled": True, "frame_sent": False,
-            "reason": "no known NERO feedback IDs observed",
-        }
-        self.broker._refresh_status_snapshot()
-
-        with self.assertRaisesRegex(RuntimeError, "fresh CAN feedback"):
-            self.broker.submit_action_job({"kind": "freedrive"})
-
-        self.assertEqual(self.fake.freedrive_calls, 0)
-        self.assertEqual(self.broker.health()["job_count"], 0)
-
-    def test_fresh_follower_feedback_overrides_stale_startup_recovery_failure(self) -> None:
-        self.fake.can_feedback_recovery = {
-            "status": "failed", "enabled": True, "frame_sent": False,
-            "reason": "startup probe did not observe known IDs",
-        }
-        self.broker._refresh_status_snapshot()
-
-        readiness = self.broker.status()["feedback_ready"]
-
-        self.assertTrue(readiness["ok"])
-        self.assertIn("follower feedback", readiness["reason"])
-
     def test_hold_is_allowed_from_fresh_leader_feedback_without_follower_arm_status(self) -> None:
         self.fake.mode = "FREEDRIVE"
         self.fake.freedrive_backend = "leader"
         self.fake.leader_only_feedback = True
-        self.fake.can_feedback_recovery = {
-            "status": "failed", "enabled": True, "frame_sent": False,
-            "reason": "no known NERO feedback IDs observed",
-        }
         self.broker._refresh_status_snapshot()
 
         readiness = self.broker.status()["feedback_ready"]
@@ -387,30 +309,6 @@ class BrokerPreemptionTests(unittest.TestCase):
         self.assertEqual(self.broker.action_status(job["action_id"])["status"], "completed")
         self.assertEqual(self.fake.follower_hold_calls, 1)
         self.assertEqual(self.fake.hold_calls, 0)
-
-    def test_status_reports_active_action_owner(self) -> None:
-        lease = self.broker.acquire("model-policy")
-        output: dict[str, Any] = {}
-
-        def run_action() -> None:
-            output.update(self.broker.execute(lease["token"], {"type": "joint_target", "block": True}))
-
-        thread = threading.Thread(target=run_action)
-        thread.start()
-        deadline = time.monotonic() + 0.5
-        active = None
-        while active is None and time.monotonic() < deadline:
-            active = self.broker.status()["active_action"]
-            time.sleep(0.01)
-        self.assertIsNotNone(active)
-        self.assertEqual(active["owner"], "model-policy")
-        self.fake.request_preempt("test cleanup")
-        thread.join(1.0)
-
-    def test_status_exposes_can_feedback_recovery(self) -> None:
-        status = self.broker.status()
-        self.assertEqual(status["can_feedback_recovery"]["status"], "not_needed")
-        self.assertFalse(status["can_feedback_recovery"]["frame_sent"])
 
     def test_operator_gripper_command_does_not_create_leader_hold(self) -> None:
         result = self.broker.command_gripper("grip", 0.0, 1.0, True)
@@ -439,7 +337,7 @@ class BrokerPreemptionTests(unittest.TestCase):
 
         original = self.fake.hold_follower_without_position_target
         try:
-            self.fake.mode = "TELEOP_CPV_VELOCITY"
+            self.fake.mode = "TELEOP_CPV"
             self.fake.continuous_stream_active = True
             self.fake.hold_follower_without_position_target = fail  # type: ignore[method-assign]
             with self.assertRaisesRegex(RuntimeError, "simulated hold failure"):
@@ -476,7 +374,7 @@ class BrokerPreemptionTests(unittest.TestCase):
         self.assertEqual(self.fake.hold_calls, 0)
 
     def test_console_handoff_uses_follower_hold_without_position_target(self) -> None:
-        self.fake.mode = "TELEOP_CPV_VELOCITY"
+        self.fake.mode = "TELEOP_CPV"
         self.fake.continuous_stream_active = True
 
         result = self.broker.handoff_to_console("test CPV handoff")
@@ -501,26 +399,6 @@ class BrokerPreemptionTests(unittest.TestCase):
         self.assertTrue(result["zero_force"])
         self.assertFalse(self.broker.status()["gripper_hold"]["active"])
 
-    def test_operator_gripper_holds_arm_when_preempting_motion(self) -> None:
-        lease = self.broker.acquire("moving-model")
-        output: dict[str, Any] = {}
-
-        def run_action() -> None:
-            output.update(self.broker.execute(
-                lease["token"], {"type": "joint_target", "block": True}
-            ))
-
-        thread = threading.Thread(target=run_action)
-        thread.start()
-        time.sleep(0.03)
-        result = self.broker.command_gripper("grip", 0.0, 1.0, True)
-        thread.join(1.0)
-
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["arm_hold"]["ok"])
-        self.assertIn("PREEMPTED_BY_OPERATOR", output["reason"])
-        self.assertIsNone(self.broker.status()["lease"])
-
     def test_operator_gripper_exits_freedrive_before_command(self) -> None:
         self.fake.mode = "FREEDRIVE"
         self.fake.freedrive_backend = "leader"
@@ -532,35 +410,6 @@ class BrokerPreemptionTests(unittest.TestCase):
         self.assertEqual(self.fake.hold_calls, 0)
         self.assertEqual(self.fake.mode, "HOLD")
         self.assertTrue(result["arm_hold"]["ok"])
-
-    def test_explicit_motion_exits_freedrive_before_dispatch(self) -> None:
-        self.fake.mode = "FREEDRIVE"
-        self.fake.freedrive_backend = "leader"
-        lease = self.broker.acquire("explicit-motion")
-
-        result = self.broker.execute(
-            lease["token"],
-            {"type": "joint_target", "joint_angles_rad": [0.0] * 7},
-        )
-
-        self.assertTrue(result["ok"])
-        self.assertEqual(self.fake.follower_hold_calls, 1)
-        self.assertEqual(self.fake.hold_calls, 0)
-        self.assertEqual(self.fake.mode, "HOLD")
-
-    def test_freedrive_exit_failure_does_not_dispatch_motion(self) -> None:
-        self.fake.mode = "FREEDRIVE"
-        self.fake.freedrive_backend = "leader"
-        self.fake.hold_should_fail = True
-        lease = self.broker.acquire("explicit-motion")
-
-        result = self.broker.execute(
-            lease["token"],
-            {"type": "joint_target", "joint_angles_rad": [0.0] * 7},
-        )
-
-        self.assertFalse(result["ok"])
-        self.assertEqual(self.fake.execute_calls, 0)
 
     def test_electronic_emergency_is_disabled_by_default(self) -> None:
         self.broker.acquire("script")
@@ -579,33 +428,6 @@ class BrokerPreemptionTests(unittest.TestCase):
         self.assertGreaterEqual(self.fake.follower_hold_calls, 1)
         self.assertEqual(self.fake.hold_calls, 0)
         self.assertEqual(self.fake.estop_calls, 0)
-
-    def test_enabled_emergency_preempts_active_model(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            fake = FakeRobot(Path(directory))
-            fake.config["safety"] = {"allow_electronic_emergency_stop": True}
-            broker = RobotControlBroker({}, robot=fake)  # type: ignore[arg-type]
-            broker.start()
-            try:
-                lease = broker.acquire("running-model")
-                output: dict[str, Any] = {}
-
-                def run_action() -> None:
-                    output.update(broker.execute(
-                        lease["token"], {"type": "joint_target", "block": True}
-                    ))
-
-                thread = threading.Thread(target=run_action)
-                thread.start()
-                time.sleep(0.03)
-                result = broker.emergency_damping("operator emergency")
-                thread.join(1.0)
-                self.assertTrue(result["ok"])
-                self.assertEqual(fake.estop_calls, 1)
-                self.assertIn("PREEMPTED_BY_OPERATOR", output["reason"])
-                self.assertIsNone(broker.status()["lease"])
-            finally:
-                broker.close()
 
     def test_fault_mode_blocks_non_emergency_operator_commands(self) -> None:
         self.fake.mode = "FAULT"
@@ -662,13 +484,13 @@ class OscFacadeTests(unittest.TestCase):
                 self.assertNotIn("input_source", state["session"])
                 self.assertEqual(state["robot"]["joint_angles_rad"], [0.0] * 7)
                 self.assertEqual(state["execution"]["current_tcp_pose"]["position_m"], [0.0, 0.2, 0.3])
-                self.assertEqual(state["execution"]["observed_source"], "simulated_final_output")
+                self.assertEqual(state["execution"]["observed_source"], "simulated_cpv_feedback")
                 self.assertEqual(state["execution"]["output_count"], 7)
                 self.assertEqual(state["command"]["output_status"], "limited")
                 self.assertAlmostEqual(state["diagnostics"]["tcp_error"]["position_norm_m"], 0.1)
                 self.assertAlmostEqual(state["diagnostics"]["tcp_error"]["orientation_angle_rad"], 0.0)
                 self.assertEqual(state["diagnostics"]["pink"]["condition_number"], 12.5)
-                self.assertEqual(state["transport"]["participation"], "not_participating")
+                self.assertEqual(state["transport"]["participation"], "shadow_simulated")
                 self.assertIsNone(state["transport"]["last_cpv_dispatch"])
                 result = controller.osc_command({
                     "session_id": "osc-1", "client_id": "client", "sequence": 1, "type": "track_tcp",
@@ -683,6 +505,11 @@ class OscFacadeTests(unittest.TestCase):
                 })
                 self.assertTrue(compact["ok"])
                 self.assertNotIn("state", compact)
+                with self.assertRaisesRegex(ValueError, "OSC command type"):
+                    controller.osc_command({
+                        "session_id": "osc-1", "client_id": "client", "sequence": 3,
+                        "type": "joint_target", "payload": {"joint_angles_rad": [0.0] * 7},
+                    })
                 heartbeat = controller.osc_heartbeat("client", "osc-1")
                 self.assertTrue(heartbeat["ok"])
                 self.assertEqual(controller.osc_servo.heartbeat_call, ("client", "osc-1"))

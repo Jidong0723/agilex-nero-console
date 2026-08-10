@@ -12,7 +12,6 @@
     "effector": "agx_gripper"
   },
   "motion": {
-    "speed_percent": 3,
     "feedback_timeout_s": 3.0,
     "emergency_reset_settle_s": 0.8,
     "emergency_recovery_feedback_timeout_s": 4.0,
@@ -30,19 +29,11 @@
     "gripper_reset_settle_s": 0.2,
     "gripper_enable_attempts": 3
   },
-  "can_feedback_recovery": {
-    "enabled": false,
-    "silence_timeout_s": 3.0,
-    "verification_timeout_s": 3.0,
-    "max_attempts": 1
-  },
   "safety": {
     "allow_electronic_emergency_stop": false,
     "min_flange_z_m": -0.01,
     "workspace_min_xyz_m": [-0.45, -0.45, -0.01],
     "workspace_max_xyz_m": [0.45, 0.60, 0.70],
-    "min_speed_percent": 1,
-    "max_speed_percent": 5,
     "min_gripper_width_m": 0.0,
     "max_gripper_width_m": 0.10,
     "max_gripper_force_n": 3.0
@@ -63,7 +54,7 @@
     "host": "0.0.0.0",
     "port": 8768,
     "pair_ttl_s": 120.0,
-    "message_timeout_s": 0.25,
+    "message_timeout_s": 2.0,
     "max_hz": 90,
     "max_message_bytes": 4096
   },

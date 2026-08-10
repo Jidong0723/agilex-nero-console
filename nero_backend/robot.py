@@ -4,19 +4,11 @@ import json
 import math
 import threading
 import time
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
 from shared.schemas import ExecutedAction, GripperState, RobotState, as_list, jsonable, now_iso, unwrap_msg
-from motion.safety import (
-    SafetyConfig,
-    SafetyLayer,
-    SafetyViolation,
-    arm_status_has_error,
-    arm_status_is_no_solution_only,
-)
-from .can_recovery import probe_and_recover_can_feedback
+from motion.safety import SafetyConfig, SafetyLayer, arm_status_has_error, arm_status_is_no_solution_only
 
 
 class MotionPreempted(RuntimeError):
@@ -32,17 +24,6 @@ def call_safe(name: str, func: Callable[[], Any]) -> dict[str, Any]:
 
 def call_joint_indexed(name: str, getter: Callable[[int], Any], joint_count: int = 7) -> list[dict[str, Any]]:
     return [call_safe(f"{name}({idx})", lambda idx=idx: getter(idx)) for idx in range(1, joint_count + 1)]
-
-
-def pose_error(actual: list[float], target: list[float]) -> dict[str, Any]:
-    position = [float(actual[idx]) - float(target[idx]) for idx in range(3)]
-    orientation = [abs((float(actual[idx]) - float(target[idx]) + math.pi) % (2.0 * math.pi) - math.pi) for idx in range(3, 6)]
-    return {
-        "position_error_m": position,
-        "position_norm_m": math.sqrt(sum(value * value for value in position)),
-        "orientation_error_rad": orientation,
-        "max_orientation_error_rad": max(orientation) if orientation else None,
-    }
 
 
 class NeroRobot:
@@ -76,15 +57,7 @@ class NeroRobot:
             "error": None,
         }
         self._gripper_requires_enable_clear = False
-        self._stale_no_solution_recovered = False
         self._cpv_stream_started = False
-        self._cpv_speed_percent: int | None = None
-        self._can_feedback_recovery: dict[str, Any] = {
-            "status": "disabled",
-            "enabled": False,
-            "frame_sent": False,
-            "reason": "connection has not started",
-        }
         self._connect_stage = "idle"
 
     @property
@@ -113,18 +86,6 @@ class NeroRobot:
             available = can.detect_available_configs(["agx_cando"])
             if not any(str(item.get("channel")) == channel for item in available):
                 raise RuntimeError(f"USB-CAN channel {channel} is unavailable; detected configurations: {available}")
-        recovery_config = self.config.get("can_feedback_recovery", {})
-        self._connect_stage = "probe_can_feedback"
-        self._can_feedback_recovery = probe_and_recover_can_feedback(
-            interface=interface,
-            channel=channel,
-            bitrate=bitrate,
-            speed_percent=int(self.motion_config.get("speed_percent", 3)),
-            enabled=bool(recovery_config.get("enabled", True)),
-            silence_timeout_s=float(recovery_config.get("silence_timeout_s", 3.0)),
-            verification_timeout_s=float(recovery_config.get("verification_timeout_s", 3.0)),
-            max_attempts=int(recovery_config.get("max_attempts", 1)),
-        )
         self._connect_stage = "create_sdk_config"
         cfg = create_agx_arm_config(
             robot=ArmModel.NERO,
@@ -140,8 +101,6 @@ class NeroRobot:
         try:
             self._connect_stage = "open_sdk_can_bus"
             self.robot.connect()
-            self._connect_stage = "set_speed_percent"
-            self.robot.set_speed_percent(int(self.motion_config.get("speed_percent", 3)))
             self._connect_stage = "initialize_gripper"
             self.gripper = self.robot.init_effector(self.robot.OPTIONS.EFFECTOR.AGX_GRIPPER)
             self._connect_stage = "wait_follower_feedback"
@@ -221,7 +180,6 @@ class NeroRobot:
             "firmware": call_safe("get_firmware", self.robot.get_firmware),
             "gripper_is_ok": call_safe("gripper.is_ok", self.gripper.is_ok),
             "feedback_ready": ready,
-            "can_feedback_recovery": dict(self._can_feedback_recovery),
         }
 
     def disconnect(self) -> dict[str, Any]:
@@ -280,118 +238,16 @@ class NeroRobot:
             "emergency_latched": self._emergency_latched,
             "freedrive_recovery": dict(self._freedrive_recovery),
             "continuous_stream_active": self._cpv_stream_started,
-            "can_feedback_recovery": dict(self._can_feedback_recovery),
             "error": error,
         }
-
-    def hold_position(
-        self, reason: str = "hold requested", recover_stale_leader: bool = False
-    ) -> ExecutedAction:
-        # Explicit legacy J-mode position hold. Normal HOLD, teleop handoff,
-        # and FREEDRIVE use hold_follower_without_position_target().
-        self.request_preempt(reason)
-        transition_epoch = self.preempt_epoch()
-        if self.robot is None:
-            return self._control_result("hold", reason, False, False, {"error": "robot not connected"})
-        with self._transition_lock:
-            previous_mode = self._control_mode
-            self._control_mode = "TRANSITIONING"
-            try:
-                if previous_mode == "EMERGENCY_DAMPING" or self._emergency_latched:
-                    raise RuntimeError(
-                        "emergency stop is latched; recover to supported freedrive before requesting hold"
-                    )
-                previous_backend = self._freedrive_backend
-                stale_leader_recovery = bool(
-                    recover_stale_leader and previous_backend == "leader" and previous_mode == "FAULT"
-                )
-                cpv_active = self._cpv_stream_started or previous_mode in {
-                    "TELEOP_CPV", "TELEOP_CPV_VELOCITY"
-                }
-
-                # A CPV stream, Leader mode, and J-mode position hold are three
-                # distinct controller states.  Never issue move_j while CPV or
-                # Leader is still active: an old stream target can otherwise be
-                # interpreted in the wrong mode and cause a discontinuous jump.
-                if cpv_active:
-                    self._stop_cpv_stream()
-
-                if previous_mode == "FREEDRIVE" and previous_backend == "drag_teach":
-                    with self._command_lock:
-                        self._set_drag_teach(False)
-                    self._gripper_requires_enable_clear = True
-                    if not self._wait_drag_teach(False, timeout=1.5):
-                        raise RuntimeError("drag teaching exit was not confirmed")
-
-                # Switch modes before sampling the hold target.  The follower
-                # feedback is the only authoritative source for a J-mode hold;
-                # Leader feedback is intentionally never used as a move_j target.
-                auto_mode = True
-                try:
-                    with self._command_lock:
-                        self.robot.set_follower_mode()
-                        enabled, enable_status = self._enable_all_with_retry(
-                            timeout=float(self.motion_config.get("enable_timeout_s", 8.0))
-                        )
-                        if not enabled:
-                            raise RuntimeError(f"required joints are not enabled: {enable_status}")
-                        auto_mode = (
-                            self.robot.get_auto_set_motion_mode_enabled()
-                            if hasattr(self.robot, "get_auto_set_motion_mode_enabled") else True
-                        )
-                        if hasattr(self.robot, "set_auto_set_motion_mode_enabled"):
-                            self.robot.set_auto_set_motion_mode_enabled(False)
-                        self.robot.set_speed_percent(1)
-                        self.robot.set_motion_mode(self.robot.OPTIONS.MOTION_MODE.J)
-
-                    joints = self._read_stable_follower_joints(timeout=0.8)
-                    if len(joints) != 7:
-                        raise RuntimeError("stable follower seven-joint feedback is unavailable")
-
-                    with self._command_lock:
-                        # Exactly one J-mode command, targeting feedback sampled
-                        # after all continuous/zero-force modes have exited.
-                        self.robot.move_j(list(joints))
-                finally:
-                    if hasattr(self.robot, "set_auto_set_motion_mode_enabled"):
-                        with self._command_lock:
-                            self.robot.set_auto_set_motion_mode_enabled(auto_mode)
-                stable, max_error = self._wait_hold_stable(joints, timeout=2.0)
-                if not stable:
-                    raise RuntimeError(f"position hold was not confirmed; max joint drift={max_error}")
-                if self.preempt_epoch() != transition_epoch:
-                    raise MotionPreempted("hold transition was superseded")
-                self._control_mode = "HOLD"
-                self._cpv_stream_started = False
-                self._freedrive_backend = None
-                self._last_control_reason = reason
-                return self._control_result(
-                    "hold", reason, True, True,
-                    {
-                        "target_joint_angles_rad": list(joints),
-                        "max_joint_drift_rad": max_error,
-                        "cpv_stream_stopped": cpv_active,
-                        "follower_target_source": "post-transition stable feedback",
-                        "stale_leader_recovery": stale_leader_recovery,
-                        "joint_enable_status": enable_status,
-                    },
-                )
-            except Exception as exc:
-                self._control_mode = "EMERGENCY_DAMPING" if self._emergency_latched else "FAULT"
-                self._last_control_reason = f"hold failed: {type(exc).__name__}: {exc}"
-                return self._control_result(
-                    "hold", reason, False, True,
-                    {"error": f"{type(exc).__name__}: {exc}"},
-                )
 
     def hold_follower_without_position_target(
         self, reason: str = "CPV handoff requested"
     ) -> ExecutedAction:
         """Leave CPV in a verified Follower hold without creating a J target.
 
-        This is the normal teleop handoff.  It deliberately differs from
-        ``hold_position``: no J-mode switch and no ``move_j`` are sent after
-        the CPV stream has reached zero velocity.
+        This is the only OSC HOLD handoff: no J-mode switch and no ``move_j``
+        command are sent after the CPV stream has reached zero velocity.
         """
         self.request_preempt(reason)
         transition_epoch = self.preempt_epoch()
@@ -406,9 +262,7 @@ class NeroRobot:
             try:
                 if previous_mode == "EMERGENCY_DAMPING" or self._emergency_latched:
                     raise RuntimeError("emergency stop is latched; cannot enter follower hold")
-                cpv_active = self._cpv_stream_started or previous_mode in {
-                    "TELEOP_CPV", "TELEOP_CPV_VELOCITY"
-                }
+                cpv_active = self._cpv_stream_started or previous_mode == "TELEOP_CPV"
                 if cpv_active:
                     self._stop_cpv_stream()
 
@@ -441,7 +295,6 @@ class NeroRobot:
 
                 self._control_mode = "HOLD"
                 self._cpv_stream_started = False
-                self._cpv_speed_percent = None
                 self._freedrive_backend = None
                 self._last_control_reason = reason
                 return self._control_result(
@@ -996,143 +849,11 @@ class NeroRobot:
             "force_n": state.force_n,
         }
 
-    def execute_action(
-        self,
-        action: dict[str, Any],
-        timeout: float | None = None,
-        expected_preempt_epoch: int | None = None,
-    ) -> ExecutedAction:
-        timeout = float(timeout if timeout is not None else self.motion_config.get("motion_timeout_s", 25.0))
-        requested = dict(action)
-        if self._control_mode == "FREEDRIVE" and requested.get("type") != "stop":
-            transition = self.hold_follower_without_position_target(
-                "automatic Leader/FREEDRIVE exit before explicit action"
-            ).to_dict()
-            if not transition.get("ok"):
-                return ExecutedAction(
-                    now_iso(), requested, None, False, False,
-                    "FREEDRIVE auto-exit failed; action was not dispatched",
-                    {"freedrive_auto_exit": transition},
-                )
-            expected_preempt_epoch = self.preempt_epoch()
-        if self._control_mode in {"EMERGENCY_DAMPING", "TRANSITIONING"}:
-            return ExecutedAction(
-                now_iso(), requested, None, False, False,
-                f"action rejected while control mode is {self._control_mode}",
-            )
-        with self._preempt_lock:
-            if expected_preempt_epoch is not None and expected_preempt_epoch != self._preempt_epoch:
-                return ExecutedAction(
-                    now_iso(), requested, None, False, False,
-                    "PREEMPTED_BY_OPERATOR before action dispatch",
-                    {"preempted": True, "control_mode": self._control_mode},
-                )
-            self._preempt_event.clear()
-        try:
-            state = self.read_state()
-            validation_state = state
-            if requested.get("type") == "cartesian_pose" and arm_status_is_no_solution_only(state.arm_status):
-                # The controller may keep the previous NO_SOLUTION flag until
-                # this new target is accepted.  Safety checks still validate
-                # limits, freshness, and the target itself; only this stale
-                # status bit is normalized for the recovery transaction.
-                validation_state = replace(
-                    state,
-                    arm_status={**state.arm_status, "arm_status": 0},
-                )
-            elif (
-                requested.get("type") == "gripper"
-                and self._stale_no_solution_recovered
-                and arm_status_is_no_solution_only(state.arm_status)
-            ):
-                validation_state = replace(
-                    state,
-                    arm_status={**state.arm_status, "arm_status": 0},
-                )
-            safe = self.safety.validate(requested, validation_state)
-        except SafetyViolation as exc:
-            return ExecutedAction(now_iso(), requested, None, False, False, f"rejected: {exc}")
-        except Exception as exc:
-            return ExecutedAction(now_iso(), requested, None, False, False, f"state/read failure: {type(exc).__name__}: {exc}")
-        try:
-            action_type = safe["type"]
-            if action_type == "stop":
-                return self.stop(str(safe.get("reason", "stop action")))
-            if action_type == "joint_target":
-                result = self._move_j(safe["joint_angles_rad"], safe["speed_percent"], timeout)
-            elif action_type == "cartesian_delta":
-                result = self._move_cartesian_delta(safe, timeout)
-            elif action_type == "cartesian_pose":
-                result = self._move_cartesian_pose(
-                    safe["pose"], safe["speed_percent"], timeout,
-                    motion_mode=safe.get("motion_mode", "point"),
-                )
-            elif action_type == "gripper":
-                result = self._move_gripper(safe["width_m"], safe["force_n"])
-            else:
-                raise RuntimeError(f"Unsupported safe action type: {action_type}")
-            if not result.get("ok"):
-                raise RuntimeError(f"action did not reach its target: {result}")
-            if action_type == "cartesian_pose" and arm_status_is_no_solution_only(state.arm_status):
-                self._stale_no_solution_recovered = True
-            if self._control_mode == "FAULT":
-                recovered_state = self.read_state()
-                if not arm_status_has_error(recovered_state.arm_status):
-                    self._control_mode = "HOLD"
-                    self._last_control_reason = "recovered from prior NO_SOLUTION with a valid action"
-            return ExecutedAction(now_iso(), requested, safe, True, True, result.get("reason", ""), result)
-        except MotionPreempted as exc:
-            return ExecutedAction(
-                now_iso(), requested, safe, False, True,
-                f"PREEMPTED_BY_OPERATOR: {exc}",
-                {"preempted": True, "control_mode": self._control_mode},
-            )
-        except Exception as exc:
-            stop_result = self._handle_action_failure(exc, requested)
-            return ExecutedAction(
-                now_iso(),
-                requested,
-                safe,
-                False,
-                True,
-                f"{type(exc).__name__}: {exc}",
-                {"exception": f"{type(exc).__name__}: {exc}", "stop": stop_result.to_dict()},
-            )
-
-    def _handle_action_failure(self, exc: Exception, requested: dict[str, Any]) -> ExecutedAction:
-        reason = f"runtime failure after {requested.get('type')}: {type(exc).__name__}: {exc}"
-        try:
-            state = self.read_state()
-            status = state.arm_status or {}
-            arm_status = self._enum_int(status.get("arm_status"))
-            if arm_status in {0x07, 0x08}:
-                return self.e_stop(reason)
-        except Exception:
-            return self._control_result(
-                "hold", reason, False, False,
-                {"error": "feedback unavailable; use the nearby power switch"},
-            )
-        return self.hold_follower_without_position_target(reason)
-
-    def _move_j(self, joints: list[float], speed_percent: int, timeout: float) -> dict[str, Any]:
-        with self._command_lock:
-            enabled, enable_status = self._enable_all_with_retry(
-                timeout=float(self.motion_config.get("enable_timeout_s", 8.0))
-            )
-            if not enabled:
-                raise RuntimeError(f"required joints are not enabled: {enable_status}")
-            self.robot.set_speed_percent(speed_percent)
-            self.robot.set_motion_mode(self.robot.OPTIONS.MOTION_MODE.J)
-            self.robot.move_j(joints)
-        reached, error = self._wait_joint_target(joints, timeout)
-        return {"ok": reached, "wait_max_joint_error_rad": error}
-
-    def send_cpv_position(self, joints: list[float], speed_percent: int | None = None) -> dict[str, Any]:
+    def send_cpv_position(self, joints: list[float]) -> dict[str, Any]:
         """Send one continuous CPV position sample.
 
-        This legacy helper remains separate from the blocking MOVE_P/MOVE_L
-        paths. The teleoperation servo uses ``send_cpv_velocity`` instead;
-        callers of either helper must apply kinematics and safety checks.
+        OSC is the only caller.  It has already applied kinematics, trajectory,
+        and final safety checks before this method serializes the CAN batch.
         """
         if self.robot is None:
             raise RuntimeError("robot is not connected")
@@ -1144,23 +865,16 @@ class NeroRobot:
         started_ns = time.monotonic_ns()
         joint_sent_ns: list[int] = []
         with self._command_lock:
-            requested_speed = int(speed_percent if speed_percent is not None else self.motion_config.get("speed_percent", 3))
-            requested_speed = max(1, min(5, requested_speed))
             if not self._cpv_stream_started:
                 enabled, enable_status = self._enable_all_with_retry(
                     timeout=float(self.motion_config.get("enable_timeout_s", 8.0))
                 )
                 if not enabled:
                     raise RuntimeError(f"required joints are not enabled: {enable_status}")
-                self.robot.set_speed_percent(requested_speed)
                 mode = getattr(getattr(self.robot, "OPTIONS", None), "MOTION_MODE", None)
                 cpv = getattr(mode, "CPV", "cpv")
                 self.robot.set_motion_mode(cpv)
                 self._cpv_stream_started = True
-                self._cpv_speed_percent = requested_speed
-            elif self._cpv_speed_percent != requested_speed:
-                self.robot.set_speed_percent(requested_speed)
-                self._cpv_speed_percent = requested_speed
             move = getattr(self.robot, "move_cpv_pos", None)
             if move is None:
                 raise RuntimeError("NERO SDK does not expose move_cpv_pos")
@@ -1172,53 +886,7 @@ class NeroRobot:
         return {
             "ok": True,
             "motion_mode": "CPV_POSITION",
-            "speed_percent": requested_speed,
             "joint_target_rad": values,
-            "started_monotonic_ns": started_ns,
-            "finished_monotonic_ns": finished_ns,
-            "joint_sent_monotonic_ns": joint_sent_ns,
-            "batch_duration_ms": (finished_ns - started_ns) / 1e6,
-            "batch_skew_ms": ((max(joint_sent_ns) - min(joint_sent_ns)) / 1e6) if joint_sent_ns else 0.0,
-        }
-
-    def send_cpv_velocity(self, velocities: list[float]) -> dict[str, Any]:
-        """Send one seven-joint CPV velocity sample without SDK-side waits.
-
-        The vendor v120 driver inherits the per-joint sign compatibility
-        handling from v112.  Values therefore pass through unchanged here.
-        """
-        if self.robot is None:
-            raise RuntimeError("robot is not connected")
-        if not isinstance(velocities, list) or len(velocities) != 7:
-            raise ValueError("CPV velocity requires seven joint values")
-        values = [float(value) for value in velocities]
-        if not all(math.isfinite(value) for value in values):
-            raise ValueError("CPV velocity contains non-finite values")
-        started_ns = time.monotonic_ns()
-        joint_sent_ns: list[int] = []
-        with self._command_lock:
-            if not self._cpv_stream_started:
-                enabled, enable_status = self._enable_all_with_retry(
-                    timeout=float(self.motion_config.get("enable_timeout_s", 8.0))
-                )
-                if not enabled:
-                    raise RuntimeError(f"required joints are not enabled: {enable_status}")
-                mode = getattr(getattr(self.robot, "OPTIONS", None), "MOTION_MODE", None)
-                self.robot.set_motion_mode(getattr(mode, "CPV", "cpv"))
-                self._cpv_stream_started = True
-                self._cpv_speed_percent = None
-            move = getattr(self.robot, "move_cpv_vel", None)
-            if move is None:
-                raise RuntimeError("NERO SDK does not expose move_cpv_vel")
-            for index, value in enumerate(values, start=1):
-                move(joint_index=index, vel=value)
-                joint_sent_ns.append(time.monotonic_ns())
-        finished_ns = time.monotonic_ns()
-        self._control_mode = "TELEOP_CPV_VELOCITY"
-        return {
-            "ok": True,
-            "motion_mode": "CPV_VELOCITY",
-            "joint_velocity_rad_s": values,
             "started_monotonic_ns": started_ns,
             "finished_monotonic_ns": finished_ns,
             "joint_sent_monotonic_ns": joint_sent_ns,
@@ -1241,7 +909,7 @@ class NeroRobot:
         with self._transition_lock:
             was_active = bool(
                 self._cpv_stream_started
-                or self._control_mode in {"TELEOP_CPV", "TELEOP_CPV_VELOCITY"}
+                or self._control_mode == "TELEOP_CPV"
             )
             if was_active:
                 self._stop_cpv_stream()
@@ -1269,7 +937,6 @@ class NeroRobot:
         if not self._wait_joint_velocity_settled(timeout=timeout):
             raise RuntimeError("CPV position hold was sent but joint motion did not settle")
         self._cpv_stream_started = False
-        self._cpv_speed_percent = None
 
     def prime_cpv_position_from_feedback(self) -> dict[str, Any]:
         """Start CPV with a measured joint-position hold, never a velocity."""
@@ -1343,43 +1010,81 @@ class NeroRobot:
         if getter is None:
             raise RuntimeError(f"NERO SDK does not expose get_cpv_{name}")
         with self._command_lock:
-            return getter(joint_index=joint_index, timeout=0.0, min_interval=0.0)
+            # A zero timeout makes every asynchronous CAN getter report
+            # ``None`` before its response can arrive.  This is still a
+            # read-only query; bound its wait so telemetry cannot monopolise
+            # the transport owner.
+            return getter(joint_index=joint_index, timeout=0.15, min_interval=0.0)
 
-    def _move_cartesian_delta(self, safe: dict[str, Any], timeout: float) -> dict[str, Any]:
-        state = self.read_state()
-        if not state.flange_pose or len(state.flange_pose) != 6:
-            raise RuntimeError("Could not read current flange pose.")
-        target = list(state.flange_pose)
-        for idx in range(3):
-            target[idx] += safe["delta_xyz_m"][idx]
-        for idx in range(3):
-            target[idx + 3] += safe["delta_rpy_rad"][idx]
-        # Validate the derived absolute pose as well.
-        self.safety.validate({"type": "cartesian_pose", "pose": target, "speed_percent": safe["speed_percent"]}, state)
-        return self._move_cartesian_pose(target, safe["speed_percent"], timeout)
+    def configure_cpv_profile(self, cv_rad_s: float, acc_rad_s2: float, dcc_rad_s2: float) -> dict[str, Any]:
+        """Set the official CPV profile and verify every SDK ACK/read-back.
 
-    def _move_cartesian_pose(
-        self, pose: list[float], speed_percent: int, timeout: float,
-        motion_mode: str = "point",
-    ) -> dict[str, Any]:
+        This only changes the vendor controller profile and never dispatches
+        a joint-position or velocity target.  CPV parameters are persisted
+        in the motor controller's Flash, so values already matching the
+        requested profile are deliberately not written again.
+        """
+        values = {"acc": float(acc_rad_s2), "dcc": float(dcc_rad_s2), "cv": float(cv_rad_s)}
+        if not all(math.isfinite(value) and value > 0.0 for value in values.values()):
+            raise ValueError("CPV cv, acc and dcc must be finite positive values")
+        if self.robot is None:
+            raise RuntimeError("robot is not connected")
+        rows: list[dict[str, Any]] = []
         with self._command_lock:
-            enabled, enable_status = self._enable_all_with_retry(
-                timeout=float(self.motion_config.get("enable_timeout_s", 8.0))
-            )
-            if not enabled:
-                raise RuntimeError(f"required joints are not enabled: {enable_status}")
-            self.robot.set_speed_percent(speed_percent)
-            if motion_mode == "linear":
-                self.robot.set_motion_mode(self.robot.OPTIONS.MOTION_MODE.L)
-                self.robot.move_l(pose)
-            else:
-                self.robot.set_motion_mode(self.robot.OPTIONS.MOTION_MODE.P)
-                self.robot.move_p(pose)
-        reached, error = self._wait_pose_target(pose, timeout)
-        return {
-            "ok": reached, "pose_error": error, "target_pose": pose,
-            "motion_mode": motion_mode,
-        }
+            # The v112/v120 SDK examples explicitly select CPV once before
+            # issuing settings.  OSC is already in the verified CPV/Follower
+            # HOLD state when it calls this method.  Disable the SDK's
+            # per-request auto mode write so settings cannot repeatedly race
+            # that mode message on the CAN channel.
+            auto_mode = True
+            if hasattr(self.robot, "get_auto_set_motion_mode_enabled"):
+                auto_mode = bool(self.robot.get_auto_set_motion_mode_enabled())
+
+            current: dict[int, dict[str, Any]] = {
+                joint_index: {name: self.read_cpv_parameter(joint_index, name) for name in values}
+                for joint_index in range(1, 8)
+            }
+            if hasattr(self.robot, "set_auto_set_motion_mode_enabled"):
+                self.robot.set_auto_set_motion_mode_enabled(False)
+            try:
+                row_data = {
+                    joint_index: {"joint_index": joint_index, "before": current[joint_index],
+                                  "acknowledgements": {}, "readback": {}}
+                    for joint_index in range(1, 8)
+                }
+                # Configure the two accel limits first.  They use the same
+                # requested value and are independent of the CV profile.
+                # This also prevents a firmware-rejected CV from leaving the
+                # requested acceleration envelope only partly configured.
+                for name in ("acc", "dcc", "cv"):
+                    for joint_index in range(1, 8):
+                        before = current[joint_index]
+                        value = values[name]
+                        if before.get(name) is not None and abs(float(before[name]) - value) <= 1e-6:
+                            acknowledgement: bool | None = None  # already persisted; do not consume Flash life
+                        else:
+                            setter = getattr(self.robot, f"set_cpv_{name}", None)
+                            if setter is None:
+                                raise RuntimeError(f"NERO SDK does not expose set_cpv_{name}")
+                            acknowledgement = bool(setter(joint_index=joint_index, **{name: value}, timeout=1.0))
+                        # Some v120 firmware revisions apply a setting but do
+                        # not emit the legacy 0xAC acknowledgement expected by
+                        # the inherited v112 SDK.  Read-back is therefore the
+                        # final safety authority; a false ACK is recorded but
+                        # only rejected when the persisted value disagrees.
+                        readback = self.read_cpv_parameter(joint_index, name)
+                        row_data[joint_index]["acknowledgements"][name] = acknowledgement
+                        row_data[joint_index]["readback"][name] = readback
+                        if readback is None or abs(float(readback) - value) > 1e-6:
+                            raise RuntimeError(
+                                f"CPV {name} read-back mismatch at J{joint_index}: "
+                                f"requested={value}, ack={acknowledgement}, before={before.get(name)}, got={readback}"
+                            )
+                rows = [row_data[joint_index] for joint_index in range(1, 8)]
+            finally:
+                if hasattr(self.robot, "set_auto_set_motion_mode_enabled"):
+                    self.robot.set_auto_set_motion_mode_enabled(auto_mode)
+        return {"ok": True, "profile": values, "joints": rows}
 
     def _move_gripper(self, width_m: float, force_n: float) -> dict[str, Any]:
         if self.gripper is None:
@@ -1390,55 +1095,6 @@ class NeroRobot:
         time.sleep(float(self.motion_config.get("gripper_settle_s", 1.0)))
         status = self.read_gripper()
         return {"ok": bool(command.get("ok")), "command": command, "gripper": status.to_dict()}
-
-    def _wait_joint_target(self, target: list[float], timeout: float, poll_interval: float = 0.1) -> tuple[bool, float | None]:
-        start = time.monotonic()
-        last_error: float | None = None
-        tolerance = float(self.motion_config.get("joint_tolerance_rad", 0.035))
-        while time.monotonic() - start <= timeout:
-            self._raise_if_preempted()
-            state = self.read_state()
-            if arm_status_has_error(state.arm_status):
-                return False, last_error
-            actual = state.joint_angles_rad or []
-            if len(actual) >= 7:
-                errors = [abs(float(actual[idx]) - float(target[idx])) for idx in range(7)]
-                last_error = max(errors)
-                if last_error <= tolerance:
-                    return True, last_error
-            time.sleep(poll_interval)
-        return False, last_error
-
-    def _wait_pose_target(self, target: list[float], timeout: float, poll_interval: float = 0.1) -> tuple[bool, dict[str, Any] | None]:
-        start = time.monotonic()
-        last_error: dict[str, Any] | None = None
-        position_tolerance = float(self.motion_config.get("position_tolerance_m", 0.015))
-        orientation_tolerance = float(self.motion_config.get("orientation_tolerance_rad", 0.05))
-        no_solution_clear_timeout = float(
-            self.motion_config.get("no_solution_clear_timeout_s", 2.0)
-        )
-        while time.monotonic() - start <= timeout:
-            self._raise_if_preempted()
-            state = self.read_state()
-            residual_no_solution = arm_status_is_no_solution_only(state.arm_status)
-            if not residual_no_solution:
-                self.safety.check_state(state)
-            actual = state.flange_pose or []
-            if len(actual) >= 6:
-                last_error = pose_error(actual[:6], target)
-                if (
-                    last_error["position_norm_m"] <= position_tolerance
-                    and last_error["max_orientation_error_rad"] <= orientation_tolerance
-                ):
-                    return True, last_error
-            # A lone NO_SOLUTION status can describe the prior Cartesian call.
-            # It is never treated as success unless live feedback reaches this
-            # newly validated target; otherwise this loop expires normally.
-            if residual_no_solution and time.monotonic() - start > no_solution_clear_timeout:
-                last_error = last_error or {}
-                last_error["residual_no_solution"] = True
-            time.sleep(poll_interval)
-        return False, last_error
 
     def _wait_hold_stable(
         self, target: list[float], timeout: float = 1.0, poll_interval: float = 0.05

@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          auto-update-conda: false
+          activate-environment: base
+      - name: Install control environment
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+          .\.venv\Scripts\python.exe -m pip install -e .
+      - name: Create isolated kinematics environment
+        shell: pwsh
+        run: conda env create --prefix .conda\nero-kinematics --file environment-kinematics.yml
+      - name: Validate package and shadow-safe tests
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -m nero_console doctor
+          .\.venv\Scripts\python.exe -m unittest tests.test_instance_lock tests.test_robot_modes tests.test_teleop tests.test_control_service tests.test_pico_adapter tests.test_pi05_adapter
