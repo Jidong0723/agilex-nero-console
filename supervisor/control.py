@@ -549,20 +549,24 @@ class OperationalSpaceController:
         # Never perform a live SDK read in an HTTP request. The monitor owns
         # refreshes; this endpoint remains responsive while an SDK call stalls.
         with self._status_lock:
-            if self._status_cache is not None:
-                stamp, snapshot = self._status_cache
-                result = dict(snapshot)
-                result["status_age_s"] = max(0.0, time.monotonic() - stamp)
-                lease = self.leases.current()
-                result["lease"] = lease.public() if lease else None
-                result["active_action"] = self._active_action_public()
-                result["service_health"] = self.health()
-                result["teleop"] = self.teleop.status()
-                result["broker"] = self.authority_status(result.get("control"))
-                result["feedback_ready"] = self._feedback_readiness(
-                    result.get("control", {}), result["status_age_s"]
-                )
-                return result
+            cached = self._status_cache
+        # Do not hold the status-cache mutex while consulting teleop/health.
+        # OSC state calls take the teleop mutex; retaining this lock here
+        # creates a lock inversion with the monitor during a session start.
+        if cached is not None:
+            stamp, snapshot = cached
+            result = dict(snapshot)
+            result["status_age_s"] = max(0.0, time.monotonic() - stamp)
+            lease = self.leases.current()
+            result["lease"] = lease.public() if lease else None
+            result["active_action"] = self._active_action_public()
+            result["service_health"] = self.health()
+            result["teleop"] = self.teleop.status()
+            result["broker"] = self.authority_status(result.get("control"))
+            result["feedback_ready"] = self._feedback_readiness(
+                result.get("control", {}), result["status_age_s"]
+            )
+            return result
         return self._refresh_status_snapshot()
 
     @staticmethod
@@ -843,14 +847,23 @@ class OperationalSpaceController:
         )
         snapshot = self.status()
         current_tcp = None
+        execution_sample = dict(servo.get("execution_sample") or {})
         solver = dict((servo.get("last_result") or {}).get("solver") or {})
-        if isinstance(solver.get("tcp"), dict):
+        if isinstance(execution_sample.get("current_tcp_pose"), dict):
+            current_tcp = dict(execution_sample["current_tcp_pose"])
+        elif isinstance(solver.get("tcp"), dict):
             try:
                 current_tcp = OperationalSpaceServo._pose_from_tcp(solver["tcp"])
             except (TypeError, ValueError):
                 current_tcp = None
         target_tcp = servo.get("reference_pose")
-        tcp_tracking_error = self._tcp_tracking_error(current_tcp, target_tcp)
+        sampled_target = execution_sample.get("target_tcp") if isinstance(execution_sample.get("target_tcp"), dict) else target_tcp
+        tcp_tracking_error = self._tcp_tracking_error(current_tcp, sampled_target)
+        if isinstance(tcp_tracking_error, dict) and execution_sample:
+            tcp_tracking_error.update({
+                "sample_id": execution_sample.get("sample_id"),
+                "target_generation": execution_sample.get("target_generation"),
+            })
         raw_diagnostics = dict(servo.get("diagnostics") or {})
         last_result = dict(servo.get("last_result") or {})
         last_output = dict(servo.get("last_output") or {})
@@ -872,15 +885,19 @@ class OperationalSpaceController:
             "timing": raw_diagnostics.get("timing", {}),
             "trajectory_state": raw_diagnostics.get("trajectory_state"),
             "trajectory_brake_reason": raw_diagnostics.get("trajectory_brake_reason"),
+            "arrival": servo.get("arrival"),
         }
         recent_batches = list(raw_diagnostics.get("recent_cpv_batches") or [])
-        observed_joints = last_output.get("final_joint_target_rad") if shadow else (snapshot.get("robot") or {}).get("joint_angles_rad")
+        observed_joints = execution_sample.get("joint_state_rad")
+        if not isinstance(observed_joints, list):
+            observed_joints = last_output.get("final_joint_target_rad") if shadow else (snapshot.get("robot") or {}).get("joint_angles_rad")
         return {
             "schema_version": "nero.osc.v2",
             "state_sequence": servo.get("state_sequence", 0),
             "session": session,
             "command": {
                 "target_tcp": target_tcp,
+                "target_generation": servo.get("reference_revision", execution_sample.get("target_generation")),
                 "final_joint_target_rad": last_output.get("final_joint_target_rad"),
                 "final_joint_velocity_rad_s": last_output.get("final_joint_velocity_rad_s"),
                 "sequence": last_output.get("sequence", (session or {}).get("sequence", 0)),
@@ -889,12 +906,18 @@ class OperationalSpaceController:
             },
             "execution": {
                 "mode": execution_mode,
+                "sample_id": execution_sample.get("sample_id"),
+                "sample_monotonic_ns": execution_sample.get("sample_monotonic_ns"),
                 "commanded_joint_state_rad": last_output.get("final_joint_target_rad"),
                 "observed_joint_state_rad": observed_joints,
                 "observed_source": "simulated_final_output" if shadow else "measured_can_feedback",
                 "output_count": raw_diagnostics.get("output_count", 0),
                 "accepting_targets": bool(servo.get("input_enabled")),
                 "current_tcp_pose": current_tcp,
+                "feedback_age_s": execution_sample.get("feedback_age_s"),
+                "estimated_feedback_delay_s": execution_sample.get("estimated_feedback_delay_s"),
+                "solver_latency_s": execution_sample.get("solver_latency_s"),
+                "dispatch_interval_s": execution_sample.get("dispatch_interval_s"),
             },
             "diagnostics": diagnostics,
             "transport": {

@@ -145,26 +145,66 @@ class Solver:
             ).toRotationMatrix(),
             np.asarray(target_position, dtype=float),
         )
+        command_position = finite_vector(request.get("command_target_position_m", target_position), 3, "command_target_position_m")
+        command_quaternion = finite_vector(request.get("command_target_orientation_xyzw", target_quaternion), 4, "command_target_orientation_xyzw")
+        command_norm = math.sqrt(sum(item * item for item in command_quaternion))
+        if command_norm <= 1e-12:
+            raise ValueError("command_target_orientation_xyzw must be non-zero")
+        command_quaternion = [item / command_norm for item in command_quaternion]
+        command_tcp = pin.SE3(
+            pin.Quaternion(
+                float(command_quaternion[3]), float(command_quaternion[0]),
+                float(command_quaternion[1]), float(command_quaternion[2]),
+            ).toRotationMatrix(),
+            np.asarray(command_position, dtype=float),
+        )
         configuration = self.pink.Configuration(self.model, self.data, qv)
-        rotation_error = float(np.linalg.norm(pin.log3(current_tcp.rotation.T @ target_tcp.rotation)))
-        position_error = float(np.linalg.norm(target_tcp.translation - current_tcp.translation))
+        # Publish errors against the caller's absolute target, not the bounded
+        # one-cycle prediction used internally by the IK task.
+        rotation_error = float(np.linalg.norm(pin.log3(current_tcp.rotation.T @ command_tcp.rotation)))
+        position_error = float(np.linalg.norm(command_tcp.translation - current_tcp.translation))
         position_cost = float(request.get("frame_position_cost", 10.0))
         orientation_cost = float(request.get("frame_orientation_cost", 1.0))
         damping_cost = float(request.get("damping_cost", 0.05))
         frame_gain = float(request.get("frame_gain", 0.5))
-        if not all(math.isfinite(value) and value > 0.0 for value in (position_cost, orientation_cost, damping_cost)) or not math.isfinite(frame_gain) or not 0.0 < frame_gain <= 1.0:
+        frame_lm_damping = float(request.get("frame_lm_damping", 0.0))
+        # Frame gain is an IK feedback gain, not a joint-speed limit.  The
+        # OSC output path independently enforces joint velocity and the
+        # 5 rad/s² acceleration limit, so permit a bounded gain above one for
+        # critically faster Cartesian error correction.
+        if not all(math.isfinite(value) and value > 0.0 for value in (position_cost, orientation_cost, damping_cost)) or not math.isfinite(frame_gain) or not 0.0 < frame_gain <= 5.0 or not math.isfinite(frame_lm_damping) or frame_lm_damping < 0.0:
             raise ValueError("Pink task costs or gain are invalid")
         frame_task = self.FrameTask(
             self.frame_name,
             position_cost=position_cost,
             orientation_cost=orientation_cost,
             gain=frame_gain,
+            lm_damping=frame_lm_damping,
         )
         frame_task.set_target(target_tcp)
         posture_reference = finite_vector(request.get("posture_reference_rad", q_feedback), 7, "posture_reference_rad")
-        posture_task = self.PostureTask(cost=float(request.get("posture_cost", 0.005)))
+        posture_cost = float(request.get("posture_cost", 0.005))
+        posture_task = self.PostureTask(cost=posture_cost)
         posture_task.set_target(self._q(posture_reference))
         damping_task = self.DampingTask(cost=damping_cost)
+        # Joint centering is a soft, limit-local objective rather than a
+        # permanent pull toward the geometric midpoint. Inside the central
+        # band its cost is exactly zero, so it cannot create hold-stage null
+        # motion merely because the session posture is not centered.
+        center_deadband = float(request.get("joint_center_deadband", 0.70))
+        center_cost = float(request.get("joint_center_cost", 0.0))
+        if not 0.0 <= center_deadband < 1.0 or not math.isfinite(center_cost) or center_cost < 0.0:
+            raise ValueError("joint-center parameters are invalid")
+        midpoint = 0.5 * (solver_lower + solver_upper)
+        half_range = np.maximum(1e-6, 0.5 * (solver_upper - solver_lower))
+        normalized_offset = np.abs((np.asarray(q_feedback, dtype=float) - midpoint) / half_range)
+        center_activation = np.square(
+            np.clip((normalized_offset - center_deadband) / max(1e-6, 1.0 - center_deadband), 0.0, 1.0)
+        )
+        center_task = None
+        if center_cost > 0.0 and bool(np.any(center_activation > 0.0)):
+            center_task = self.PostureTask(cost=center_cost * center_activation)
+            center_task.set_target(self._q(midpoint.tolist()))
         acceleration_limit = self.AccelerationLimit(self.model, np.asarray(acceleration_limits, dtype=float))
         # This is deliberately the final CAN velocity from the previous cycle,
         # never the raw Pink proposal.
@@ -174,7 +214,10 @@ class Solver:
             self.VelocityLimit(self.model),
             acceleration_limit,
         ]
-        dq = np.asarray(self.pink.solve_ik(configuration, [frame_task, posture_task, damping_task], dt, solver="quadprog", limits=limits), dtype=float)[:7]
+        tasks = [frame_task, posture_task, damping_task]
+        if center_task is not None:
+            tasks.append(center_task)
+        dq = np.asarray(self.pink.solve_ik(configuration, tasks, dt, solver="quadprog", limits=limits), dtype=float)[:7]
         tcp_twist = np.asarray(jac, dtype=float) @ dq
         jacobian_rank = int(np.linalg.matrix_rank(np.asarray(jac, dtype=float)))
         nullspace_velocity = dq - np.linalg.pinv(np.asarray(jac, dtype=float)) @ tcp_twist
@@ -192,11 +235,19 @@ class Solver:
             "posture_error_norm": float(np.linalg.norm(posture_error)),
             "damping_cost": damping_cost,
             "frame_gain": frame_gain,
+            "frame_lm_damping": frame_lm_damping,
+            "position_cost": position_cost,
+            "posture_cost": posture_cost,
+            "joint_center_cost": center_cost,
+            "joint_center_deadband": center_deadband,
+            "joint_center_activation": center_activation.tolist(),
+            "joint_acceleration_limit_rad_s2": acceleration_limits,
             "solver": "pinocchio+pink",
             "target_pose": {
-                "position_m": target_position,
-                "orientation_xyzw": target_quaternion,
+                "position_m": command_position,
+                "orientation_xyzw": command_quaternion,
             },
+            "solver_target_pose": {"position_m": target_position, "orientation_xyzw": target_quaternion},
             "position_error_m": position_error,
             "orientation_error_rad": rotation_error,
             "posture_reference_rad": posture_reference,
@@ -289,11 +340,15 @@ def main() -> int:
         response.update({
             "input_sequence": latest.get("sequence"),
             "solver_request_id": latest.get("solver_request_id"),
+            "control_sample_id": latest.get("control_sample_id"),
+            "target_generation": latest.get("target_generation"),
             "anchor_id": latest.get("anchor_id"),
             "reference_revision": latest.get("reference_revision"),
+            "joint_state_rad": latest.get("joint_angles_rad"),
             "joint_state_monotonic_ns": latest.get("joint_state_monotonic_ns"),
             "motion_epoch": latest.get("motion_epoch"),
             "solver_monotonic_ns": started_ns,
+            "solver_finished_monotonic_ns": time.monotonic_ns(),
         })
         print(json.dumps(response, ensure_ascii=False, separators=(",", ":")), flush=True)
         if closed.is_set():

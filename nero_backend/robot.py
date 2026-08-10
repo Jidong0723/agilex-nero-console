@@ -1141,6 +1141,8 @@ class NeroRobot:
         values = [float(value) for value in joints]
         if not all(math.isfinite(value) for value in values):
             raise ValueError("CPV position contains non-finite values")
+        started_ns = time.monotonic_ns()
+        joint_sent_ns: list[int] = []
         with self._command_lock:
             requested_speed = int(speed_percent if speed_percent is not None else self.motion_config.get("speed_percent", 3))
             requested_speed = max(1, min(5, requested_speed))
@@ -1164,8 +1166,20 @@ class NeroRobot:
                 raise RuntimeError("NERO SDK does not expose move_cpv_pos")
             for index, value in enumerate(values, start=1):
                 move(joint_index=index, pos=value)
+                joint_sent_ns.append(time.monotonic_ns())
+        finished_ns = time.monotonic_ns()
         self._control_mode = "TELEOP_CPV"
-        return {"ok": True, "motion_mode": "CPV_POSITION", "speed_percent": requested_speed, "joint_target_rad": values}
+        return {
+            "ok": True,
+            "motion_mode": "CPV_POSITION",
+            "speed_percent": requested_speed,
+            "joint_target_rad": values,
+            "started_monotonic_ns": started_ns,
+            "finished_monotonic_ns": finished_ns,
+            "joint_sent_monotonic_ns": joint_sent_ns,
+            "batch_duration_ms": (finished_ns - started_ns) / 1e6,
+            "batch_skew_ms": ((max(joint_sent_ns) - min(joint_sent_ns)) / 1e6) if joint_sent_ns else 0.0,
+        }
 
     def send_cpv_velocity(self, velocities: list[float]) -> dict[str, Any]:
         """Send one seven-joint CPV velocity sample without SDK-side waits.

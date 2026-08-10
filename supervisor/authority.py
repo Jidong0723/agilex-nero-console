@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
@@ -158,6 +159,7 @@ class HardwareTransportOwner:
             "method": method, "args": args, "kwargs": kwargs,
             "priority": priority, "command_epoch": envelope_epoch,
             "category": envelope_category, "execute_guard": execute_guard, "done": done,
+            "queued_monotonic_ns": time.monotonic_ns(),
         }
         with self._sequence_lock:
             self._sequence += 1
@@ -227,11 +229,22 @@ class HardwareTransportOwner:
             if envelope is None:
                 return
             try:
-                envelope["result"] = self._execute(
+                dispatch_started_ns = time.monotonic_ns()
+                result = self._execute(
                     envelope["method"], envelope["args"], envelope["kwargs"],
                     envelope["priority"], envelope["command_epoch"],
                     envelope["category"], envelope.get("execute_guard"),
                 )
+                dispatch_finished_ns = time.monotonic_ns()
+                if isinstance(result, dict):
+                    result = dict(result)
+                    queued_ns = int(envelope.get("queued_monotonic_ns") or dispatch_started_ns)
+                    result.setdefault("transport_queued_monotonic_ns", queued_ns)
+                    result.setdefault("transport_dispatch_started_monotonic_ns", dispatch_started_ns)
+                    result.setdefault("transport_dispatch_finished_monotonic_ns", dispatch_finished_ns)
+                    result.setdefault("queue_delay_ms", max(0.0, (dispatch_started_ns - queued_ns) / 1e6))
+                    result.setdefault("transport_duration_ms", max(0.0, (dispatch_finished_ns - dispatch_started_ns) / 1e6))
+                envelope["result"] = result
             except Exception as exc:  # deliver the original SDK error to caller
                 envelope["error"] = exc
             finally:
