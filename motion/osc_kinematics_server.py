@@ -43,7 +43,7 @@ class Solver:
         self.joint_ids = [self.model.getJointId(name) for name in joint_names]
         if any(item == 0 for item in self.joint_ids):
             raise RuntimeError(f"NERO URDF is missing one of {joint_names}")
-        self.frame_name = "teleop_tcp_candidate"
+        self.frame_name = "osc_tcp_candidate"
         tcp_placement = pin.SE3(pin.Quaternion.Identity(), np.asarray(tcp_offset, dtype=float))
         self.frame_id = self.model.addFrame(
             pin.Frame(self.frame_name, self.joint_ids[-1], tcp_placement, pin.FrameType.OP_FRAME)
@@ -313,7 +313,7 @@ def main() -> int:
                 continue
         closed.set()
 
-    threading.Thread(target=receive, name="teleop-solver-input", daemon=True).start()
+    threading.Thread(target=receive, name="osc-solver-input", daemon=True).start()
     latest: dict[str, Any] | None = None
     while True:
         # Process the newest state as soon as it arrives. A fixed-rate solver

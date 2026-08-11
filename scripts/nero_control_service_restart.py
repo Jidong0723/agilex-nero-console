@@ -219,7 +219,7 @@ def main() -> int:
         if pid != os.getpid():
             terminate_process_tree(pid)
     # A solver can be orphaned if its parent was previously killed without /T.
-    for pid in matching_python_pids(args.project_root, "teleop_kinematics_server.py"):
+    for pid in matching_python_pids(args.project_root, "osc_kinematics_server.py"):
         if pid != os.getpid():
             terminate_process_tree(pid)
 

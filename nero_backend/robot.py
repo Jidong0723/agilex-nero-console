@@ -196,7 +196,7 @@ class NeroRobot:
                         # JOINT_BRAKE_NOT_RELEASED is a recoverable controller
                         # state, not a latched safety fault. It can appear with
                         # all drives disabled or with a partially enabled set
-                        # after a prior HOLD/teleop transition. The explicit
+                        # after a prior HOLD/osc transition. The explicit
                         # HOLD path owns re-enabling the joints, so do not
                         # promote this state to FAULT merely because the
                         # enable bitmap is mixed.
@@ -358,7 +358,7 @@ class NeroRobot:
             try:
                 if previous_mode == "EMERGENCY_DAMPING" or self._emergency_latched:
                     raise RuntimeError("emergency stop is latched; cannot enter follower hold")
-                cpv_active = self._cpv_stream_started or previous_mode == "TELEOP_CPV"
+                cpv_active = self._cpv_stream_started or previous_mode == "OSC_CPV"
                 if cpv_active:
                     self._stop_cpv_stream()
 
@@ -605,12 +605,12 @@ class NeroRobot:
             raw=raw,
         )
 
-    def read_teleop_feedback(self) -> dict[str, Any]:
-        """Return the minimal cached feedback set required by CPV velocity servo.
+    def read_osc_feedback(self) -> dict[str, Any]:
+        """Return the minimal cached feedback set required by the OSC CPV servo.
 
         This intentionally avoids pose/driver status reads.  The SDK
         updates joint and motor feedback from its CAN receive path, so the
-        teleop cache thread can remain independent from the HTTP status path.
+        OSC feedback can remain independent from the HTTP status path.
         """
         self._require_connected()
         raw_joints = call_safe("get_joint_angles", self.robot.get_joint_angles)
@@ -957,7 +957,7 @@ class NeroRobot:
             "state": "completed", "started_monotonic_ns": started_ns,
             "finished_monotonic_ns": finished_ns, "sent_joint_count": len(joint_sent_ns),
         }
-        self._control_mode = "TELEOP_CPV"
+        self._control_mode = "OSC_CPV"
         return {
             "ok": True,
             "motion_mode": "CPV_POSITION",
@@ -1069,7 +1069,7 @@ class NeroRobot:
         with self._transition_lock:
             was_active = bool(
                 self._cpv_stream_started
-                or self._control_mode == "TELEOP_CPV"
+                or self._control_mode == "OSC_CPV"
             )
             if was_active:
                 self._stop_cpv_stream()

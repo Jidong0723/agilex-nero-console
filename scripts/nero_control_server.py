@@ -835,7 +835,7 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     width_m=float(width) if width is not None else None,
                     force_n=float(body.get("force_n", 1.0)),
                     preserve_on_freedrive=bool(body.get("preserve_on_freedrive", False)),
-                    resume_teleop=bool(body.get("resume_teleop", False)),
+                    resume_osc=bool(body.get("resume_osc", False)),
                 ))
             if self.path == "/api/operator/gripper/clear-hold":
                 return self._json_ok(self.broker.clear_gripper_hold())

@@ -177,49 +177,49 @@ class BrokerPreemptionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.fake = FakeRobot(Path(self.temp.name))
-        self.broker = RobotControlBroker({}, robot=self.fake)  # type: ignore[arg-type]
-        self.broker.start()
+        self.hardware = RobotControlBroker({}, robot=self.fake)  # type: ignore[arg-type]
+        self.hardware.start()
 
     def tearDown(self) -> None:
-        self.broker.close()
+        self.hardware.close()
         self.temp.cleanup()
 
     def test_async_operator_job_is_single_flight_and_queryable(self) -> None:
-        first = self.broker.submit_action_job({"kind": "hold", "reason": "test"})
-        second = self.broker.submit_action_job({"kind": "hold", "reason": "duplicate"})
+        first = self.hardware.submit_action_job({"kind": "hold", "reason": "test"})
+        second = self.hardware.submit_action_job({"kind": "hold", "reason": "duplicate"})
         self.assertEqual(first["action_id"], second["action_id"])
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
-            state = self.broker.action_status(first["action_id"])
+            state = self.hardware.action_status(first["action_id"])
             if state["status"] not in {"queued", "running", "already_running"}:
                 break
             time.sleep(0.01)
-        self.assertEqual(self.broker.action_status(first["action_id"])["status"], "completed")
+        self.assertEqual(self.hardware.action_status(first["action_id"])["status"], "completed")
 
     def test_cpv_parameter_snapshot_is_read_only_and_serialized(self) -> None:
-        snapshot = self.broker.read_teleop_cpv_parameters()
+        snapshot = self.hardware.read_osc_cpv_parameters()
         self.assertEqual(snapshot["status"], "available")
         self.assertEqual(len(self.fake.cpv_parameter_reads), 42)
         self.assertEqual(snapshot["values"]["acc"], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
         self.assertEqual(self.fake.execute_calls, 0)
 
     def test_start_remains_running_when_usb_can_connect_fails(self) -> None:
-        self.broker.close()
+        self.hardware.close()
         self.fake.connect = lambda: (_ for _ in ()).throw(RuntimeError("USB-CAN channel 0 unavailable"))  # type: ignore[method-assign]
         self.fake.get_control_state = lambda: (_ for _ in ()).throw(RuntimeError("USB-CAN channel 0 unavailable"))  # type: ignore[method-assign]
-        self.broker = RobotControlBroker({}, robot=self.fake)  # type: ignore[arg-type]
-        self.broker._status_monitor_interval_s = 60.0
+        self.hardware = RobotControlBroker({}, robot=self.fake)  # type: ignore[arg-type]
+        self.hardware._status_monitor_interval_s = 60.0
 
-        initial = self.broker.start()
+        initial = self.hardware.start()
 
         self.assertFalse(initial["connected"])
-        self.assertTrue(self.broker.health()["running"])
-        status = self.broker.status()
+        self.assertTrue(self.hardware.health()["running"])
+        status = self.hardware.status()
         self.assertEqual(status["control"]["mode"], "DISCONNECTED")
         self.assertFalse(status["feedback_ready"]["ok"])
 
     def test_start_times_out_stuck_hardware_and_keeps_shadow_backend_ready(self) -> None:
-        self.broker.close()
+        self.hardware.close()
         blocked = threading.Event()
 
         def stuck_connect() -> dict[str, Any]:
@@ -228,28 +228,28 @@ class BrokerPreemptionTests(unittest.TestCase):
 
         self.fake.config["control_service"]["startup_connect_timeout_s"] = 0.05
         self.fake.connect = stuck_connect  # type: ignore[method-assign]
-        self.broker = RobotControlBroker({}, robot=self.fake)  # type: ignore[arg-type]
+        self.hardware = RobotControlBroker({}, robot=self.fake)  # type: ignore[arg-type]
 
         started = time.monotonic()
-        initial = self.broker.start()
+        initial = self.hardware.start()
         elapsed = time.monotonic() - started
 
         self.assertLess(elapsed, 0.5)
         self.assertFalse(initial["connected"])
         self.assertIn("did not finish", initial["error"])
-        self.assertTrue(self.broker.health()["running"])
-        self.assertFalse(self.broker.health()["hardware_transport_available"])
-        self.assertEqual(self.broker.status()["control"]["mode"], "DISCONNECTED")
-        self.assertEqual(self.broker.osc_servo.status()["session"]["state"], "IDLE")
+        self.assertTrue(self.hardware.health()["running"])
+        self.assertFalse(self.hardware.health()["hardware_transport_available"])
+        self.assertEqual(self.hardware.status()["control"]["mode"], "DISCONNECTED")
+        self.assertEqual(self.hardware._osc.status()["session"]["state"], "IDLE")
         blocked.set()
 
     def test_freedrive_brakes_then_waits_for_cpv_stop_before_leader_transition(self) -> None:
-        original_handoff = self.broker.handoff_to_console
+        original_handoff = self.hardware.handoff_to_console
         try:
-            self.broker.handoff_to_console = lambda _reason: self.fail("FREEDRIVE must not use console handoff")  # type: ignore[method-assign]
-            result = self.broker.freedrive("direct Leader test")
+            self.hardware.handoff_to_console = lambda _reason: self.fail("FREEDRIVE must not use console handoff")  # type: ignore[method-assign]
+            result = self.hardware.freedrive("direct Leader test")
         finally:
-            self.broker.handoff_to_console = original_handoff  # type: ignore[method-assign]
+            self.hardware.handoff_to_console = original_handoff  # type: ignore[method-assign]
 
         self.assertTrue(result["ok"])
         self.assertEqual(self.fake.freedrive_calls, 1)
@@ -258,68 +258,68 @@ class BrokerPreemptionTests(unittest.TestCase):
         self.assertEqual(self.fake.hold_calls, 0)
 
         self.assertEqual(self.fake.events[-3:], ["preempt", "cpv_stop", "freedrive"])
-        self.assertIn("teleop_brake", result)
+        self.assertIn("osc_brake", result)
         self.assertTrue(result["cpv_stop"]["cpv_zero_confirmed"])
         self.assertEqual(result["cpv_stop"]["post_cpv_dwell_s"], 0.0)
-        authority = self.broker.status()["broker"]
+        authority = self.hardware.status()["broker"]
         self.assertEqual(authority["arm_writer"], "NONE")
         self.assertEqual(authority["servo_mode"], "SUSPENDED")
-        self.assertFalse(self.broker.servo_can_write("old-session", 0))
+        self.assertFalse(self.hardware.servo_can_write("old-session", 0))
 
     def test_hold_is_allowed_from_fresh_leader_feedback_without_follower_arm_status(self) -> None:
         self.fake.mode = "FREEDRIVE"
         self.fake.freedrive_backend = "leader"
         self.fake.leader_only_feedback = True
-        self.broker._refresh_status_snapshot()
+        self.hardware._refresh_status_snapshot()
 
-        readiness = self.broker.status()["feedback_ready"]
+        readiness = self.hardware.status()["feedback_ready"]
         self.assertTrue(readiness["ok"])
         self.assertIn("Leader feedback", readiness["reason"])
 
-        job = self.broker.submit_action_job({"kind": "hold", "reason": "exit leader"})
+        job = self.hardware.submit_action_job({"kind": "hold", "reason": "exit leader"})
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
-            state = self.broker.action_status(job["action_id"])
+            state = self.hardware.action_status(job["action_id"])
             if state["status"] not in {"queued", "running"}:
                 break
             time.sleep(0.01)
 
-        self.assertEqual(self.broker.action_status(job["action_id"])["status"], "completed")
+        self.assertEqual(self.hardware.action_status(job["action_id"])["status"], "completed")
         self.assertEqual(self.fake.follower_hold_calls, 1)
         self.assertEqual(self.fake.hold_calls, 0)
 
     def test_operator_gripper_command_does_not_create_leader_hold(self) -> None:
-        result = self.broker.command_gripper("grip", 0.0, 1.0, True)
+        result = self.hardware.command_gripper("grip", 0.0, 1.0, True)
         self.assertTrue(result["ok"])
-        self.assertFalse(self.broker.status()["gripper_hold"]["active"])
+        self.assertFalse(self.hardware.status()["gripper_hold"]["active"])
 
-    def test_operator_gripper_preserves_active_teleop_session(self) -> None:
-        original_status = self.broker.osc_servo.status
-        original_stop = self.broker.osc_servo.stop_session
+    def test_operator_gripper_preserves_active_osc_session(self) -> None:
+        original_status = self.hardware._osc.status
+        original_stop = self.hardware._osc.stop_session
         try:
-            self.broker.osc_servo.status = lambda: {"session": {"state": "ACTIVE"}}  # type: ignore[method-assign]
-            self.broker.osc_servo.stop_session = lambda _reason: self.fail("gripper must not stop an active OSC session")  # type: ignore[method-assign]
-            result = self.broker.command_gripper("grip", 0.0, 1.0, True)
+            self.hardware._osc.status = lambda: {"session": {"state": "ACTIVE"}}  # type: ignore[method-assign]
+            self.hardware._osc.stop_session = lambda _reason: self.fail("gripper must not stop an active OSC session")  # type: ignore[method-assign]
+            result = self.hardware.command_gripper("grip", 0.0, 1.0, True)
         finally:
-            self.broker.osc_servo.status = original_status  # type: ignore[method-assign]
-            self.broker.osc_servo.stop_session = original_stop  # type: ignore[method-assign]
+            self.hardware._osc.status = original_status  # type: ignore[method-assign]
+            self.hardware._osc.stop_session = original_stop  # type: ignore[method-assign]
         self.assertTrue(result["ok"])
-        self.assertTrue(result["teleop_preserved"])
+        self.assertTrue(result["osc_preserved"])
 
     def test_failed_operator_action_closes_observed_lifecycle(self) -> None:
         events: list[dict[str, Any]] = []
-        self.broker.add_action_observer(lambda **event: events.append(event))
+        self.hardware.add_action_observer(lambda **event: events.append(event))
 
         def fail(_: str) -> ExecutedAction:
             raise RuntimeError("simulated hold failure")
 
         original = self.fake.hold_follower_without_position_target
         try:
-            self.fake.mode = "TELEOP_CPV"
+            self.fake.mode = "OSC_CPV"
             self.fake.continuous_stream_active = True
             self.fake.hold_follower_without_position_target = fail  # type: ignore[method-assign]
             with self.assertRaisesRegex(RuntimeError, "simulated hold failure"):
-                self.broker.hold("test failure")
+                self.hardware.hold("test failure")
         finally:
             self.fake.hold_follower_without_position_target = original  # type: ignore[method-assign]
 
@@ -327,61 +327,61 @@ class BrokerPreemptionTests(unittest.TestCase):
         self.assertEqual(events[0]["action_id"], events[1]["action_id"])
 
     def test_console_handoff_revokes_ownership_then_issues_official_follower_hold(self) -> None:
-        lease = self.broker.acquire("stale-model-owner")
-        result = self.broker.handoff_to_console("test console handoff")
+        lease = self.hardware.acquire("stale-model-owner")
+        result = self.hardware.handoff_to_console("test console handoff")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["revoked_lease"]["owner"], lease["owner"])
-        self.assertIsNone(self.broker.status()["lease"])
+        self.assertIsNone(self.hardware.status()["lease"])
         self.assertIn("preempt", self.fake.events)
         self.assertEqual(self.fake.follower_hold_calls, 1)
         self.assertEqual(self.fake.hold_calls, 0)
 
-    def test_console_handoff_does_not_call_hold_when_teleop_worker_wont_stop(self) -> None:
-        original = self.broker.osc_servo.stop_session
+    def test_console_handoff_does_not_call_hold_when_osc_worker_wont_stop(self) -> None:
+        original = self.hardware._osc.stop_session
         try:
-            self.broker.osc_servo.stop_session = lambda reason: {  # type: ignore[method-assign]
+            self.hardware._osc.stop_session = lambda reason: {  # type: ignore[method-assign]
                 "handoff": {"servo_stopped": False, "feedback_stopped": True}
             }
-            result = self.broker.handoff_to_console("blocked teleop worker")
+            result = self.hardware.handoff_to_console("blocked osc worker")
         finally:
-            self.broker.osc_servo.stop_session = original  # type: ignore[method-assign]
+            self.hardware._osc.stop_session = original  # type: ignore[method-assign]
 
         self.assertFalse(result["ok"])
-        self.assertEqual(result["handoff"]["stage"], "teleop_stop")
+        self.assertEqual(result["handoff"]["stage"], "osc_stop")
         self.assertEqual(self.fake.hold_calls, 0)
 
     def test_console_handoff_uses_follower_hold_without_position_target(self) -> None:
-        self.fake.mode = "TELEOP_CPV"
+        self.fake.mode = "OSC_CPV"
         self.fake.continuous_stream_active = True
 
-        result = self.broker.handoff_to_console("test CPV handoff")
+        result = self.hardware.handoff_to_console("test CPV handoff")
 
         self.assertTrue(result["ok"])
         self.assertEqual(self.fake.follower_hold_calls, 1)
         self.assertEqual(self.fake.hold_calls, 0)
         self.assertFalse(result["hold"]["result"]["position_target_sent"])
-        self.assertEqual(self.broker.status()["broker"]["command_stream"], "NONE")
+        self.assertEqual(self.hardware.status()["broker"]["command_stream"], "NONE")
         self.assertEqual(self.fake.events[-3:], ["preempt", "cpv_stop", "follower_hold"])
 
-        cleared = self.broker.clear_gripper_hold()
+        cleared = self.hardware.clear_gripper_hold()
         self.assertFalse(cleared["active"])
-        self.assertFalse(self.broker.status()["gripper_hold"]["active"])
+        self.assertFalse(self.hardware.status()["gripper_hold"]["active"])
 
     def test_operator_gripper_zero_force_clears_hold(self) -> None:
-        self.broker.command_gripper("grip", 0.0, 1.0, True)
+        self.hardware.command_gripper("grip", 0.0, 1.0, True)
 
-        result = self.broker.release_gripper_zero_force()
+        result = self.hardware.release_gripper_zero_force()
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["zero_force"])
-        self.assertFalse(self.broker.status()["gripper_hold"]["active"])
+        self.assertFalse(self.hardware.status()["gripper_hold"]["active"])
 
     def test_operator_gripper_exits_freedrive_before_command(self) -> None:
         self.fake.mode = "FREEDRIVE"
         self.fake.freedrive_backend = "leader"
 
-        result = self.broker.command_gripper("grip", 0.0, 1.0, True)
+        result = self.hardware.command_gripper("grip", 0.0, 1.0, True)
 
         self.assertTrue(result["ok"])
         self.assertEqual(self.fake.follower_hold_calls, 1)
@@ -390,16 +390,16 @@ class BrokerPreemptionTests(unittest.TestCase):
         self.assertTrue(result["arm_hold"]["ok"])
 
     def test_electronic_emergency_is_disabled_by_default(self) -> None:
-        self.broker.acquire("script")
+        self.hardware.acquire("script")
         with self.assertRaisesRegex(RuntimeError, "disabled by the non-disabling control policy"):
-            self.broker.emergency_damping("danger")
+            self.hardware.emergency_damping("danger")
         self.assertEqual(self.fake.estop_calls, 0)
-        self.assertIsNotNone(self.broker.status()["lease"])
+        self.assertIsNotNone(self.hardware.status()["lease"])
 
     def test_expired_lease_triggers_hold(self) -> None:
-        self.broker.acquire("abandoned-script")
-        assert self.broker.leases._lease is not None
-        self.broker.leases._lease.expires_monotonic = time.monotonic() - 0.01
+        self.hardware.acquire("abandoned-script")
+        assert self.hardware.leases._lease is not None
+        self.hardware.leases._lease.expires_monotonic = time.monotonic() - 0.01
         deadline = time.monotonic() + 1.0
         while self.fake.follower_hold_calls == 0 and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -409,14 +409,14 @@ class BrokerPreemptionTests(unittest.TestCase):
 
     def test_fault_mode_blocks_non_emergency_operator_commands(self) -> None:
         self.fake.mode = "FAULT"
-        self.broker._refresh_status_snapshot()
+        self.hardware._refresh_status_snapshot()
 
         with self.assertRaisesRegex(RuntimeError, "restore fresh CAN feedback"):
-            self.broker.hold("must not reach robot")
+            self.hardware.hold("must not reach robot")
         with self.assertRaisesRegex(RuntimeError, "restore fresh CAN feedback"):
-            self.broker.freedrive("must not reach robot")
+            self.hardware.freedrive("must not reach robot")
         with self.assertRaisesRegex(RuntimeError, "restore fresh CAN feedback"):
-            self.broker.command_gripper("open", None, 1.0, False)
+            self.hardware.command_gripper("open", None, 1.0, False)
 
         self.assertEqual(self.fake.hold_calls, 0)
 
@@ -429,7 +429,7 @@ class HardwareFeedbackPoseTests(unittest.TestCase):
         })
 
 
-@unittest.skip("legacy teleop facade was removed; OSC absolute-target coverage lives in test_osc_boundary")
+@unittest.skip("legacy osc facade was removed; OSC absolute-target coverage lives in test_osc_boundary")
 class OscFacadeTests(unittest.TestCase):
     def test_osc_is_the_public_controller_and_hides_clutch_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -445,7 +445,7 @@ class OscFacadeTests(unittest.TestCase):
                         return {
                             "session": {"state": "ACTIVE", "id": "osc-1", "input_source": "legacy-adapter"},
                             "clutch_active": True, "anchor_id": 9, "relative_pose": {"position_m": [1, 2, 3]},
-                            "reference_pose": {"position_m": [0.1, 0.2, 0.3], "orientation_xyzw": [0, 0, 0, 1]},
+                            "target_pose": {"position_m": [0.1, 0.2, 0.3], "orientation_xyzw": [0, 0, 0, 1]},
                             "execution_sample": {
                                 "sample_id": 41,
                                 "target_generation": 7,
@@ -463,6 +463,12 @@ class OscFacadeTests(unittest.TestCase):
                             "solver": {}, "workspace": {}, "diagnostics": {"loop_count": 8, "output_count": 7, "cpv_dispatch_count": 0, "timing": {}},
                         }
 
+                    def target_pose(self):
+                        return {"position_m": [0.1, 0.2, 0.3], "orientation_xyzw": [0, 0, 0, 1]}
+
+                    def accepting_targets(self):
+                        return True
+
                     def stop_session(self, reason):
                         return {"handoff": {"reason": reason}}
 
@@ -470,8 +476,8 @@ class OscFacadeTests(unittest.TestCase):
                         self.heartbeat_call = (client_id, session_id)
                         return self.status()
 
-                controller.osc_servo = FakeOscServo()  # type: ignore[assignment]
-                controller.teleop = controller.osc_servo
+                controller._osc = FakeOscServo()  # type: ignore[assignment]
+                controller.osc = controller._osc
                 controller.status = lambda: {  # type: ignore[method-assign]
                     "control": {"robot": {"joint_angles_rad": [0.0] * 7}},
                 }
@@ -515,7 +521,7 @@ class OscFacadeTests(unittest.TestCase):
                     })
                 heartbeat = controller.osc_heartbeat("client", "osc-1")
                 self.assertTrue(heartbeat["ok"])
-                self.assertEqual(controller.osc_servo.heartbeat_call, ("client", "osc-1"))
+                self.assertEqual(controller._osc.heartbeat_call, ("client", "osc-1"))
             finally:
                 controller.close()
 

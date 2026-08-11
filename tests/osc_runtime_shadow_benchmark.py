@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
 
 BASE_URL = "http://127.0.0.1:8765"
 CLIENT_ID = "osc-runtime-shadow-benchmark"
-CONFIG_PATH = ROOT / "config" / "teleop.json"
+CONFIG_PATH = ROOT / "config" / "osc.json"
 DT_S = 0.02
 HOLD_S = 10.0
 STATE_SAMPLE_STRIDE = 5  # 10 Hz; state RPC must not throttle 50 Hz commands.

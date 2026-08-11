@@ -51,7 +51,7 @@ def doctor_report(root: Path | None = None) -> dict[str, Any]:
         "kinematics_python": str(kinematics_python(base)),
         "control_modules": {name: _module_status(name) for name in ("numpy", "ruckig", "pyAgxArm", "agx_cando", "can")},
         "kinematics_config": str(base / "environment-kinematics.yml"),
-        "teleop_config": str(base / "config" / "teleop.json"),
+        "osc_config": str(base / "config" / "osc.json"),
     }
     try:
         import can

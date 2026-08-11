@@ -11,12 +11,27 @@ import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 
 
 class KinematicsUnavailable(RuntimeError):
     pass
+
+
+class OscHardwarePort(Protocol):
+    """Minimal hardware/authority surface available to the private servo."""
+
+    def require_operational_control(self) -> None: ...
+    def prepare_osc_hardware(self) -> dict[str, Any]: ...
+    def read_osc_feedback(self) -> dict[str, Any]: ...
+    def osc_stream_active(self) -> bool: ...
+    def grant_osc_tracking(self, session_id: str, epoch: int) -> bool: ...
+    def mark_osc_stopping(self, session_id: str, epoch: int, reason: str) -> bool: ...
+    def servo_can_write(self, session_id: str, epoch: int) -> bool: ...
+    def send_servo_position(self, joints: list[float], session_id: str, epoch: int) -> dict[str, Any]: ...
+    def latch_osc_hold(self, reason: str) -> dict[str, Any]: ...
+    def trigger_safety_fault(self, reason: str) -> dict[str, Any]: ...
 
 
 def _finite_vector(value: Any, length: int, name: str) -> list[float]:
@@ -85,6 +100,13 @@ def _matrix_to_quat(matrix: list[list[float]]) -> list[float]:
     s = math.sqrt(1.0 + matrix[2][2] - matrix[0][0] - matrix[1][1]) * 2; return _unit_quaternion([(matrix[0][2] + matrix[2][0]) / s, (matrix[1][2] + matrix[2][1]) / s, 0.25 * s, (matrix[1][0] - matrix[0][1]) / s])
 
 
+def pose_from_tcp(tcp: dict[str, Any]) -> dict[str, list[float]]:
+    """Convert Pink's base-frame TCP dictionary to the public pose format."""
+    position = _finite_vector(tcp.get("position_m"), 3, "tcp.position_m")
+    rotation = _matrix3(tcp.get("rotation"), "tcp.rotation")
+    return {"position_m": position, "orientation_xyzw": _matrix_to_quat(rotation)}
+
+
 def _matrix3(value: Any, name: str) -> list[list[float]]:
     if not isinstance(value, list) or len(value) != 3:
         raise ValueError(f"{name} must be a 3x3 matrix")
@@ -120,7 +142,7 @@ class KinematicsClient:
         self.root = project_root
         python = Path(str(solver.get("python", "")))
         self.python = python if python.is_absolute() else project_root / python
-        self.script = project_root / str(solver.get("script", "motion/teleop_kinematics_server.py"))
+        self.script = project_root / str(solver.get("script", "motion/osc_kinematics_server.py"))
         self.urdf = project_root / str(solver.get("urdf", "vendor/nero_description/nero_description.urdf"))
         self.offset = config.get("tcp", {}).get("offset_from_link7_m", [0.175, 0.0, -0.0235])
         self.period_s = float(solver.get("dt_s", 0.02))
@@ -166,7 +188,7 @@ class KinematicsClient:
             cwd=str(self.root), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", bufsize=1, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        threading.Thread(target=self._read_stdout, name="teleop-pink-reader", daemon=True).start()
+        threading.Thread(target=self._read_stdout, name="osc-pink-reader", daemon=True).start()
         try:
             ready = self.ready.get(timeout=max(1.0, self.startup_timeout_s))
         except queue.Empty as exc:
@@ -179,7 +201,7 @@ class KinematicsClient:
         threading.Thread(
             target=self._motion_writer,
             args=(self.process,),
-            name="teleop-pink-writer",
+            name="osc-pink-writer",
             daemon=True,
         ).start()
 
@@ -203,7 +225,7 @@ class KinematicsClient:
                 process.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
                 process.kill()
-        # A new teleop session must never inherit responses from the previous
+        # A new osc session must never inherit responses from the previous
         # anchor/epoch.  This is especially important after the hard-reset
         # recovery path, where the controller worker may survive while its
         # Pink child still has an older request in flight.
@@ -755,20 +777,19 @@ class ShadowCpvPlant:
                 "output_count": self.output_count, "config": dict(self.config)}
 
 
-class OperationalSpaceServo:
+class _OperationalSpaceServo:
     """Fixed-rate operational-space servo: Pink, Ruckig and safety sync.
 
-    This is the sole Pink/Ruckig/CPV loop owned by OperationalSpaceController.
-    Legacy teleoperation is only an input adapter to this servo.
+    This is the sole Pink/Ruckig/CPV loop inside the OSC runtime.
     """
 
-    def __init__(self, broker: Any, project_root: Path, config: dict[str, Any]) -> None:
+    def __init__(self, hardware: OscHardwarePort, project_root: Path, config: dict[str, Any]) -> None:
         try:
             import ruckig
         except ImportError as exc:
-            raise RuntimeError("teleop requires ruckig in the control-service environment") from exc
+            raise RuntimeError("OSC requires ruckig in the control-service environment") from exc
         self.ruckig = ruckig
-        self.broker, self.root, self.config = broker, project_root, config
+        self.hardware, self.root, self.config = hardware, project_root, config
         self.limits, self.runtime = config.get("limits", {}), config.get("runtime", {})
         self.solver = KinematicsClient(project_root, config)
         self.authority = JointLimitAuthority(self.solver.urdf, config)
@@ -780,11 +801,11 @@ class OperationalSpaceServo:
         self.session: dict[str, Any] | None = None
         self.state_sequence = 0
         self.last_error: str | None = None
-        self.input_enabled = False
+        self._accepting_targets = False
         self._heartbeat_monotonic_ns = 0
         self.command: dict[str, Any] | None = None
         self.target_generation = 0
-        self.reference_pose: dict[str, list[float]] | None = None
+        self._target_pose: dict[str, list[float]] | None = None
         self.motion_epoch = 0
         self.last_sent_velocity = [0.0] * 7
         self.trajectory: dict[str, list[float]] | None = None
@@ -879,14 +900,8 @@ class OperationalSpaceServo:
             "last_input_age_s": session.get("last_input_age_s"),
         }
 
-    @staticmethod
-    def _pose_from_tcp(tcp: dict[str, Any]) -> dict[str, list[float]]:
-        position = _finite_vector(tcp.get("position_m"), 3, "tcp.position_m")
-        rotation = _matrix3(tcp.get("rotation"), "tcp.rotation")
-        return {"position_m": position, "orientation_xyzw": _matrix_to_quat(rotation)}
-
     def _current_tcp_pose(self, joints: list[float]) -> dict[str, list[float]]:
-        return self._pose_from_tcp(self.solver.fk(joints))
+        return pose_from_tcp(self.solver.fk(joints))
 
     def _pose_in_workspace(self, pose: dict[str, list[float]]) -> bool:
         position = pose["position_m"]
@@ -909,18 +924,18 @@ class OperationalSpaceServo:
             # This method is also called while ``self.lock`` is held by the
             # servo loop and the HTTP intent handler.  Authority transitions
             # acquire supervisor/transport locks and can be called back by
-            # status/control paths that need the teleop lock.  Never wait for
+            # status/control paths that need the osc lock.  Never wait for
             # that lock cycle from inside the input critical section: a stale
             # joystick packet must brake, not make the next packet time out.
             threading.Thread(
-                target=self.broker.mark_teleop_stopping,
+                target=self.hardware.mark_osc_stopping,
                 args=(str(session.get("session_id", "unknown")), self.motion_epoch, reason),
-                name="teleop-stop-authority",
+                name="osc-stop-authority",
                 daemon=True,
             ).start()
         self.command = None
         self.target_generation += 1
-        self.reference_pose = None
+        self._target_pose = None
         self.trajectory_state = "BRAKING"
         self.trajectory_brake_reason = reason
 
@@ -933,7 +948,7 @@ class OperationalSpaceServo:
                 self.session["motion_epoch"] = self.motion_epoch
             self.command = None
             self.target_generation += 1
-            self.input_enabled = False
+            self._accepting_targets = False
             self.feedback_sync_pending = True
             self.needs_resync = True
             self.trajectory_state = "HOLD_READY"
@@ -981,7 +996,7 @@ class OperationalSpaceServo:
                     authority = {"status": "shadow", "effective_lower_rad": self.authority.hard_lower, "effective_upper_rad": self.authority.hard_upper, "controller_speed_rad_s": [float(self.limits.get("joint_speed_rad_s", 1.5))] * 7, "controller_acceleration_rad_s2": [float(self.config.get("solver", {}).get("ruckig_max_acceleration", 5.0))] * 7}
                     self.authority.effective = authority
                 else:
-                    self.broker._require_operational_control()
+                    self.hardware.require_operational_control()
                     authority = self._hardware_preflight()
                 self.supervisor.configure(authority, [float(self.limits.get("joint_speed_rad_s", 1.5))] * 7, [float(self.config.get("solver", {}).get("ruckig_max_acceleration", 5.0))] * 7)
                 # Always create a fresh Pink bridge for a fresh session.  A
@@ -991,7 +1006,7 @@ class OperationalSpaceServo:
                 self.solver.close()
                 self.solver.start()
                 if execution_mode != "shadow":
-                    broker_authority = self.broker.prepare_teleop_hardware()
+                    hardware_authority = self.hardware.prepare_osc_hardware()
                     # Start feedback first and wait for a sample produced by
                     # this session. Do not initialize Ruckig from the
                     # supervisor snapshot while the feedback worker is still
@@ -1014,13 +1029,13 @@ class OperationalSpaceServo:
                 with self.lock:
                     self.session = None
                     self.command = None
-                    self.input_enabled = False
-                    self.last_error = f"teleop start failed: {type(exc).__name__}: {exc}"
+                    self._accepting_targets = False
+                    self.last_error = f"osc start failed: {type(exc).__name__}: {exc}"
                     self.last_result = {"ok": False, "reason": self.last_error, "timestamp": time.time(), "robot_commands_sent": False}
                     self._bump_state()
                 raise
             period = 1.0 / float(self.runtime.get("control_hz", 50))
-            if execution_mode != "shadow" and not self.broker.grant_teleop_tracking(session_id, int(broker_authority["control_epoch"])):
+            if execution_mode != "shadow" and not self.hardware.grant_osc_tracking(session_id, int(hardware_authority["control_epoch"])):
                 self.solver.close()
                 self._feedback_stop.set()
                 feedback_thread = self._feedback_thread
@@ -1030,11 +1045,11 @@ class OperationalSpaceServo:
                 with self.lock:
                     self.session = None
                     self.command = None
-                    self.input_enabled = False
-                    self.last_error = "teleop tracking authority could not be granted"
+                    self._accepting_targets = False
+                    self.last_error = "osc tracking authority could not be granted"
                     self.last_result = {"ok": False, "reason": self.last_error, "timestamp": time.time(), "robot_commands_sent": False}
                     self._bump_state()
-                raise RuntimeError("teleop tracking authority could not be granted")
+                raise RuntimeError("osc tracking authority could not be granted")
             with self.lock:
                 self._initialize_ruckig([float(x) for x in joints], period)
                 self.posture_reference = [float(x) for x in joints]
@@ -1056,13 +1071,13 @@ class OperationalSpaceServo:
                 self._control_qd_estimate = [0.0] * 7
                 self._estimator_snapshot = {"estimated_joint_state_rad": list(joints), "estimated_joint_velocity_rad_s": [0.0] * 7,
                                             "measurement_error_rad": [0.0] * 7, "correction_rad": [0.0] * 7}
-                self.motion_epoch = int(broker_authority["control_epoch"]) if execution_mode != "shadow" else self.motion_epoch
+                self.motion_epoch = int(hardware_authority["control_epoch"]) if execution_mode != "shadow" else self.motion_epoch
                 self.solver.discard_before_epoch(self.motion_epoch)
                 self.session = {"state": "ACTIVE", "session_id": session_id, "client_id": client_id, "execution_mode": execution_mode, "started_at": time.time(), "sequence": 0, "last_input_age_s": None, "motion_epoch": self.motion_epoch}
                 self.command = None
                 self.target_generation += 1
-                self.reference_pose = self._current_tcp_pose([float(x) for x in joints])
-                self.input_enabled = True
+                self._target_pose = self._current_tcp_pose([float(x) for x in joints])
+                self._accepting_targets = True
                 self._heartbeat_monotonic_ns = time.monotonic_ns()
                 self.trajectory_state, self.trajectory_brake_reason, self.feedback_sync_pending = "HOLD_READY", None, True
                 self.needs_resync = True
@@ -1071,12 +1086,12 @@ class OperationalSpaceServo:
                 self._cycle_trace.clear()
                 self.last_output = {"status": "held", "final_joint_target_rad": list(joints), "final_joint_velocity_rad_s": [0.0] * 7, "sequence": 0, "epoch": self.motion_epoch}
                 self.last_result = {"ok": True, "reason": "session started", "robot_commands_sent": False}
-                self.thread = threading.Thread(target=self._loop, name="nero-teleop-loop", daemon=True)
+                self.thread = threading.Thread(target=self._loop, name="nero-osc-loop", daemon=True)
                 self.thread.start()
                 self._bump_state()
             return self.status()
 
-    def stop_session(self, reason: str = "teleop stopped") -> dict[str, Any]:
+    def stop_session(self, reason: str = "osc stopped") -> dict[str, Any]:
         """Invalidate inputs and stop workers before a controller handoff.
 
         This method deliberately does not select J mode or issue move_j.  The
@@ -1097,11 +1112,11 @@ class OperationalSpaceServo:
             # the controller.  Sending a CPV sample after HOLD would initialise
             # CPV again, creating an unnecessary mode transition.
             cpv_stream_active = bool(
-            (self.session or {}).get("execution_mode") != "shadow" and self.broker.teleop_stream_active()
+            (self.session or {}).get("execution_mode") != "shadow" and self.hardware.osc_stream_active()
             )
             if self.session:
                 self.session.update({"state": "STOPPING", "stopped_reason": reason})
-            self.input_enabled = False
+            self._accepting_targets = False
             self._bump_state()
             self.stop_event.set(); self._feedback_stop.set(); self.command = None
         servo_thread, feedback_thread = self.thread, self._feedback_thread
@@ -1120,7 +1135,7 @@ class OperationalSpaceServo:
         with self.lock:
             self.session = None
             self.last_error = None
-            self.input_enabled = False
+            self._accepting_targets = False
             self._bump_state()
         result = self.status()
         result["handoff"] = {
@@ -1163,7 +1178,7 @@ class OperationalSpaceServo:
             if self.session:
                 self.session.update({"state": "STOPPING", "stopped_reason": reason, "motion_epoch": self.motion_epoch})
             self.command = None
-            self.input_enabled = False
+            self._accepting_targets = False
             self.feedback_sync_pending = True
             self.needs_resync = True
             self.trajectory_state = "HOLD_READY"
@@ -1236,7 +1251,7 @@ class OperationalSpaceServo:
                     if self.session.get("execution_mode") == "shadow"
                     else list((self._feedback_snapshot() or {}).get("joints") or [])
                 )
-                safe_target = dict(self.reference_pose or self._current_tcp_pose(fallback_q))
+                safe_target = dict(self._target_pose or self._current_tcp_pose(fallback_q))
                 return {
                     "accepted": False,
                     "reason": "OSC target is outside the configured workspace",
@@ -1249,7 +1264,7 @@ class OperationalSpaceServo:
                 resumed, reason = self._resume_from_hold_locked()
                 if not resumed:
                     raise PermissionError(f"OSC command rejected: cannot resume from HOLD_READY ({reason})")
-            previous_reference = self.reference_pose or {}
+            previous_reference = self._target_pose or {}
             previous_position = previous_reference.get("position_m") or []
             previous_orientation = previous_reference.get("orientation_xyzw") or []
             same_reference = (
@@ -1260,7 +1275,7 @@ class OperationalSpaceServo:
             )
             self.session["sequence"] = sequence
             now_ns = time.monotonic_ns()
-            self.reference_pose = reference
+            self._target_pose = reference
             if not same_reference:
                 self.target_generation += 1
                 self._target_changed_monotonic_ns = now_ns
@@ -1270,7 +1285,7 @@ class OperationalSpaceServo:
                 "sequence": sequence,
                 "host_monotonic_ns": time.monotonic_ns(),
                 "target_generation": self.target_generation,
-                "reference_pose": dict(reference),
+                "target_pose": dict(reference),
                 "osc_mode": mode,
             }
             self._bump_state()
@@ -1285,7 +1300,7 @@ class OperationalSpaceServo:
     def heartbeat(self, client_id: str, session_id: str) -> dict[str, Any]:
         with self.lock:
             if not self._session_active() or str(self.session.get("client_id")) != str(client_id) or str(self.session.get("session_id")) != str(session_id):
-                raise PermissionError("teleop heartbeat rejected")
+                raise PermissionError("osc heartbeat rejected")
             self._heartbeat_monotonic_ns = time.monotonic_ns()
             return self.status()
 
@@ -1312,7 +1327,7 @@ class OperationalSpaceServo:
             while not self._feedback_stop.is_set():
                 try:
                     requested_ns = time.monotonic_ns()
-                    row = self.broker.read_teleop_feedback()
+                    row = self.hardware.read_osc_feedback()
                     received_monotonic_ns = int(row.get("received_at_monotonic_ns") or time.monotonic_ns())
                     q = list(row.get("joint_angles_rad") or [])
                     qd = list(row.get("joint_velocity_rad_s") or [])
@@ -1344,7 +1359,7 @@ class OperationalSpaceServo:
                     pass
                 next_tick += period
                 self._feedback_stop.wait(max(0.0, next_tick - time.monotonic()))
-        self._feedback_thread = threading.Thread(target=run, name="nero-teleop-feedback", daemon=True); self._feedback_thread.start()
+        self._feedback_thread = threading.Thread(target=run, name="nero-osc-feedback", daemon=True); self._feedback_thread.start()
 
     def _feedback_snapshot(self) -> dict[str, Any] | None:
         with self._feedback_lock: return dict(self._feedback) if self._feedback else None
@@ -1398,7 +1413,7 @@ class OperationalSpaceServo:
                 ):
                     return row
             time.sleep(0.01)
-        raise RuntimeError("timed out waiting for first valid teleop joint feedback")
+        raise RuntimeError("timed out waiting for first valid osc joint feedback")
 
     def _set_result(self, ok: bool, reason: str, **extra: Any) -> None:
         with self.lock:
@@ -1413,10 +1428,18 @@ class OperationalSpaceServo:
         with self.lock:
             debug_fn = getattr(self.solver, "debug_status", None)
             debug = debug_fn() if callable(debug_fn) else {}
-            return {"state_sequence": self.state_sequence, "session": self._session_view(), "command": dict(self.command) if self.command else None, "input_enabled": self.input_enabled, "target_generation": self.target_generation, "reference_pose": dict(self.reference_pose) if self.reference_pose else None, "last_error": self.last_error, "last_result": dict(self.last_result), "last_output": dict(self.last_output), "execution_sample": dict(self.execution_sample) if self.execution_sample else None, "arrival": {"reached": self._arrival_reached, "stable_since_monotonic_ns": self._arrival_since_monotonic_ns or None, "target_generation": self.target_generation}, "solver": {"running": bool(self.solver.process and self.solver.process.poll() is None), "python": str(self.solver.python), "tcp_verified": True, "debug": debug}, "workspace": {"min_xyz_m": list(self.limits.get("workspace_min_m", [-0.45, -0.15, -0.02])), "max_xyz_m": list(self.limits.get("workspace_max_m", [0.45, 0.60, 0.70])), "min_tcp_z_m": float(self.limits.get("min_tcp_z_m", -0.02))}, "diagnostics": {"trajectory_state": self.trajectory_state, "trajectory_brake_reason": self.trajectory_brake_reason, "motion_epoch": self.motion_epoch, "needs_resync": self.needs_resync, "last_sent_velocity_rad_s": list(self.last_sent_velocity), "trajectory": dict(self.trajectory) if self.trajectory else None, "state_estimator": dict(self._estimator_snapshot), "shadow_transport": self.shadow_plant.diagnostics() if self.shadow_plant else {"enabled": False}, "cpv_parameters": dict(self._cpv_parameters), "limit_authority": dict(self.authority.effective) if self.authority.effective else None, "supervisor": dict(self.supervisor.limit_data) if self.supervisor.limit_data else None, "timing": dict(self._timing), "cycle_trace": self._trace_public(), "loop_count": self.loop_count, "output_count": self.output_count, "cpv_dispatch_count": self.cpv_send_count, "recent_cpv_batches": list(self._batch_history)[-10:]}}
+            return {"state_sequence": self.state_sequence, "session": self._session_view(), "command": dict(self.command) if self.command else None, "target_generation": self.target_generation, "last_error": self.last_error, "last_result": dict(self.last_result), "last_output": dict(self.last_output), "execution_sample": dict(self.execution_sample) if self.execution_sample else None, "arrival": {"reached": self._arrival_reached, "stable_since_monotonic_ns": self._arrival_since_monotonic_ns or None, "target_generation": self.target_generation}, "solver": {"running": bool(self.solver.process and self.solver.process.poll() is None), "python": str(self.solver.python), "tcp_verified": True, "debug": debug}, "workspace": {"min_xyz_m": list(self.limits.get("workspace_min_m", [-0.45, -0.15, -0.02])), "max_xyz_m": list(self.limits.get("workspace_max_m", [0.45, 0.60, 0.70])), "min_tcp_z_m": float(self.limits.get("min_tcp_z_m", -0.02))}, "diagnostics": {"trajectory_state": self.trajectory_state, "trajectory_brake_reason": self.trajectory_brake_reason, "motion_epoch": self.motion_epoch, "needs_resync": self.needs_resync, "last_sent_velocity_rad_s": list(self.last_sent_velocity), "trajectory": dict(self.trajectory) if self.trajectory else None, "state_estimator": dict(self._estimator_snapshot), "shadow_transport": self.shadow_plant.diagnostics() if self.shadow_plant else {"enabled": False}, "cpv_parameters": dict(self._cpv_parameters), "limit_authority": dict(self.authority.effective) if self.authority.effective else None, "supervisor": dict(self.supervisor.limit_data) if self.supervisor.limit_data else None, "timing": dict(self._timing), "cycle_trace": self._trace_public(), "loop_count": self.loop_count, "output_count": self.output_count, "cpv_dispatch_count": self.cpv_send_count, "recent_cpv_batches": list(self._batch_history)[-10:]}}
+
+    def _public_target_pose(self) -> dict[str, list[float]] | None:
+        with self.lock:
+            return dict(self._target_pose) if self._target_pose else None
+
+    def _is_accepting_targets(self) -> bool:
+        with self.lock:
+            return self._accepting_targets
 
     def kinematics(self) -> dict[str, Any]:
-        return {"schema_version": "nero.teleop.v1", "tcp_verified": True, "tcp_offset_m": self.config.get("tcp", {}).get("offset_from_link7_m"), "last_result": dict(self.last_result), "shadow_default": True}
+        return {"schema_version": "nero.osc.kinematics.v1", "tcp_verified": True, "tcp_offset_m": self.config.get("tcp", {}).get("offset_from_link7_m"), "last_result": dict(self.last_result), "shadow_default": True}
 
     def _sync_if_settled(self, feedback_q: list[float]) -> bool:
         if self.trajectory_state != "HOLD_READY": return False
@@ -1452,16 +1475,16 @@ class OperationalSpaceServo:
             qd = list(feedback.get("velocities") or [])
             if len(q) != 7 or len(qd) != 7 or not all(math.isfinite(float(x)) for x in [*q, *qd]):
                 return False, "hardware feedback is invalid"
-            if not self.broker.servo_can_write(str(session.get("session_id")), self.motion_epoch):
+            if not self.hardware.servo_can_write(str(session.get("session_id")), self.motion_epoch):
                 return False, "SERVO write authority is unavailable"
-            if not self.broker.grant_teleop_tracking(str(session.get("session_id")), self.motion_epoch):
+            if not self.hardware.grant_osc_tracking(str(session.get("session_id")), self.motion_epoch):
                 return False, "SERVO tracking authority could not be restored"
         else:
             q = list(self.shadow_joints or (self.trajectory or {}).get("position_rad") or [])
             if len(q) != 7 or not all(math.isfinite(float(x)) for x in q):
                 return False, "shadow state is invalid"
         self._sync_if_settled([float(x) for x in q])
-        self.input_enabled = True
+        self._accepting_targets = True
         self.trajectory_state = "RUNNING"
         self.trajectory_brake_reason = None
         return True, "resumed from HOLD_READY"
@@ -1582,7 +1605,7 @@ class OperationalSpaceServo:
                     )
                     if hard_stale and motion_or_brake_active:
                         self.trajectory_state, self.trajectory_brake_reason = "FAULT", "feedback hard stale"
-                        self.input_enabled = False
+                        self._accepting_targets = False
                     state = self.trajectory_state; epoch = self.motion_epoch
                 # HOLD_READY is a frozen state until a fresh absolute OSC target arrives.
                 if state == "HOLD_READY":
@@ -1604,7 +1627,7 @@ class OperationalSpaceServo:
                     )
                     self._set_result(False, reason, robot_commands_sent=False)
                     continue
-                target_pose = dict((command or {}).get("reference_pose") or self.reference_pose or {})
+                target_pose = dict((command or {}).get("target_pose") or self._target_pose or {})
                 if state != "RUNNING" or not target_pose:
                     # Braking must not issue a second asynchronous FK request
                     # while session shutdown is closing the Pink bridge. The
@@ -1617,8 +1640,8 @@ class OperationalSpaceServo:
                     })
                 # A live P1 thread without SERVO authority is deliberately
                 # frozen. It must not integrate old targets and later chase
-                # them when a mode transition returns control to teleop.
-                if not shadow and not self.broker.servo_can_write(str(session.get("session_id")), epoch):
+                # them when a mode transition returns control to osc.
+                if not shadow and not self.hardware.servo_can_write(str(session.get("session_id")), epoch):
                     with self.lock:
                         self.feedback_sync_pending = True
                         self.trajectory_state = "HOLD_READY"
@@ -1652,11 +1675,11 @@ class OperationalSpaceServo:
                 if pink and pink.get("ok"):
                     self.last_solver_result = pink
                     try:
-                        estimated_tcp = self._pose_from_tcp(dict(pink.get("tcp") or {}))
+                        estimated_tcp = pose_from_tcp(dict(pink.get("tcp") or {}))
                     except (TypeError, ValueError):
                         estimated_tcp = None
                     try:
-                        measured_tcp = self._pose_from_tcp(dict(pink.get("measured_tcp") or {}))
+                        measured_tcp = pose_from_tcp(dict(pink.get("measured_tcp") or {}))
                     except (TypeError, ValueError):
                         measured_tcp = None
                     if measured_tcp is None and shadow:
@@ -1769,7 +1792,7 @@ class OperationalSpaceServo:
                         result_reason += " with final safety gate velocity limit"
                     with self.lock:
                         self.output_count += 1
-                        self.last_output = {"status": "limited" if gate_limited else "accepted", "final_joint_target_rad": list(position_target), "final_joint_velocity_rad_s": list(final_velocity), "sequence": int((intent or {}).get("sequence", session.get("sequence", 0))), "epoch": epoch}
+                        self.last_output = {"status": "limited" if gate_limited else "accepted", "final_joint_target_rad": list(position_target), "final_joint_velocity_rad_s": list(final_velocity), "sequence": int((command or {}).get("sequence", session.get("sequence", 0))), "epoch": epoch}
                         self._last_dispatch_monotonic_ns = time.monotonic_ns()
                     self._set_result(True, result_reason, robot_commands_sent=False, solver=pink if pink and pink.get("ok") else None, ruckig=ruckig_info, supervisor=supervisor_report, gate_reason=gate_reason, gate_limited=gate_limited, final_joint_target_rad=list(position_target), final_joint_velocity_rad_s=list(final_velocity))
                     batch = None
@@ -1790,11 +1813,11 @@ class OperationalSpaceServo:
                             (float(command) - float(previous)) / max(0.001, actual_dt)
                             for command, previous in zip(final_velocity, previous_velocity)
                         ]
-                    batch = self.broker.send_servo_position(position_target, str(session.get("session_id")), epoch)
+                    batch = self.hardware.send_servo_position(position_target, str(session.get("session_id")), epoch)
                     dispatch_finished_ns = int((batch or {}).get("finished_monotonic_ns") or time.monotonic_ns())
                     with self.lock:
                         self.cpv_send_count += 1; self.output_count += 1; self._send_times.append(time.monotonic()); self._batch_history.append({"control_sample_id": sample_id, "motion_epoch": epoch, "joint_target_rad": list(position_target), "joint_velocity_rad_s": list(final_velocity), **batch})
-                        self.last_output = {"status": "limited" if gate_limited else "accepted", "final_joint_target_rad": list(position_target), "final_joint_velocity_rad_s": list(final_velocity), "sequence": int((intent or {}).get("sequence", session.get("sequence", 0))), "epoch": epoch}
+                        self.last_output = {"status": "limited" if gate_limited else "accepted", "final_joint_target_rad": list(position_target), "final_joint_velocity_rad_s": list(final_velocity), "sequence": int((command or {}).get("sequence", session.get("sequence", 0))), "epoch": epoch}
                         self._last_dispatch_monotonic_ns = dispatch_finished_ns
                     result_reason = "CPV joint-position batch sent"
                     if soft_stale and not hard_stale:
@@ -1845,7 +1868,7 @@ class OperationalSpaceServo:
                         self.trajectory_state, self.trajectory_brake_reason, self.feedback_sync_pending = "HOLD_READY", None, True
                         self.needs_resync = True
                         if not shadow:
-                            self.broker.latch_teleop_hold("teleop braking settled")
+                            self.hardware.latch_osc_hold("osc braking settled")
                     actuator_response = None
                     if not shadow:
                         tolerance = float(self.config.get("diagnostics", {}).get("response_joint_tolerance_rad", 0.02))
@@ -1877,11 +1900,64 @@ class OperationalSpaceServo:
                         self.trajectory_brake_reason = "servo write authority revoked"
                 self._set_result(False, str(exc), robot_commands_sent=False)
             except Exception as exc:
-                self._fault_zero(f"teleop loop: {type(exc).__name__}: {exc}", shadow=False)
+                self._fault_zero(f"osc loop: {type(exc).__name__}: {exc}", shadow=False)
 
     def _fault_zero(self, reason: str, shadow: bool) -> None:
         with self.lock: self.trajectory_state, self.trajectory_brake_reason = "FAULT", reason
         if not shadow:
-            self.broker.trigger_safety_fault(reason)
+            self.hardware.trigger_safety_fault(reason)
         self.last_sent_velocity = [0.0] * 7
         self._set_result(False, reason, robot_commands_sent=not shadow)
+
+
+class OscRuntime:
+    """Internal OSC facade; the Servo implementation never escapes this type."""
+
+    def __init__(self, hardware: OscHardwarePort, project_root: Path, config: dict[str, Any]) -> None:
+        self._servo = _OperationalSpaceServo(hardware, project_root, config)
+
+    def status(self) -> dict[str, Any]: return self._servo.status()
+    def target_pose(self) -> dict[str, list[float]] | None: return self._servo._public_target_pose()
+    def accepting_targets(self) -> bool: return self._servo._is_accepting_targets()
+    def kinematics(self) -> dict[str, Any]: return self._servo.kinematics()
+    def start_session(self, *, client_id: str, execution_mode: str) -> dict[str, Any]: return self._servo.start_session(client_id, execution_mode)
+    def stop_session(self, reason: str) -> dict[str, Any]: return self._servo.stop_session(reason)
+    def heartbeat(self, client_id: str, session_id: str) -> dict[str, Any]: return self._servo.heartbeat(client_id, session_id)
+    def heartbeat_expired(self) -> bool: return self._servo.heartbeat_expired()
+    def submit_absolute_target(self, body: dict[str, Any], *, mode: str) -> dict[str, Any]: return self._servo.submit_absolute_target(body, mode=mode)
+    def request_shadow_hold(self, reason: str) -> dict[str, Any]: return self._servo.request_shadow_hold(reason)
+    def freeze_for_authority_change(self, epoch: int, reason: str) -> None: self._servo.freeze_for_authority_change(epoch, reason)
+    def abandon_session_without_braking(self, epoch: int, reason: str) -> dict[str, Any]: return self._servo.abandon_session_without_braking(epoch, reason)
+
+    def cpv_limits(self) -> tuple[float, float]:
+        return (
+            float(self._servo.limits.get("joint_speed_rad_s", 1.5)),
+            float(self._servo.config.get("solver", {}).get("ruckig_max_acceleration", 5.0)),
+        )
+
+    def apply_hardware_calibration(self, calibration: dict[str, Any], feedback: dict[str, Any], cpv_parameters: dict[str, Any]) -> dict[str, Any]:
+        shadow = self._servo.config.setdefault("shadow_transport", {})
+        estimator = self._servo.config.setdefault("state_estimator", {})
+        shadow["feedback_delay_s"] = calibration["feedback_delay_s"]
+        shadow["feedback_jitter_s"] = calibration["feedback_jitter_s"]
+        estimator["max_prediction_s"] = max(0.02, min(0.15, calibration["feedback_delay_s"] + float(feedback["inter_request_p95_s"])))
+        self._servo.config["hardware_readonly_calibration"] = {
+            **calibration,
+            "feedback_read_duration_p50_s": feedback["read_duration_p50_s"],
+            "feedback_read_duration_p95_s": feedback["read_duration_p95_s"],
+            "feedback_inter_request_p95_s": feedback["inter_request_p95_s"],
+            "cpv_parameters": dict(cpv_parameters),
+            "applied_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        return {
+            "shadow_transport": {
+                "feedback_delay_s": shadow["feedback_delay_s"],
+                "feedback_jitter_s": shadow["feedback_jitter_s"],
+                "max_joint_speed_rad_s": shadow.get("max_joint_speed_rad_s"),
+                "max_joint_acceleration_rad_s2": shadow.get("max_joint_acceleration_rad_s2"),
+            },
+            "state_estimator": {"max_prediction_s": estimator["max_prediction_s"]},
+        }
+
+    def configuration_json(self) -> str:
+        return json.dumps(self._servo.config, ensure_ascii=False, indent=2) + "\n"

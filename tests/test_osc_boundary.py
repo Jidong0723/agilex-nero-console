@@ -22,11 +22,11 @@ def _imports(path: Path) -> set[str]:
 class OscBoundaryTests(unittest.TestCase):
     def test_osc_core_does_not_import_input_adapters_or_cameras(self) -> None:
         forbidden = {"supervisor.pi05_adapter", "supervisor.pico_adapter", "supervisor.camera_resource"}
-        for path in (ROOT / "supervisor" / "control.py", ROOT / "motion" / "teleop.py"):
+        for path in (ROOT / "supervisor" / "control.py", ROOT / "motion" / "osc.py"):
             self.assertFalse(_imports(path) & forbidden)
 
     def test_osc_servo_has_no_legacy_relative_input_symbols(self) -> None:
-        source = (ROOT / "motion" / "teleop.py").read_text(encoding="utf-8")
+        source = (ROOT / "motion" / "osc.py").read_text(encoding="utf-8")
         for symbol in ("submit_intent", "submit_pico_intent", "clutch_active", "relative_pose", "tcp_anchor", "input_source"):
             self.assertNotIn(symbol, source)
 
@@ -34,3 +34,10 @@ class OscBoundaryTests(unittest.TestCase):
         source = (ROOT / "scripts" / "nero_control_server.py").read_text(encoding="utf-8")
         self.assertNotIn('"/api/teleop/', source)
         self.assertIn('"/api/osc/kinematics"', source)
+
+    def test_servo_is_private_and_uses_a_narrow_hardware_port(self) -> None:
+        source = (ROOT / "motion" / "osc.py").read_text(encoding="utf-8")
+        self.assertIn("class OscHardwarePort(Protocol)", source)
+        self.assertIn("class _OperationalSpaceServo", source)
+        self.assertNotIn("self.broker", source)
+        self.assertNotIn("OperationalSpaceController", source)

@@ -13,7 +13,7 @@ This release targets Windows 10/11 x64, NERO firmware v120, and the AgileX CANDO
 
 ```powershell
 git clone <YOUR_REPOSITORY_URL>
-cd neroAgilex-pico-teleop
+cd neroAgilex-pico-osc
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
 powershell -ExecutionPolicy Bypass -File .\setup-kinematics.ps1
 ```

@@ -330,7 +330,7 @@ class RobotModeTests(unittest.TestCase):
         robot.send_cpv_position([0.1] * 7)
         sdk.events.clear()
 
-        result = robot.hold_follower_without_position_target("exit continuous teleop")
+        result = robot.hold_follower_without_position_target("exit continuous osc")
 
         self.assertTrue(result.ok, result.result)
         self.assertTrue(result.result["cpv_stream_stopped"])
@@ -385,10 +385,10 @@ class RobotModeTests(unittest.TestCase):
         self.assertEqual(status[3], False)
         self.assertEqual(sdk.enable_joint_indices, [4])
 
-    def test_teleop_feedback_uses_only_joint_and_motor_cache(self) -> None:
+    def test_osc_feedback_uses_only_joint_and_motor_cache(self) -> None:
         robot, sdk = self.make_robot()
         robot._control_mode = "HOLD"
-        feedback = robot.read_teleop_feedback()
+        feedback = robot.read_osc_feedback()
         self.assertEqual(feedback["joint_angles_rad"], sdk.follower_values)
         self.assertEqual(feedback["joint_velocity_rad_s"], sdk.motor_velocity)
         self.assertIsInstance(feedback["received_at_monotonic_ns"], int)

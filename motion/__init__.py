@@ -1,5 +1,5 @@
-"""Deterministic motion safety, Pink, Ruckig, and teleoperation."""
+"""Deterministic OSC motion safety, Pink, and Ruckig."""
 
-from .teleop import OperationalSpaceServo
+from .osc import OscRuntime
 
-__all__ = ["OperationalSpaceServo"]
+__all__ = ["OscRuntime"]

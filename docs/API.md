@@ -12,7 +12,7 @@ Base URL: `http://127.0.0.1:8765`. Success responses use `{"ok": true, "data": {
 - `GET /api/osc/kinematics`: solver and task-point diagnostics.
 
 Supported command types are `track_tcp`, `move_tcp`, `hold`, `stop`,
-`freedrive`, `gripper`, and `joint_target`. TCP commands always contain an
+`freedrive`, and `gripper`. TCP commands always contain an
 absolute base-frame pose:
 
 ```json

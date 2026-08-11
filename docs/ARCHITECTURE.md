@@ -53,8 +53,8 @@ can construct hardware transport.
 - `supervisor/authority.py`: current hardware writer, servo mode, and monotonically increasing authority epoch.
 - `nero_backend/robot.py`: NERO SDK access, feedback, mode transitions, CPV, joint/Cartesian motion, and gripper commands.
 - `motion/safety.py`: finite-value, dimension, status, speed, workspace, and gripper validation.
-- `motion/teleop.py`: the OSC Pink/Ruckig/CPV servo for absolute TCP targets.
-- `motion/teleop_kinematics_server.py`: separate Python 3.11 kinematics process.
+- `motion/osc.py`: the OSC Pink/Ruckig/CPV servo for absolute TCP targets.
+- `motion/osc_kinematics_server.py`: separate Python 3.11 kinematics process.
 
 ## Priorities
 

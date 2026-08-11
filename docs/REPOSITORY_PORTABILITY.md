@@ -9,7 +9,7 @@ This repository is self-contained for the desktop Web-control program: all appli
 - `requirements.txt`, `environment-kinematics.yml`, `setup.ps1`, `setup-kinematics.ps1`, `run_console.cmd`, and `run_console_watchdog.cmd`
 - Documentation and third-party licence notices
 
-The control service resolves its runtime paths from the repository root. `config/teleop.json` references the kinematics interpreter, solver script, and URDF with repository-relative paths.
+The control service resolves its runtime paths from the repository root. `config/osc.json` references the kinematics interpreter, solver script, and URDF with repository-relative paths.
 
 ## Local files that must not be committed
 
@@ -24,7 +24,7 @@ These paths are intentionally ignored by Git. Recreate the first two environment
 
 ```powershell
 git clone <YOUR_REPOSITORY_URL>
-cd neroAgilex-pico-teleop
+cd neroAgilex-pico-osc
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
 powershell -ExecutionPolicy Bypass -File .\setup-kinematics.ps1
 .\run_console.cmd

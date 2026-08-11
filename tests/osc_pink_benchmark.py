@@ -21,10 +21,10 @@ if str(ROOT) not in sys.path:
 
 import numpy as np
 
-from motion.teleop_kinematics_server import Solver
+from motion.osc_kinematics_server import Solver
 
 
-CONFIG_PATH = ROOT / "config" / "teleop.json"
+CONFIG_PATH = ROOT / "config" / "osc.json"
 DT_S = 0.02
 HOLD_S = 10.0
 DELTA_POSITION_M = np.array([0.050, -0.040, 0.040])

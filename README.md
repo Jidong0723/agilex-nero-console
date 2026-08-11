@@ -102,7 +102,7 @@ These are control invariants measured on a NERO v120 arm:
 - Normal HOLD and FREEDRIVE handoffs must not create a J-mode `move_j()` position target.
 
 ```text
-Teleop CPV -> brake -> seven-axis CPV zero confirmed -> HOLD
+Osc CPV -> brake -> seven-axis CPV zero confirmed -> HOLD
 FREEDRIVE/Leader -> set_follower_mode() -> conditional per-joint enable -> HOLD
 ```
 
@@ -111,7 +111,7 @@ Do not weaken these rules without controlled hardware validation.
 ## Configuration
 
 - [`config/runtime.json`](config/runtime.json): CAN interface, motion timeouts, speed, gripper limits, logging, and service settings.
-- [`config/teleop.json`](config/teleop.json): URDF, control frequency, deadman/staleness thresholds, input filtering, and the sole Cartesian workspace limits.
+- [`config/osc.json`](config/osc.json): URDF, control frequency, deadman/staleness thresholds, input filtering, and the sole Cartesian workspace limits.
 
 Defaults are intentionally conservative. Review every change with the physical workspace and tool geometry in mind.
 

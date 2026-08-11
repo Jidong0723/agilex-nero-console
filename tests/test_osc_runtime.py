@@ -8,8 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from motion.teleop import JointConvention, JointLimitAuthority, OperationalSpaceServo, SafetySupervisor, ShadowCpvPlant
-TeleopController = OperationalSpaceServo
+from motion.osc import JointConvention, JointLimitAuthority, _OperationalSpaceServo, SafetySupervisor, ShadowCpvPlant
+OscController = _OperationalSpaceServo
 from supervisor.authority import (
     ArmWriter, CommandRevoked, ControlSupervisor, HardwareTxOwner, ServoMode,
     ServoWriteRevoked,
@@ -74,7 +74,7 @@ class FakeRobot:
     def __init__(self) -> None:
         self.velocities: list[list[float]] = []
         self.positions: list[list[float]] = []
-        self.controller: TeleopController | None = None
+        self.controller: OscController | None = None
         self.stream_active = False
 
     def read_state(self, include_motor_states: bool = False):
@@ -111,33 +111,33 @@ class FakeBroker:
     def status(self) -> dict[str, Any]:
         return {"control": {"robot": {"joint_angles_rad": [0.0] * 7}}}
 
-    def prepare_teleop_hardware(self) -> dict[str, Any]:
+    def prepare_osc_hardware(self) -> dict[str, Any]:
         self.epoch += 1
         self.writer = "SERVO"
         return {"arm_writer": "SERVO", "servo_mode": "HOLDING", "control_epoch": self.epoch}
 
-    def read_teleop_joint_limits(self) -> dict[str, Any]:
+    def read_osc_joint_limits(self) -> dict[str, Any]:
         return {"joints": [{"joint_index": index + 1, "angle_velocity": {"min_angle_limit": -2.0, "max_angle_limit": 2.0, "max_joint_spd": 0.45}, "acceleration": {"max_joint_acc": 2.0}} for index in range(7)]}
 
-    def read_teleop_feedback(self) -> dict[str, Any]:
+    def read_osc_feedback(self) -> dict[str, Any]:
         return {"joint_angles_rad": [0.0] * 7, "joint_velocity_rad_s": [0.0] * 7, "timestamp_monotonic_ns": time.monotonic_ns()}
 
-    def read_teleop_cpv_parameters(self) -> dict[str, Any]:
+    def read_osc_cpv_parameters(self) -> dict[str, Any]:
         return {"status": "available", "values": {"acc": [2.0] * 7}}
 
-    def teleop_stream_active(self) -> bool:
+    def osc_stream_active(self) -> bool:
         return self.robot.continuous_stream_active()
 
-    def grant_teleop_tracking(self, session_id: str, epoch: int) -> bool:
+    def grant_osc_tracking(self, session_id: str, epoch: int) -> bool:
         del session_id
         self.servo_tracking = self.writer == "SERVO" and epoch == self.epoch
         return self.servo_tracking
 
-    def mark_teleop_stopping(self, session_id: str, epoch: int, reason: str) -> bool:
+    def mark_osc_stopping(self, session_id: str, epoch: int, reason: str) -> bool:
         del session_id, reason
         return self.writer == "SERVO" and epoch == self.epoch
 
-    def latch_teleop_hold(self, reason: str) -> dict[str, Any]:
+    def latch_osc_hold(self, reason: str) -> dict[str, Any]:
         return {"arm_writer": self.writer, "servo_mode": "HOLDING", "reason": reason}
 
     def servo_can_write(self, session_id: str, epoch: int) -> bool:
@@ -220,7 +220,7 @@ class SafetyGateTests(unittest.TestCase):
 
 
 @unittest.skip("legacy session call shape was removed; OSC absolute-target coverage lives in test_osc_boundary")
-class TeleopPositionDispatchTests(unittest.TestCase):
+class OscPositionDispatchTests(unittest.TestCase):
     def test_hardware_loop_can_send_direct_pink_joint_positions(self) -> None:
         config = {
             "solver": {"dt_s": 0.02, "direct_pink_cpv_position": True, "ruckig_max_acceleration": 2.0, "ruckig_max_jerk": 20.0, "urdf": str(ROOT / "vendor/nero_description/nero_description.urdf")},
@@ -229,7 +229,7 @@ class TeleopPositionDispatchTests(unittest.TestCase):
         }
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), config)
+            controller = OscController(broker, Path(temp), config)
             solver = FakeSolver()
             controller.solver = solver  # type: ignore[assignment]
             broker.robot.controller = controller
@@ -241,7 +241,7 @@ class TeleopPositionDispatchTests(unittest.TestCase):
             controller.session = {"state": "ACTIVE", "session_id": "test", "client_id": "anonymous", "mode": "hardware", "execution_mode": "hardware", "sequence": 1}
             controller.trajectory_state = "RUNNING"
             controller.clutch_active = True
-            controller.intent = {"sequence": 1, "host_monotonic_ns": time.monotonic_ns(), "reference_pose": {"position_m": [0.1, 0.3, 0.2], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]}, "anchor_id": 1, "reference_revision": 1}
+            controller.intent = {"sequence": 1, "host_monotonic_ns": time.monotonic_ns(), "target_pose": {"position_m": [0.1, 0.3, 0.2], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]}, "anchor_id": 1, "reference_revision": 1}
             controller._feedback = {"joints": [0.0] * 7, "velocities": [0.0] * 7, "monotonic_ns": time.monotonic_ns()}
             controller._loop()
         self.assertGreaterEqual(len(broker.robot.positions), 4)
@@ -268,9 +268,9 @@ class ShadowCpvPlantTests(unittest.TestCase):
         self.assertEqual(plant.diagnostics()["output_count"], 1)
 
 
-@unittest.skip("Superseded by pose-clutch coverage in tests.test_pose_teleop")
+@unittest.skip("Superseded by pose-clutch coverage in tests.test_pose_osc")
 @unittest.skip("relative/clutch input stream was removed from OSC")
-class TeleopVelocityStreamTests(unittest.TestCase):
+class OscVelocityStreamTests(unittest.TestCase):
     @staticmethod
     def config() -> dict[str, Any]:
         return {
@@ -291,7 +291,7 @@ class TeleopVelocityStreamTests(unittest.TestCase):
     def test_solver_start_failure_does_not_leave_active_session(self) -> None:
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             solver = FailingStartSolver()
             controller.solver = solver  # type: ignore[assignment]
             with self.assertRaises(RuntimeError):
@@ -299,13 +299,13 @@ class TeleopVelocityStreamTests(unittest.TestCase):
             status = controller.status()
         self.assertTrue(solver.closed)
         self.assertEqual(status["session"]["state"], "IDLE")
-        self.assertIn("teleop start failed", status["last_result"]["reason"])
+        self.assertIn("osc start failed", status["last_result"]["reason"])
 
     def test_requested_hardware_mode_requires_stopping_active_shadow_session(self) -> None:
         """Mode changes never hide an implicit session replacement."""
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             controller.solver = FakeSolver()  # type: ignore[assignment]
             controller.session = {"state": "ACTIVE", "session_id": "shadow", "client_id": "anonymous", "mode": "shadow", "sequence": 4}
             controller._heartbeat_monotonic_ns = time.monotonic_ns()
@@ -315,13 +315,13 @@ class TeleopVelocityStreamTests(unittest.TestCase):
     def test_shadow_session_starts_without_hardware_feedback(self) -> None:
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             controller.solver = FakeSolver()  # type: ignore[assignment]
             result = controller.start_session("shadow", client_id="browser-a")
             try:
                 self.assertEqual(result["session"]["state"], "ACTIVE")
                 self.assertEqual(result["session"]["client_id"], "browser-a")
-                self.assertTrue(result["input_enabled"])
+                self.assertTrue(result["accepting_targets"])
                 self.assertNotIn("servo_mode", result)
             finally:
                 controller.stop_event.set()
@@ -331,13 +331,13 @@ class TeleopVelocityStreamTests(unittest.TestCase):
     def test_hardware_session_starts_without_confirmation_flag(self) -> None:
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             controller.solver = FakeSolver()  # type: ignore[assignment]
             result = controller.start_session("hardware", confirm_hardware=False, client_id="browser-a")
             try:
                 self.assertEqual(result["session"]["state"], "ACTIVE")
                 self.assertEqual(result["session"]["mode"], "hardware")
-                self.assertTrue(result["input_enabled"])
+                self.assertTrue(result["accepting_targets"])
                 self.assertNotIn("servo_mode", result)
                 self.assertTrue(controller.trajectory_state == "RUNNING")
             finally:
@@ -352,7 +352,7 @@ class TeleopVelocityStreamTests(unittest.TestCase):
     def test_hardware_stream_uses_only_cpv_positions(self) -> None:
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             solver = FakeSolver()
             controller.solver = solver  # type: ignore[assignment]
             broker.robot.controller = controller
@@ -384,7 +384,7 @@ class TeleopVelocityStreamTests(unittest.TestCase):
     def test_zero_target_does_not_activate_unstarted_controller(self) -> None:
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             solver = FakeSolver()
             controller.solver = solver  # type: ignore[assignment]
             authority = {
@@ -410,14 +410,14 @@ class TeleopVelocityStreamTests(unittest.TestCase):
             timer.start()
             controller._loop()
             timer.cancel()
-        self.assertFalse(controller.input_enabled)
+        self.assertFalse(controller._accepting_targets)
         self.assertEqual(controller.trajectory_state, "HOLD_READY")
         self.assertFalse(broker.servo_tracking)
 
     def test_deadman_release_discards_old_solver_velocity(self) -> None:
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             authority = {
                 "status": "shadow", "effective_lower_rad": controller.authority.hard_lower,
                 "effective_upper_rad": controller.authority.hard_upper,
@@ -453,14 +453,14 @@ class TeleopVelocityStreamTests(unittest.TestCase):
     def test_deadman_release_keeps_input_permission_for_next_resume(self) -> None:
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             controller.session = {
                 "state": "ACTIVE", "session_id": "test",
                 "client_id": "browser-a", "mode": "shadow", "sequence": 1,
             }
-            controller.input_enabled = True
+            controller._accepting_targets = True
             controller._invalidate_motion("deadman released")
-        self.assertTrue(controller.input_enabled)
+        self.assertTrue(controller._accepting_targets)
         self.assertEqual(controller.trajectory_state, "BRAKING")
 
     def test_soft_stale_feedback_derates_without_braking(self) -> None:
@@ -469,7 +469,7 @@ class TeleopVelocityStreamTests(unittest.TestCase):
             config = self.config()
             config["limits"]["feedback_soft_stale_s"] = 0.05
             config["limits"]["feedback_hard_stale_s"] = 0.5
-            controller = TeleopController(broker, Path(temp), config)
+            controller = OscController(broker, Path(temp), config)
             controller.solver = FakeSolver()  # type: ignore[assignment]
             broker.robot.controller = controller
             authority = {
@@ -484,7 +484,7 @@ class TeleopVelocityStreamTests(unittest.TestCase):
             controller.posture_reference = [0.0] * 7
             controller.session = {"state": "ACTIVE", "session_id": "test", "client_id": "anonymous", "mode": "hardware", "sequence": 1}
             controller.trajectory_state = "RUNNING"
-            controller.input_enabled = True
+            controller._accepting_targets = True
             controller.intent = {"sequence": 1, "host_monotonic_ns": time.monotonic_ns(), "tcp_velocity": [0.2, 0.0, 0.0, 0.0, 0.0, 0.0], "speed_scale": 1.0, "deadman": True}
             controller._feedback = {"joints": [0.0] * 7, "velocities": [0.0] * 7, "monotonic_ns": time.monotonic_ns() - 250_000_000}
             timer = threading.Timer(0.06, controller.stop_event.set)
@@ -497,7 +497,7 @@ class TeleopVelocityStreamTests(unittest.TestCase):
     def test_intent_heartbeat_response_does_not_embed_full_status(self) -> None:
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             controller._initialize_ruckig([0.0] * 7, 0.02)
             controller.shadow_joints = [0.0] * 7
             controller.session = {"state": "ACTIVE", "session_id": "test", "client_id": "anonymous", "mode": "shadow", "sequence": 2}
@@ -514,14 +514,14 @@ class TeleopVelocityStreamTests(unittest.TestCase):
     def test_hold_ready_resumes_shadow_on_fresh_deadman(self) -> None:
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             controller._initialize_ruckig([0.1] * 7, 0.02)
             controller.shadow_joints = [0.1] * 7
             controller.session = {
                 "state": "ACTIVE", "session_id": "shadow-session",
                 "client_id": "browser-a", "mode": "shadow", "sequence": 4,
             }
-            controller.input_enabled = False
+            controller._accepting_targets = False
             controller.trajectory_state = "HOLD_READY"
             controller.feedback_sync_pending = True
             controller.needs_resync = True
@@ -533,20 +533,20 @@ class TeleopVelocityStreamTests(unittest.TestCase):
             status = controller.status()
         self.assertTrue(response["accepted"])
         self.assertEqual(status["diagnostics"]["trajectory_state"], "RUNNING")
-        self.assertTrue(status["input_enabled"])
+        self.assertTrue(status["accepting_targets"])
         self.assertFalse(status["diagnostics"]["needs_resync"])
         self.assertEqual(controller.trajectory["position_rad"], [0.1] * 7)
 
     def test_hold_ready_resumes_hardware_only_with_fresh_servo_authority(self) -> None:
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             controller._initialize_ruckig([0.0] * 7, 0.02)
             controller.session = {
                 "state": "ACTIVE", "session_id": "hardware-session",
                 "client_id": "browser-a", "mode": "hardware", "sequence": 7,
             }
-            controller.input_enabled = False
+            controller._accepting_targets = False
             controller.trajectory_state = "HOLD_READY"
             controller.feedback_sync_pending = True
             controller.needs_resync = True
@@ -564,19 +564,19 @@ class TeleopVelocityStreamTests(unittest.TestCase):
         self.assertTrue(response["accepted"])
         self.assertTrue(broker.servo_tracking)
         self.assertEqual(status["diagnostics"]["trajectory_state"], "RUNNING")
-        self.assertTrue(status["input_enabled"])
+        self.assertTrue(status["accepting_targets"])
         self.assertEqual(controller.trajectory["position_rad"], [0.2] * 7)
 
     def test_hold_ready_does_not_resume_with_stale_hardware_feedback(self) -> None:
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             controller._initialize_ruckig([0.0] * 7, 0.02)
             controller.session = {
                 "state": "ACTIVE", "session_id": "hardware-session",
                 "client_id": "browser-a", "mode": "hardware", "sequence": 1,
             }
-            controller.input_enabled = False
+            controller._accepting_targets = False
             controller.trajectory_state = "HOLD_READY"
             controller._feedback = {
                 "joints": [0.0] * 7, "velocities": [0.0] * 7,
@@ -589,13 +589,13 @@ class TeleopVelocityStreamTests(unittest.TestCase):
                     "speed_scale": 1.0, "deadman": True,
                 })
         self.assertEqual(controller.trajectory_state, "HOLD_READY")
-        self.assertFalse(controller.input_enabled)
+        self.assertFalse(controller._accepting_targets)
 
     def test_hard_stale_feedback_while_hold_ready_is_not_a_fault(self) -> None:
         """Idle feedback is reported, while the next deadman input rechecks it."""
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             controller.session = {
                 "state": "ACTIVE", "session_id": "hardware-session",
                 "client_id": "browser-a", "mode": "hardware", "sequence": 1,
@@ -614,7 +614,7 @@ class TeleopVelocityStreamTests(unittest.TestCase):
     def test_intent_is_rejected_when_session_belongs_to_another_client(self) -> None:
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             controller.session = {
                 "state": "ACTIVE", "session_id": "test",
                 "client_id": "browser-a",
@@ -633,12 +633,12 @@ class TeleopVelocityStreamTests(unittest.TestCase):
     def test_faulted_hardware_session_rejects_nonzero_intent(self) -> None:
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             controller.session = {
                 "state": "ACTIVE", "session_id": "test",
                 "client_id": "browser-a", "mode": "hardware", "sequence": 2,
             }
-            controller.input_enabled = True
+            controller._accepting_targets = True
             controller.trajectory_state = "FAULT"
             controller.trajectory_brake_reason = "feedback hard stale"
             with self.assertRaisesRegex(PermissionError, "FAULT"):
@@ -652,7 +652,7 @@ class TeleopVelocityStreamTests(unittest.TestCase):
         """A repeated handoff must not reinitialise CPV after HOLD is active."""
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             controller.solver = FakeSolver()  # type: ignore[assignment]
             controller.session = {
                 "state": "STOPPING", "session_id": "stale-hardware",
@@ -666,7 +666,7 @@ class TeleopVelocityStreamTests(unittest.TestCase):
     def test_direct_freedrive_handoff_revokes_session_without_braking_or_zero_stream(self) -> None:
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             controller.solver = FakeSolver()  # type: ignore[assignment]
             controller.session = {
                 "state": "ACTIVE", "session_id": "direct-freedrive",
@@ -687,10 +687,10 @@ class TeleopVelocityStreamTests(unittest.TestCase):
         self.assertFalse(result["direct_handoff"]["zero_velocity_sent"])
         self.assertEqual(broker.robot.velocities, [])
 
-    def test_revoked_servo_write_freezes_teleop_without_p0_safety_zero(self) -> None:
+    def test_revoked_servo_write_freezes_osc_without_p0_safety_zero(self) -> None:
         broker = FakeBroker()
         with tempfile.TemporaryDirectory() as temp:
-            controller = TeleopController(broker, Path(temp), self.config())
+            controller = OscController(broker, Path(temp), self.config())
             controller.solver = FakeSolver()  # type: ignore[assignment]
             controller.start_session("hardware", client_id="browser-a")
             broker.writer = "NONE"

@@ -18,7 +18,7 @@ This document describes software defenses, not a safety certification.
 
 `config/runtime.json` includes a 1–5% speed range, gripper width range, and force limit. These are examples for the verified setup, not universal NERO limits.
 
-`config/teleop.json` defines control frequency, deadman and stale-data thresholds, Cartesian speed and workspace limits, solver parameters, and joint conventions.
+`config/osc.json` defines control frequency, deadman and stale-data thresholds, Cartesian speed and workspace limits, solver parameters, and joint conventions.
 
 ### Joint-motion envelope
 

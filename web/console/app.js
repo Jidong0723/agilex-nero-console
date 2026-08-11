@@ -39,7 +39,7 @@
 
   const state = {
     status: null,
-    teleop: null,
+    osc: null,
     broker: null,
     action: null,
     latestSequence: 0,
@@ -70,7 +70,7 @@
     const panel = document.createElement("section");
     panel.id = "pi05-panel"; panel.className = "pi05-panel hidden";
     panel.innerHTML = `<div class="pi05-observation"><div class="pi05-head"><span class="pi05-index">01</span><div><strong>Observation</strong><small>π0.5 多模态输入</small></div></div><div class="pi05-cameras"><label>外部 RGB<input id="pi05-external-index" type="number" min="0" max="32" value="0"></label><label>腕部 RGB<input id="pi05-wrist-index" type="number" min="0" max="32" value="1"></label></div><div class="pi05-views"><div class="pi05-view"><span>外部视角</span><img id="pi05-external-frame" alt="外部 RGB 实时画面"><b id="pi05-external-preview">等待画面</b></div><div class="pi05-view"><span>腕部视角</span><img id="pi05-wrist-frame" alt="腕部 RGB 实时画面"><b id="pi05-wrist-preview">等待画面</b></div></div><label class="pi05-prompt">Prompt<textarea id="pi05-prompt" maxlength="500">place the fixed block into the fixed box</textarea></label></div><div class="pi05-arrow">→<small>推理中</small></div><div class="pi05-inference"><div class="pi05-head"><span class="pi05-index">02</span><div><strong>π0.5 Inference</strong><small>持续重规划</small></div></div><div class="pi05-orb">π</div><strong id="pi05-model-state">未连接</strong><div class="pi05-metrics"><span>状态<b id="pi05-run-state">IDLE</b></span><span>推理耗时<b id="pi05-inference-ms">--</b></span><span>生成序号<b id="pi05-chunk-length">0</b></span><span>执行动作<b id="pi05-executed">0</b></span></div><div class="pi05-actions"><button id="pi05-cameras" class="button" type="button">初始化相机</button><button id="pi05-start" class="button primary" type="button">启动 π0.5</button><button id="pi05-stop" class="button quiet" type="button">停止</button></div><p id="pi05-result" class="result">Action Chunk 将转换为绝对 TCP 目标，并只通过 OSC track_tcp 输出。</p></div>`;
-    document.querySelector(".teleop-panel")?.append(panel);
+    document.querySelector(".osc-panel")?.append(panel);
     for (const id of ["pi05-external-index", "pi05-wrist-index"]) {
       const input = $(id); const select = document.createElement("select");
       select.id = id; select.setAttribute("aria-label", id.includes("external") ? "外部 RGB 相机" : "腕部 RGB 相机");
@@ -139,7 +139,7 @@
     const panel = document.createElement("section");
     panel.id = "pico-panel"; panel.className = "pico-panel hidden";
     panel.innerHTML = `<div class="pico-head"><span class="pi05-index">P</span><div><strong>PICO 4 Ultra</strong><small>6D 遥操输入适配器</small></div><span id="pico-state" class="badge neutral">IDLE</span></div><section class="pico-camera-resource"><strong>公共相机观测</strong><div class="pi05-cameras"><label>外部 RGB<select id="pico-external-index" aria-label="外部 RGB 相机"></select></label><label>腕部 RGB<select id="pico-wrist-index" aria-label="腕部 RGB 相机"></select></label></div><div class="pi05-views"><div class="pi05-view"><span>外部视角</span><img id="pico-external-frame" alt="外部 RGB 实时画面"><b>等待画面</b></div><div class="pi05-view"><span>腕部视角</span><img id="pico-wrist-frame" alt="腕部 RGB 实时画面"><b>等待画面</b></div></div></section><div class="pico-pair"><div id="pico-qr" class="pico-qr"><span>等待配对</span></div><div><strong>一次性配对</strong><p id="pico-url">先接入 PICO Adapter 以生成二维码。</p><code id="pico-code">------</code><small>二维码或短码有效期内仅允许一个头显接入。</small></div></div><div class="pico-status"><span>连接 <b id="pico-connected">未连接</b></span><span>追踪 <b id="pico-tracking">--</b></span><span>Anchor <b id="pico-anchor">--</b></span><span>夹爪 <b id="pico-gripper">--</b></span></div><div class="pico-controls"><strong>手柄映射</strong><p>右手 Grip 按住：定义 Anchor 并控制 TCP；右手 Trigger：夹爪开度；左手 Menu：安全 HOLD。松开 Grip、追踪丢失或断连都会进入 HOLD。</p></div><div class="pico-actions"><button id="pico-start" class="button primary" type="button">接入 PICO Adapter</button><button id="pico-stop" class="button quiet" type="button">断开 PICO Adapter</button></div><p id="pico-result" class="result">PICO 只向 OSC 提交绝对 TCP 与标准夹爪/HOLD 指令。</p>`;
-    document.querySelector(".teleop-panel")?.append(panel);
+    document.querySelector(".osc-panel")?.append(panel);
     panel.querySelector(".pico-camera-resource .pi05-cameras")?.insertAdjacentHTML("afterend", `<div class="camera-power"><span id="camera-power-pico">相机状态：检查中</span><button id="camera-open-pico" class="button" type="button">打开相机</button><button id="camera-close-pico" class="button quiet" type="button">关闭相机</button></div>`);
     const picoSubtitle = panel.querySelector(".pico-head small");
     if (picoSubtitle) picoSubtitle.textContent = "用 PICO 手柄控制机械臂";
@@ -230,14 +230,14 @@
   }
 
   function session() {
-    return state.teleop?.session || { state: "IDLE", id: null, client_id: null, mode: null, execution_mode: null, input_source: null };
+    return state.osc?.session || { state: "IDLE", id: null, client_id: null, mode: null, execution_mode: null, input_source: null };
   }
 
   const isShadowSession = (current) => (current.execution_mode || current.mode) === "shadow";
 
   function canSendNonzero(allowHoldReadyResume = false) {
     const current = session();
-    const diagnostic = state.teleop?.diagnostics || {};
+    const diagnostic = state.osc?.diagnostics || {};
     const shadow = isShadowSession(current);
     if (allowHoldReadyResume && diagnostic.trajectory_state === "HOLD_READY" &&
         current.state === "ACTIVE" && current.client_id === clientId) {
@@ -247,11 +247,11 @@
     }
     const common = current.state === "ACTIVE" &&
       current.client_id === clientId &&
-      state.teleop?.execution?.accepting_targets === true;
+      state.osc?.execution?.accepting_targets === true;
     if (!common) {
       return false;
     }
-    return (shadow || state.teleop?.authority?.servo_mode === "TRACKING") &&
+    return (shadow || state.osc?.authority?.servo_mode === "TRACKING") &&
       diagnostic.trajectory_state === "RUNNING";
   }
 
@@ -259,10 +259,10 @@
     const current = session();
     if (current.state !== "ACTIVE") return "会话未处于 ACTIVE";
     if (current.client_id !== clientId) return "会话属于其他客户端";
-    if (state.teleop?.diagnostics?.trajectory_state === "FAULT") return `FAULT · ${state.teleop.diagnostics.trajectory_brake_reason || "轨迹故障"}`;
-    if (state.teleop?.execution?.accepting_targets !== true) return "等待 OSC 输入权限";
-    if (!isShadowSession(current) && state.teleop?.authority?.servo_mode !== "TRACKING") return "等待进入 TRACKING";
-    if (state.teleop?.diagnostics?.trajectory_state !== "RUNNING") return "等待遥操轨迹运行";
+    if (state.osc?.diagnostics?.trajectory_state === "FAULT") return `FAULT · ${state.osc.diagnostics.trajectory_brake_reason || "轨迹故障"}`;
+    if (state.osc?.execution?.accepting_targets !== true) return "等待 OSC 输入权限";
+    if (!isShadowSession(current) && state.osc?.authority?.servo_mode !== "TRACKING") return "等待进入 TRACKING";
+    if (state.osc?.diagnostics?.trajectory_state !== "RUNNING") return "等待遥操轨迹运行";
     return "";
   }
 
@@ -280,7 +280,7 @@
     document.querySelectorAll("[data-web-adapter]").forEach((element) => element.classList.toggle("hidden", pi || pico));
     $("pi05-panel")?.classList.toggle("hidden", !pi);
     $("pico-panel")?.classList.toggle("hidden", !pico);
-    const note = document.querySelector(".teleop-panel .section-note");
+    const note = document.querySelector(".osc-panel .section-note");
     if (note) note.textContent = pi ? "π0.5 将双相机观测与 OSC 状态送入 OpenPI，并把 Action Chunk 转换为绝对 TCP 目标。" : pico ? "PICO Adapter 在 OSC 外部处理 Anchor，并只向 OSC 发送绝对 TCP 目标。" : "WebAdapter 将网页摇杆增量转换为基座系绝对 TCP 目标，并接入 OSC。";
     if (note) note.textContent = pi ? "π0.5 会查看两路相机画面，自动生成并执行下一步机械臂动作。" : pico ? "用 PICO 手柄遥控机械臂：按住右手 Grip 才会移动，松开即停止。" : "用网页摇杆控制机械臂；系统会自动把摇杆动作变成机械臂末端的目标位置。";
     if (pi || pico) {
@@ -317,7 +317,7 @@
       let current = session();
       if (current.state !== "ACTIVE") {
         const started = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId }, 10000);
-        state.teleop = started.state; current = session();
+        state.osc = started.state; current = session();
       }
       state.pico = await api("/api/adapters/pico/pair", "POST", { session_id: current.id, client_id: clientId }, 10000);
       phase("PICO 配对已创建；在头显中扫描二维码。 "); render();
@@ -326,7 +326,7 @@
   }
 
   async function stopPico() {
-    try { state.pico = await api("/api/adapters/pico/disconnect", "POST", { reason: "Console disconnected PICO" }); state.teleop = (await api("/api/osc/session/stop", "POST", { reason: "PICO Adapter disconnected" })).state; render(); }
+    try { state.pico = await api("/api/adapters/pico/disconnect", "POST", { reason: "Console disconnected PICO" }); state.osc = (await api("/api/osc/session/stop", "POST", { reason: "PICO Adapter disconnected" })).state; render(); }
     catch (error) { phase(`PICO 断开失败：${error.message}`, true); }
   }
 
@@ -396,7 +396,7 @@
   async function reanchorWebAdapter() {
     const current = session();
     if (current.state !== "ACTIVE" || current.client_id !== clientId) return phase(`WebAdapter 输入已拦截：${permissionReason()}`, true);
-    const target = state.teleop?.command?.target_tcp;
+    const target = state.osc?.command?.target_tcp;
     if (!target?.position_m || !target?.orientation_xyzw) return phase("OSC 尚未提供当前 TCP 位姿", true);
     state.oscAnchor = { position_m: [...target.position_m], orientation_xyzw: [...target.orientation_xyzw] };
     state.webAdapterActive = true;
@@ -480,17 +480,17 @@
   }
 
   function backendPhase() {
-    const transport = state.teleop?.transport || {};
-    const broker = state.teleop?.authority || {};
-    const teleop = state.teleop || {};
-    const action = teleop.active_action;
-    if (broker.hardware_mode === "FAULT" || broker.arm_writer === "SAFETY" || broker.safety_state === "FAULT" || teleop.diagnostics?.trajectory_state === "FAULT") {
-      return `FAULT · ${transport.reason || broker.reason || teleop.diagnostics?.trajectory_brake_reason || "安全停车"}`;
+    const transport = state.osc?.transport || {};
+    const broker = state.osc?.authority || {};
+    const osc = state.osc || {};
+    const action = osc.active_action;
+    if (broker.hardware_mode === "FAULT" || broker.arm_writer === "SAFETY" || broker.safety_state === "FAULT" || osc.diagnostics?.trajectory_state === "FAULT") {
+      return `FAULT · ${transport.reason || broker.reason || osc.diagnostics?.trajectory_brake_reason || "安全停车"}`;
     }
     if (broker.arm_writer === "MODE_TRANSITION") return "MODE_TRANSITION";
     if (action?.type) return `${String(action.type).toUpperCase()} · 执行中`;
     if (broker.servo_mode) return broker.servo_mode;
-    if (teleop.session?.state === "ACTIVE") return teleop.execution?.accepting_targets ? "ACTIVE · OSC 已就绪" : "ACTIVE · 等待 OSC";
+    if (osc.session?.state === "ACTIVE") return osc.execution?.accepting_targets ? "ACTIVE · OSC 已就绪" : "ACTIVE · 等待 OSC";
     return broker.hardware_mode || "IDLE";
   }
 
@@ -498,7 +498,7 @@
     const current = session();
     if (current.state !== "ACTIVE" || current.client_id !== clientId) return;
     if (!state.webAdapterActive) return;
-    const anchor = state.oscAnchor || state.teleop?.command?.target_tcp;
+    const anchor = state.oscAnchor || state.osc?.command?.target_tcp;
     if (!anchor?.position_m || !anchor?.orientation_xyzw) return;
     const sequence = nextOscSequence();
     const targetPose = {
@@ -517,7 +517,7 @@
       const resultSequence = Number(result.state.state_sequence || result.state.session?.sequence || 0);
       if (resultSequence >= state.latestSequence) {
         state.latestSequence = resultSequence;
-        state.teleop = result.state;
+        state.osc = result.state;
       }
     }
     if (!result?.ok) {
@@ -537,9 +537,9 @@
       const reason = result?.result?.reason || result?.state?.diagnostics?.trajectory_brake_reason || "OSC 未接受该目标";
       throw new Error(`OSC 拒绝：${reason}`);
     }
-    if (result?.result?.accepted_sequence != null && state.teleop?.command) {
+    if (result?.result?.accepted_sequence != null && state.osc?.command) {
       state.oscSequence = Math.max(state.oscSequence, Number(result.result.accepted_sequence));
-      state.teleop.command.sequence = result.result.accepted_sequence;
+      state.osc.command.sequence = result.result.accepted_sequence;
     }
   }
 
@@ -618,20 +618,20 @@
     ];
   }
 
-  function drawWorkspace(teleop) {
+  function drawWorkspace(osc) {
     if (!ctx || !canvas) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    const tcp = teleop?.diagnostics?.pink?.tcp || {};
+    const tcp = osc?.diagnostics?.pink?.tcp || {};
     const links = Array.isArray(tcp.link_positions_m) ? tcp.link_positions_m : [];
-    const currentPose = teleop?.execution?.measured_tcp_pose || teleop?.transport?.hardware_feedback?.tcp_pose || null;
+    const currentPose = osc?.execution?.measured_tcp_pose || osc?.transport?.hardware_feedback?.tcp_pose || null;
     const position = Array.isArray(currentPose?.position_m) && currentPose.position_m.length === 3 && currentPose.position_m.every((value) => Number.isFinite(Number(value)))
       ? currentPose.position_m.map(Number)
       : (Array.isArray(tcp.position_m) && tcp.position_m.length === 3 && tcp.position_m.every((value) => Number.isFinite(Number(value))) ? tcp.position_m.map(Number) : null);
-    const targetPose = teleop?.command?.target_tcp || null;
+    const targetPose = osc?.command?.target_tcp || null;
     const targetPosition = Array.isArray(targetPose?.position_m) && targetPose.position_m.length === 3 && targetPose.position_m.every((value) => Number.isFinite(Number(value)))
       ? targetPose.position_m.map(Number) : null;
     const targetRotation = rotationFromQuat(targetPose?.orientation_xyzw);
-    const workspace = teleop?.workspace || {};
+    const workspace = osc?.workspace || {};
     const min = Array.isArray(workspace.min_xyz_m) ? workspace.min_xyz_m.map(Number) : [-0.45, -0.15, -0.02];
     const max = Array.isArray(workspace.max_xyz_m) ? workspace.max_xyz_m.map(Number) : [0.45, 0.60, 0.70];
     const minZ = Number.isFinite(Number(workspace.min_tcp_z_m)) ? Number(workspace.min_tcp_z_m) : min[2];
@@ -709,14 +709,14 @@
   }
 
   function render() {
-    const teleop = state.teleop || {};
-    const broker = teleop.authority || {};
-    const transport = teleop.transport || {};
-    const command = teleop.command || {};
-    const execution = teleop.execution || {};
+    const osc = state.osc || {};
+    const broker = osc.authority || {};
+    const transport = osc.transport || {};
+    const command = osc.command || {};
+    const execution = osc.execution || {};
     const hardwareFeedback = transport.hardware_feedback || {};
     const current = session();
-    const diagnostic = teleop.diagnostics || {};
+    const diagnostic = osc.diagnostics || {};
     const timing = diagnostic.timing || {};
     const executionFeedbackAge = finite(execution.feedback_age_s, NaN);
     const hardwareFeedbackAge = finite(hardwareFeedback.feedback_age_s, NaN);
@@ -727,7 +727,7 @@
     badge("connection", transport.connected ? "\u786c\u4ef6\u5df2\u8fde\u63a5" : "\u786c\u4ef6\u672a\u8fde\u63a5", transport.connected ? "ok" : "warn");
     const adapterName = selectedAdapter() === "pi05" ? "π0.5" : selectedAdapter() === "pico" ? "PICO 4 Ultra" : "WebAdapter";
     const modeLabel = current.state === "ACTIVE" ? `${adapterName} + ${isShadowSession(current) ? "影子" : "真机"}` : "未接入";
-    badge("teleop-mode", modeLabel, current.state === "ACTIVE" && isShadowSession(current) ? "ok" : current.state === "ACTIVE" ? "warn" : "neutral");
+    badge("osc-mode", modeLabel, current.state === "ACTIVE" && isShadowSession(current) ? "ok" : current.state === "ACTIVE" ? "warn" : "neutral");
     badge("session-state", current.state || "IDLE", current.state === "ACTIVE" ? "ok" : "neutral");
     badge("feedback-state", Number.isFinite(feedbackAgeS) ? `反馈 ${Math.round(feedbackAgeS * 1000)} ms` : "反馈 --", transport.can_health?.ok ? "ok" : "warn");
     badge("safety-state", `安全 ${broker.safety_state || diagnostic.trajectory_state || "--"}`, broker.safety_state === "FAULT" ? "fault" : "neutral");
@@ -736,14 +736,14 @@
     const inputStatus = execution.accepting_targets ? "WebAdapter 已就绪" : current.state === "ACTIVE" ? "等待 OSC 输入权限" : "WebAdapter 未接入";
     const livePhase = backendPhase();
     phase(state.last_error || livePhase || inputStatus, Boolean(state.last_error));
-    $("solver-badge").textContent = teleop.solver?.running ? "求解器在线" : "求解器空闲";
-    $("solver-badge").className = `badge ${teleop.solver?.running ? "ok" : "neutral"}`;
+    $("solver-badge").textContent = osc.solver?.running ? "求解器在线" : "求解器空闲";
+    $("solver-badge").className = `badge ${osc.solver?.running ? "ok" : "neutral"}`;
     $("status-age").textContent = Number.isFinite(feedbackAgeS) ? `反馈 ${Math.round(feedbackAgeS * 1000)} ms` : "反馈 --";
     $("control-mode").textContent = `${broker.hardware_mode || "DISCONNECTED"} · ${broker.control_role || "NONE"}`;
     $("controller-mode").textContent = controllerModeLabel(hardwareFeedback.arm_status?.ctrl_mode);
-    $("active-action").textContent = teleop.active_action?.type || "无";
+    $("active-action").textContent = osc.active_action?.type || "无";
     $("reason").textContent = transport.reason || diagnostic.safety_gate?.reason || diagnostic.trajectory_brake_reason || "--";
-    const grip = teleop.gripper || {};
+    const grip = osc.gripper || {};
     $("gripper-width-value").textContent = grip.width_m == null ? "--" : `${fixed(grip.width_m * 1000, 1)} mm`;
     $("gripper-force").textContent = grip.force_n == null ? "--" : `${fixed(grip.force_n, 2)} N`;
     $("gripper-driver").textContent = grip.status?.foc_status?.driver_enable_status ? "已使能" : "--";
@@ -813,8 +813,8 @@
     // robot command. It must remain available precisely when the backend is
     // disconnected, initializing, or stuck.
     $("reset-control").disabled = Date.now() < state.resetPendingUntil;
-    drawWorkspace(teleop);
-    renderHierarchy(teleop, broker, transport, hardwareFeedback, diagnostic, current);
+    drawWorkspace(osc);
+    renderHierarchy(osc, broker, transport, hardwareFeedback, diagnostic, current);
     renderPi05();
     renderPico();
     renderCameraControls();
@@ -839,7 +839,7 @@
       const sequence = Number(osc.state_sequence || osc.session?.sequence || 0);
       if (sequence < state.latestSequence) return;
       state.latestSequence = sequence;
-      state.teleop = osc;
+      state.osc = osc;
       if (includeAuxiliary) {
         state.pi05 = pi05;
         state.pico = pico;
@@ -874,7 +874,7 @@
       // fresh authoritative response to the user's explicit connect action,
       // so it must replace any snapshot from the previous process instance.
       state.latestSequence = sequence;
-      state.teleop = osc;
+      state.osc = osc;
       state.oscSequence = Math.max(state.oscSequence, Number(osc.command?.sequence || osc.session?.sequence || 0));
       if (osc?.session?.state === "ACTIVE") {
         await reanchorWebAdapter();
@@ -893,7 +893,7 @@
   async function disconnectWebAdapter() {
     state.requestGeneration += 1;
     resetWebAdapter();
-    try { state.teleop = (await api("/api/osc/session/stop", "POST", { reason: "WebAdapter disconnected" })).state; render(); } catch (error) { phase(`WebAdapter 断开失败：${error.message}`, true); }
+    try { state.osc = (await api("/api/osc/session/stop", "POST", { reason: "WebAdapter disconnected" })).state; render(); } catch (error) { phase(`WebAdapter 断开失败：${error.message}`, true); }
   }
 
   function pi05ConfigBody() {
@@ -933,7 +933,7 @@
       let current = session();
       if (current.state !== "ACTIVE" || current.client_id !== clientId) {
         const result = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId }, 10000);
-        state.teleop = result.state; state.latestSequence = Number(result.state?.state_sequence || 0); current = session();
+        state.osc = result.state; state.latestSequence = Number(result.state?.state_sequence || 0); current = session();
       }
       await api("/api/pi05/config", "POST", pi05ConfigBody());
       state.pi05 = await api("/api/pi05/start", "POST", { session_id: current.id, client_id: clientId }, 10000);
@@ -945,7 +945,7 @@
     try {
       state.pi05 = await api("/api/pi05/stop", "POST", { reason: "operator stopped pi05 adapter" });
       const result = await api("/api/osc/session/stop", "POST", { reason: "pi05 adapter stopped" });
-      state.teleop = result.state; render();
+      state.osc = result.state; render();
     } catch (error) { phase(`π0.5 停止失败：${error.message}`, true); }
   }
 
@@ -979,7 +979,7 @@
       const sequence = Number(osc.state_sequence || osc.session?.sequence || 0);
       if (sequence >= state.latestSequence) {
         state.latestSequence = sequence;
-        state.teleop = osc;
+        state.osc = osc;
         state.oscSequence = Number(osc.command?.sequence || osc.session?.sequence || 0);
         render();
       }
@@ -995,7 +995,7 @@
         resetWebAdapter();
         try {
           const result = await api("/api/osc/session/stop", "POST", { reason: "WebAdapter heartbeat lost" }, 3000);
-          state.teleop = result.state;
+          state.osc = result.state;
           state.latestSequence = Number(result.state?.state_sequence || 0);
           render();
         } catch (stopError) {
@@ -1008,7 +1008,7 @@
     }
   }
 
-  function renderHierarchy(teleop, broker, transport, robot, diagnostic, current) {
+  function renderHierarchy(osc, broker, transport, robot, diagnostic, current) {
     const cards = document.querySelectorAll(".layer-card");
     if (cards.length >= 4) {
       const copy = [
@@ -1051,17 +1051,17 @@
     if (authorityLabel) authorityLabel.textContent = "Writer / Epoch";
     const motionLabel = cards[2]?.querySelector(".layer-value span");
     if (motionLabel) motionLabel.textContent = "Servo / Stream";
-    void teleop; void transport; void robot; void diagnostic;
+    void osc; void transport; void robot; void diagnostic;
   }
 
   function permissionReason() {
     const current = session();
-    const broker = state.teleop?.authority || {};
-    const diagnostic = state.teleop?.diagnostics || {};
+    const broker = state.osc?.authority || {};
+    const diagnostic = state.osc?.diagnostics || {};
     if (current.state !== "ACTIVE") return "会话未处于 ACTIVE";
     if (current.client_id !== clientId) return "会话属于其他客户端";
     if (broker.hardware_mode === "FAULT" || diagnostic.trajectory_state === "FAULT") return `FAULT · ${broker.reason || diagnostic.trajectory_brake_reason || "轨迹故障"}`;
-    if (state.teleop?.execution?.accepting_targets !== true) return "后端未开启 OSC 输入权限";
+    if (state.osc?.execution?.accepting_targets !== true) return "后端未开启 OSC 输入权限";
     if (!isShadowSession(current) && broker.servo_mode !== "TRACKING") return `等待进入 ${broker.servo_mode || "TRACKING"}`;
     if (diagnostic.trajectory_state !== "RUNNING") return `等待轨迹恢复（${diagnostic.trajectory_state || "unknown"}）`;
     return "";
@@ -1107,15 +1107,15 @@
     const sequence = nextOscSequence();
     return api("/api/osc/command", "POST", { session_id: current.id, client_id: clientId, sequence, type, payload });
   };
-  $("hold").onclick = () => { resetWebAdapter(); $("hold").disabled = true; oscCommand("hold", { reason: "operator requested HOLD" }).then((result) => { state.teleop = result.state; render(); }).catch((error) => phase(`HOLD失败：${error.message}`, true)); };
+  $("hold").onclick = () => { resetWebAdapter(); $("hold").disabled = true; oscCommand("hold", { reason: "operator requested HOLD" }).then((result) => { state.osc = result.state; render(); }).catch((error) => phase(`HOLD失败：${error.message}`, true)); };
   $("freedrive").onclick = () => {
     // Clear the local UI only.  FREEDRIVE must not first submit a zero
-    // teleop intent, because that would start a P1/Ruckig braking path before
+    // osc intent, because that would start a P1/Ruckig braking path before
     // the dedicated direct Leader transition reaches the backend.
     resetWebAdapter();
     $("freedrive").disabled = true;
     oscCommand("freedrive", { reason: "operator requested FREEDRIVE" })
-      .then((result) => { state.teleop = result.state; render(); })
+      .then((result) => { state.osc = result.state; render(); })
       .catch((error) => phase(`FREEDRIVE失败：${error.message}`, true));
   };
   $("gripper-open").onclick = () => oscCommand("gripper", { mode: "open", force_n: Number($("gripper-force-input").value) });
