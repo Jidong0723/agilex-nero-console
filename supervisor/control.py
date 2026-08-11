@@ -474,15 +474,32 @@ class OperationalSpaceController:
             )
         )
         try:
-            return self.robot.call(
+            result = self.robot.call(
                 "p1", "send_cpv_position", values, command_epoch=epoch,
                 category="servo_position", execute_guard=guard,
                 dispatch_timeout_s=max(0.1, dispatch_timeout_s),
             )
+            can_diagnostics = result.get("can_diagnostics") if isinstance(result, dict) else None
+            slow_events = can_diagnostics.get("slow_send_events", []) if isinstance(can_diagnostics, dict) else []
+            if slow_events:
+                self._log(
+                    "cpv_slow_can_send",
+                    diagnostics={
+                        "cpv_batch": {
+                            "started_monotonic_ns": result.get("started_monotonic_ns"),
+                            "finished_monotonic_ns": result.get("finished_monotonic_ns"),
+                            "batch_duration_ms": result.get("batch_duration_ms"),
+                            "batch_skew_ms": result.get("batch_skew_ms"),
+                        },
+                        "can": can_diagnostics,
+                    },
+                )
+            return result
         except TimeoutError as exc:
             transport = self._transport_owner.diagnostics()
             progress = getattr(self._transport_owner.backend, "cpv_dispatch_progress", lambda: {})()
-            detail = {"transport": transport, "cpv_progress": progress}
+            can_diagnostics = getattr(self._transport_owner.backend, "can_dispatch_diagnostics", lambda: {})()
+            detail = {"transport": transport, "cpv_progress": progress, "can": can_diagnostics}
             self._log("cpv_position_timeout", error=str(exc), diagnostics=detail)
             self._schedule_transport_reset(f"CPV position timeout: {exc}; diagnostics={detail}")
             raise

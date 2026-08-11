@@ -21,6 +21,10 @@
     }
   }
   ensureSelectionControls();
+  document.querySelector(".diagnostics-panel h2")?.replaceChildren("运动诊断");
+  const gripperLabel = document.querySelector(".gripper-card .section-label");
+  if (gripperLabel) gripperLabel.textContent = "DISCRETE ACTION";
+  document.getElementById("gripper-result")?.remove();
   document.querySelector(".intent-readout span")?.replaceChildren("当前摇杆输入");
   const keys = new Set(["KeyW", "KeyS", "KeyQ", "KeyE", "KeyR", "KeyF", "KeyA", "KeyD"]);
   const clientId = (() => {

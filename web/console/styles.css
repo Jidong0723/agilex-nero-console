@@ -161,5 +161,64 @@
 .hardware-feedback-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:12px}.hardware-feedback-head h2{margin:2px 0 4px;font-size:17px}.hardware-feedback-head .section-note{margin:0;max-width:620px}.hardware-feedback-badges{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .hardware-feedback-grid{display:grid;grid-template-columns:minmax(300px,1.25fr) minmax(310px,1fr) minmax(330px,1.15fr);gap:10px;align-items:stretch}.feedback-pose{display:grid;gap:6px;padding:12px 13px;border:1px solid #315269;border-radius:6px;background:linear-gradient(135deg,rgba(13,39,43,.72),rgba(11,24,27,.86))}.feedback-pose>span{color:#9dc8d7;font-size:10px;font-weight:700;letter-spacing:.08em}.feedback-pose code{color:#d0f2e5;font-size:11px;line-height:1.55}.feedback-pose small{color:var(--muted);font-size:10px}
 .hardware-feedback-card .backend-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin:0;min-width:0}.hardware-feedback-card .backend-summary>div{min-height:0;padding:10px;background:#0d191b;border-color:#29464a}.hardware-feedback-card .backend-summary>div:last-child{min-width:0}.hardware-feedback-card .backend-summary>div:last-child strong{white-space:normal;overflow:visible;text-overflow:clip;line-height:1.3}.hardware-feedback-card .joint-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:5px;margin:0}.hardware-feedback-card .joint-grid div{min-width:0;padding:7px 5px;background:#0d191b;border-color:#29464a}.hardware-feedback-card .joint-grid strong{font-size:10px}.hardware-feedback-card .joint-grid>.muted{grid-column:1/-1;align-self:center;padding:8px 10px;border:1px dashed #29464a;border-radius:6px;background:#0d191b;color:#718985;font-size:10px}
-@media(max-width:1180px){.hardware-feedback-grid{grid-template-columns:minmax(300px,1fr) minmax(300px,1fr)}.hardware-feedback-card .joint-grid{grid-column:1/-1;grid-template-columns:repeat(7,minmax(0,1fr)}}
-@media(max-width:720px){.hardware-feedback-card{padding:13px}.hardware-feedback-head{display:grid;gap:10px}.hardware-feedback-badges{justify-content:flex-start}.hardware-feedback-grid{grid-template-columns:1fr}.hardware-feedback-card .backend-summary{grid-template-columns:repeat(3,minmax(0,1fr)}.hardware-feedback-card .joint-grid{grid-template-columns:repeat(4,1fr)}}
+@media(max-width:1180px){.hardware-feedback-grid{grid-template-columns:minmax(300px,1fr) minmax(300px,1fr)}.hardware-feedback-card .joint-grid{grid-column:1/-1;grid-template-columns:repeat(7,minmax(0,1fr))}}
+@media(max-width:720px){.hardware-feedback-card{padding:13px}.hardware-feedback-head{display:grid;gap:10px}.hardware-feedback-badges{justify-content:flex-start}.hardware-feedback-grid{grid-template-columns:1fr}.hardware-feedback-card .backend-summary{grid-template-columns:repeat(3,minmax(0,1fr))}.hardware-feedback-card .joint-grid{grid-template-columns:repeat(4,1fr)}}
+
+/* Keep the architecture overview between maintenance and hardware feedback. */
+.app-shell{display:flex;flex-direction:column}
+.operator-rail{order:1}
+.content-grid{order:2}
+.maintenance{order:3}
+.layer-strip{order:4}
+.hardware-feedback-card{order:5}
+#tcp-reference-readout{order:6}
+
+/* Compact OSC and gripper presentation. */
+.osc-card-head{margin-bottom:10px}
+.osc-card-head h2{font-size:18px}
+.gripper-card .gripper-readouts{padding:6px;border:1px solid #29464a;border-radius:6px;background:linear-gradient(135deg,rgba(13,30,35,.72),rgba(11,24,27,.86));gap:2px}
+.gripper-card .gripper-readouts>div{padding:4px 7px;border:0;background:transparent}
+.gripper-card .gripper-fields input{width:78px;justify-self:start}
+@media(max-width:720px){.gripper-card .gripper-fields input{width:100%}}
+
+/* Final compact gripper layout: one feedback group, vertical settings. */
+.gripper-card{grid-template-columns:108px 132px 110px minmax(140px,1fr);column-gap:10px}
+.gripper-card .gripper-readouts{display:grid;grid-template-columns:1fr;align-items:stretch;min-width:0;padding:5px 7px;border:1px solid #315269;border-radius:7px;background:linear-gradient(135deg,rgba(13,39,43,.82),rgba(11,24,27,.94));gap:0}
+.gripper-card .gripper-readouts>div{display:grid;grid-template-columns:1fr auto;align-items:center;padding:3px 5px;border:0;border-top:1px solid #29464a;border-radius:0;background:transparent}
+.gripper-card .gripper-readouts>div:first-child{border-top:0}
+.gripper-card .gripper-readouts strong{margin-top:0;text-align:right}
+.gripper-card .gripper-fields{display:flex;flex-direction:column;gap:6px;margin:0;min-width:0}
+.gripper-card .gripper-fields label{display:grid;grid-template-columns:54px 78px auto;align-items:center;gap:5px;white-space:nowrap;font-size:10px}
+.gripper-card .gripper-fields input{grid-column:2;width:78px;padding:5px 6px}
+.gripper-card .button-row{display:flex;gap:5px;min-width:0}
+.osc-card{padding:16px 18px}
+.osc-card-head{padding-bottom:10px;border-bottom:1px solid rgba(111,92,52,.55)}
+.osc-card .layer-strip{gap:8px}
+.osc-card .layer-card{min-height:96px;padding:11px 12px;grid-template-columns:auto 1fr auto;gap:9px;box-shadow:none;background:linear-gradient(135deg,rgba(21,35,38,.72),rgba(13,22,24,.88))}
+.osc-card .layer-name{font-size:9px;letter-spacing:.08em;white-space:nowrap}
+@media(max-width:1180px){.gripper-card{grid-template-columns:minmax(126px,.75fr) minmax(220px,1.3fr);grid-template-rows:auto auto auto}.gripper-card-head{grid-column:1;grid-row:1}.gripper-card .gripper-readouts{grid-column:2;grid-row:1}.gripper-card .gripper-fields{grid-column:1;grid-row:2}.gripper-card .button-row{grid-column:2;grid-row:2}.osc-card .layer-strip{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:720px){.gripper-card{grid-template-columns:1fr;grid-template-rows:auto}.gripper-card-head,.gripper-card .gripper-readouts,.gripper-card .gripper-fields,.gripper-card .button-row{grid-column:auto;grid-row:auto}.gripper-card .gripper-fields label{grid-template-columns:68px minmax(0,1fr) auto}.gripper-card .gripper-fields input{width:100%}.osc-card .layer-strip{grid-template-columns:1fr}}
+
+/* Keep gripper settings and actions in separate rows so buttons never cover inputs. */
+@media(min-width:721px){
+  .gripper-card{grid-template-columns:108px 132px minmax(250px,1fr);grid-template-rows:auto auto;column-gap:10px;row-gap:6px;align-items:center}
+  .gripper-card-head{grid-column:1;grid-row:1 / span 2}
+  .gripper-card .gripper-readouts{grid-column:2;grid-row:1 / span 2}
+  .gripper-card .gripper-fields{grid-column:3;grid-row:1;display:grid;grid-template-columns:1fr 1fr;gap:8px;min-width:0}
+  .gripper-card .gripper-fields label{display:grid;grid-template-columns:52px minmax(0,1fr) auto;align-items:center;gap:4px;min-width:0;white-space:nowrap}
+  .gripper-card .gripper-fields input{grid-column:2;width:100%;min-width:0}
+  .gripper-card .button-row{grid-column:3;grid-row:2;display:flex;gap:6px;justify-content:flex-end}
+  .gripper-card .button-row .button{min-width:0;flex:1;padding:0 7px;white-space:nowrap}
+}
+@media(max-width:1180px) and (min-width:721px){
+  .gripper-card{grid-template-columns:100px 128px minmax(220px,1fr)}
+}
+
+/* The architecture layers share one OSC card and sit between hardware feedback and maintenance. */
+.hardware-feedback-card{order:3}
+.osc-card{order:4;margin-top:14px;padding:14px 16px;border-color:#6f5c34;background:linear-gradient(112deg,rgba(30,29,18,.98),rgba(16,26,29,.98) 58%,rgba(17,27,24,.98))}
+.osc-card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:12px}
+.osc-card-head h2{margin:2px 0 0;font-size:17px}
+.osc-card .layer-strip{order:unset;margin:0}
+.maintenance{order:5}
+#tcp-reference-readout{order:6}

@@ -911,7 +911,24 @@ class NeroRobot:
             "joint_sent_monotonic_ns": joint_sent_ns,
             "batch_duration_ms": (finished_ns - started_ns) / 1e6,
             "batch_skew_ms": ((max(joint_sent_ns) - min(joint_sent_ns)) / 1e6) if joint_sent_ns else 0.0,
+            "can_diagnostics": self.can_dispatch_diagnostics(consume_slow=True),
         }
+
+    def can_dispatch_diagnostics(self, *, consume_slow: bool = False) -> dict[str, Any]:
+        """Read bounded SDK/CAN TX diagnostics without issuing a CAN query."""
+        robot = self.robot
+        if robot is None:
+            return {"available": False, "reason": "robot is not connected"}
+        try:
+            context = getattr(robot, "_ctx", None)
+            getter = getattr(context, "get_comm", None)
+            comm = getter() if callable(getter) else None
+            diagnostics = getattr(comm, "send_diagnostics", None)
+            if not callable(diagnostics):
+                return {"available": False, "reason": "SDK CAN diagnostics are unavailable"}
+            return {"available": True, **jsonable(diagnostics(consume_slow=consume_slow))}
+        except Exception as exc:
+            return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
 
     def cpv_dispatch_progress(self) -> dict[str, Any]:
         """Non-blocking introspection for a potentially stuck CPV batch."""

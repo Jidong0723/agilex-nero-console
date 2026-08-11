@@ -2,6 +2,9 @@
 # -*- coding: utf-8 -*-
 import errno
 import can
+import threading
+import time
+from collections import deque
 from can.message import Message
 from platform import system
 
@@ -71,6 +74,13 @@ class CanCommImpl(CanCommBase):
         self._timeout = self._config.get("timeout", 1.0)
         self._receive_own_messages = self._config.get("receive_own_messages", False)
         self._local_loopback = self._config.get("local_loopback", False)
+        # Keep transport diagnostics bounded and silent during normal 50 Hz
+        # operation.  The control service consumes these only when a CPV
+        # send is slow or times out.
+        self._slow_send_threshold_s = float(self._config.get("slow_send_threshold_s", 0.05))
+        self._send_diagnostics_lock = threading.Lock()
+        self._active_send_diagnostic = None
+        self._slow_send_events = deque(maxlen=16)
         self._is_connected = False
         self._is_stopped = False
         if self._interface == "socketcan":
@@ -188,21 +198,70 @@ class CanCommImpl(CanCommBase):
         self._is_connected = False
         self._is_stopped = True
 
+    @staticmethod
+    def _message_diagnostic(msg: Message) -> dict:
+        return {
+            "arbitration_id": int(getattr(msg, "arbitration_id", 0)),
+            "is_extended_id": bool(getattr(msg, "is_extended_id", False)),
+            "is_remote_frame": bool(getattr(msg, "is_remote_frame", False)),
+            "dlc": int(getattr(msg, "dlc", len(getattr(msg, "data", b"")))),
+            "data_hex": bytes(getattr(msg, "data", b"")).hex(" "),
+        }
+
+    def send_diagnostics(self, *, consume_slow: bool = False) -> dict:
+        """Return bounded state for diagnosing a stalled CAN transmission."""
+        with self._send_diagnostics_lock:
+            active = dict(self._active_send_diagnostic) if self._active_send_diagnostic else None
+            slow = [dict(item) for item in self._slow_send_events]
+            if consume_slow:
+                self._slow_send_events.clear()
+        bus = self.send_bus
+        return {
+            "channel": self._channel,
+            "interface": self._interface,
+            "connected": bool(self._is_connected and bus is not None),
+            "stopped": bool(self._is_stopped),
+            "last_error": None if self.last_error is None else f"{type(self.last_error).__name__}: {self.last_error}",
+            "bus_state": None if bus is None else str(getattr(bus, "state", None)),
+            "active_send": active,
+            "slow_send_events": slow,
+            "slow_send_threshold_ms": self._slow_send_threshold_s * 1000.0,
+        }
+
     def send(self, msg: Message, timeout=None):
         if self.send_bus is None:
             self.close()
             raise RuntimeError("CAN bus is not connected.")
 
+        started_ns = time.monotonic_ns()
+        diagnostic = {
+            **self._message_diagnostic(msg),
+            "started_monotonic_ns": started_ns,
+            "timeout": timeout,
+        }
+        with self._send_diagnostics_lock:
+            self._active_send_diagnostic = diagnostic
         try:
             self.send_bus.send(msg, timeout)
             self.last_error = None
         except Exception as exc:
             self.last_error = exc
+            diagnostic["error"] = f"{type(exc).__name__}: {exc}"
+            diagnostic["force_record"] = True
             err_kind = self._classify_can_error(exc)
             if err_kind in (errno.ENOBUFS, errno.ENETDOWN):
+                diagnostic["classified_error"] = err_kind
                 return
             self.close()
             raise self.last_error
+        finally:
+            finished_ns = time.monotonic_ns()
+            diagnostic.setdefault("finished_monotonic_ns", finished_ns)
+            diagnostic.setdefault("duration_ms", (finished_ns - started_ns) / 1e6)
+            with self._send_diagnostics_lock:
+                self._active_send_diagnostic = None
+                if diagnostic.get("force_record") or diagnostic["duration_ms"] >= self._slow_send_threshold_s * 1000.0:
+                    self._slow_send_events.append(dict(diagnostic))
 
     def recv(self):
         if self.recv_bus is None:
