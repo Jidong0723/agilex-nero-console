@@ -113,13 +113,13 @@
     });
     inference?.querySelector(".pi05-index")?.remove();
     $("pi05-cameras")?.remove();
-    if (prompt) prompt.firstChild.textContent = "任务说明";
+    if (prompt) prompt.firstChild.textContent = "Prompt";
     const inferenceTitle = inference?.querySelector(".pi05-head strong");
     if (inferenceTitle) inferenceTitle.textContent = "π0.5 自动控制";
     const inferenceHint = inference?.querySelector(".pi05-head small");
     if (inferenceHint) inferenceHint.textContent = "根据相机画面生成下一步动作";
     const chunkTitle = chunk?.querySelector("span");
-    if (chunkTitle) chunkTitle.textContent = "下一步动作";
+    if (chunkTitle) chunkTitle.textContent = "Action Chunk";
     const inferenceStack = document.createElement("div");
     inferenceStack.className = "pi05-inference-stack";
     if (inference) inferenceStack.append(inference);
@@ -338,7 +338,7 @@
     $("pi05-model-state").textContent = pi.model_state || "UNKNOWN";
     $("pi05-run-state").textContent = pi.state || "IDLE";
     $("pi05-inference-ms").textContent = Number.isFinite(Number(pi.inference_ms)) ? `${Number(pi.inference_ms).toFixed(0)} ms` : "--";
-    $("pi05-chunk-length").textContent = String(pi.action_chunk_length || 0);
+    $("pi05-chunk-length").textContent = String(pi.chunk_sequence || 0);
     $("pi05-executed").textContent = String(pi.executed_steps || 0);
     const firstAction = Array.isArray(pi.action_chunk) && Array.isArray(pi.action_chunk[0]) ? pi.action_chunk[0] : null;
     $("pi05-action-first").textContent = firstAction ? `[${firstAction.map((value) => Number(value).toFixed(3)).join(", ")}]` : "等待推理结果";
@@ -352,8 +352,8 @@
       $("pi05-external-frame").classList.add("ready"); $("pi05-wrist-frame").classList.add("ready");
     }
     if ($("pi05-cameras")) $("pi05-cameras").disabled = pi.state === "RUNNING";
-    $("pi05-start").disabled = pi.state === "RUNNING" || !pi.camera_ready;
-    $("pi05-stop").disabled = pi.state !== "RUNNING" && pi.state !== "ERROR";
+    $("pi05-start").disabled = pi.execution_enabled === true || !pi.camera_ready;
+    $("pi05-stop").disabled = pi.execution_enabled !== true;
     $("pi05-start").textContent = "开始自动控制";
     $("pi05-stop").textContent = "停止自动控制";
     renderPi05Connections(pi.connections || {});
@@ -841,7 +841,8 @@
       state.latestSequence = sequence;
       state.osc = osc;
       if (includeAuxiliary) {
-        state.pi05 = pi05;
+        const previousPi05At = Number(state.pi05?.updated_at || 0);
+        if (Number(pi05?.updated_at || 0) >= previousPi05At) state.pi05 = pi05;
         state.pico = pico;
       }
       if (resetPending) {
@@ -903,6 +904,32 @@
     }};
   }
 
+  let pi05PromptTimer = null;
+  async function commitPi05Prompt() {
+    const prompt = $("pi05-prompt")?.value?.trim() || "";
+    if (!prompt) return;
+    try {
+      state.pi05 = await api("/api/pi05/config", "POST", { model: { prompt } }, 5000);
+      const result = $("pi05-result");
+      if (result) result.textContent = "Prompt 已提交，下一轮推理将使用新任务说明。";
+      renderPi05();
+    } catch (error) {
+      const result = $("pi05-result");
+      if (result) result.textContent = `Prompt 提交失败：${error.message}`;
+    }
+  }
+
+  async function refreshPi05State() {
+    if (selectedAdapter() !== "pi05") return;
+    try {
+      const pi05 = await api("/api/pi05/state", "GET", undefined, 1200);
+      if (Number(pi05?.updated_at || 0) >= Number(state.pi05?.updated_at || 0)) state.pi05 = pi05;
+      renderPi05();
+    } catch (_) {
+      // The regular combined refresh renders the connection error state.
+    }
+  }
+
   async function activateSharedCameras() {
     try {
       await api("/api/cameras/config", "POST", cameraConfigBody());
@@ -935,17 +962,21 @@
         const result = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId }, 10000);
         state.osc = result.state; state.latestSequence = Number(result.state?.state_sequence || 0); current = session();
       }
-      await api("/api/pi05/config", "POST", pi05ConfigBody());
+      // Cameras and inference are already running; this button only enables
+      // forwarding the latest Action Chunk to OSC.
+      await api("/api/pi05/config", "POST", { model: { prompt: $("pi05-prompt")?.value || "" } });
       state.pi05 = await api("/api/pi05/start", "POST", { session_id: current.id, client_id: clientId }, 10000);
-      phase("π0.5 已接入 OSC；持续推理与 Action Chunk 执行中"); render();
+      phase(current.execution_mode === "shadow"
+        ? "π0.5 已开启，但当前是影子模式，不会驱动真机；请切换为真机模式"
+        : "π0.5 已开启，Action Chunk 正在发送给 OSC 执行");
+      render();
     } catch (error) { phase(`π0.5 启动失败：${error.message}`, true); await refresh(); }
   }
 
   async function stopPi05() {
     try {
       state.pi05 = await api("/api/pi05/stop", "POST", { reason: "operator stopped pi05 adapter" });
-      const result = await api("/api/osc/session/stop", "POST", { reason: "pi05 adapter stopped" });
-      state.osc = result.state; render();
+      phase("π0.5 推理继续运行，已停止向 OSC 输出 Action Chunk"); render();
     } catch (error) { phase(`π0.5 停止失败：${error.message}`, true); }
   }
 
@@ -1073,7 +1104,25 @@
   buildPicoCard();
   void loadSharedCameras();
   $("input-adapter")?.addEventListener("change", applyAdapterSelection);
-  $("execution-mode")?.addEventListener("change", () => { resetWebAdapter(); render(); });
+  $("execution-mode")?.addEventListener("change", async () => {
+    resetWebAdapter();
+    const current = session();
+    if (current.state === "ACTIVE" && current.client_id === clientId) {
+      try {
+        // The execution mode belongs to the OSC session. Recreate the
+        // session so changing the selector cannot leave a stale shadow
+        // session while the UI says hardware mode.
+        await api("/api/pi05/stop", "POST", { reason: "execution mode changed" }).catch(() => {});
+        await api("/api/osc/session/stop", "POST", { reason: "execution mode changed" });
+        const result = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId }, 10000);
+        state.osc = result.state;
+        phase($("execution-mode").value === "hardware" ? "已切换为真机模式，请点击开始自动控制" : "已切换为影子模式");
+      } catch (error) {
+        phase(`控制模式切换失败：${error.message}`, true);
+      }
+    }
+    render();
+  });
   $("right-mode")?.addEventListener("change", () => {
     // Changing the axis mapping must not clear the active joystick or the
     // accumulated relative TCP pose. Only the interpretation of the right
@@ -1094,6 +1143,11 @@
   $("stop").onclick = disconnectWebAdapter;
   $("reanchor")?.addEventListener("click", () => reanchorWebAdapter().catch((error) => phase(`WebAdapter 重锚定失败：${error.message}`, true)));
   $("pi05-cameras")?.addEventListener("click", activateSharedCameras);
+  $("pi05-prompt")?.addEventListener("change", () => { void commitPi05Prompt(); });
+  $("pi05-prompt")?.addEventListener("input", () => {
+    clearTimeout(pi05PromptTimer);
+    pi05PromptTimer = setTimeout(() => { void commitPi05Prompt(); }, 700);
+  });
   $("pi05-start")?.addEventListener("click", startPi05);
   $("pi05-stop")?.addEventListener("click", stopPi05);
   $("pico-start")?.addEventListener("click", startPico);
@@ -1150,6 +1204,7 @@
   // can consume the same 50 Hz state cadence as the servo loop.
   setInterval(() => { void refresh(false); }, 20);
   setInterval(() => { void refresh(true); }, 500);
+  setInterval(() => { void refreshPi05State(); }, 200);
   setInterval(refreshPi05Frames, 200);
   setInterval(heartbeat, 1000);
   setInterval(() => {

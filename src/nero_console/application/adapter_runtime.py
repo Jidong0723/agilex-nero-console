@@ -89,7 +89,10 @@ class AdapterRuntime:
     def pi05_stop(self, reason: str) -> dict[str, Any]: return self.pi05.stop(reason)
     def camera_state(self) -> dict[str, Any]: return self.cameras.snapshot()
     def camera_update_config(self, body: dict[str, Any]) -> dict[str, Any]: return self.cameras.update_config(body.get("cameras", body))
-    def camera_activate(self) -> dict[str, Any]: return self.cameras.activate()
+    def camera_activate(self) -> dict[str, Any]:
+        result = self.cameras.activate()
+        self.pi05.cameras_ready()
+        return result
     def camera_deactivate(self) -> dict[str, Any]:
         if self.pi05.snapshot().get("state") == "RUNNING":
             self.pi05.stop("cameras closed by operator")

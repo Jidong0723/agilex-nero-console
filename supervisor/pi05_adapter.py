@@ -151,8 +151,8 @@ class Pi05InputAdapter:
     def _new_state(self) -> dict[str, Any]:
         return {"adapter": "pi05", "state": "IDLE", "camera_state": "IDLE", "model_state": "UNKNOWN",
                 "session_id": None, "client_id": None, "execution_mode": None, "prompt": self.config["model"]["prompt"],
-                "last_error": None, "inference_ms": None, "action_chunk": None, "action_chunk_length": 0,
-                "executed_steps": 0, "sequence": 0, "updated_at": time.time()}
+                "last_error": None, "inference_ms": None, "action_chunk": None, "action_chunk_length": 0, "chunk_sequence": 0,
+                "executed_steps": 0, "sequence": 0, "execution_enabled": False, "updated_at": time.time()}
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -199,6 +199,8 @@ class Pi05InputAdapter:
                         else:
                             self._policy = policy
                             self.state.update({"model_state": "CONNECTED", "last_error": None, "updated_at": time.time()})
+                            if self.camera_resource and self.camera_resource.snapshot().get("ready"):
+                                self._ensure_worker()
                 except Exception as exc:
                     with self.lock:
                         self.state.update({"model_state": "CONNECTING", "last_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
@@ -223,6 +225,19 @@ class Pi05InputAdapter:
                 pass
             time.sleep(.05)
         raise RuntimeError("π0.5 WebSocket is not connected")
+
+    def _ensure_worker(self) -> None:
+        with self.lock:
+            if self.worker and self.worker.is_alive():
+                return
+            self.stop_event = threading.Event()
+            self.state.update({"state": "RUNNING", "last_error": None, "updated_at": time.time()})
+            self.worker = threading.Thread(target=self._run, name="nero-pi05-input-adapter", daemon=True)
+            self.worker.start()
+
+    def cameras_ready(self) -> None:
+        """Start observation/inference once the shared camera resource is live."""
+        self._ensure_worker()
 
     def _refresh_connections_locked(self) -> None:
         if time.monotonic() - self._last_connection_probe < 1.0: return
@@ -259,7 +274,6 @@ class Pi05InputAdapter:
 
     def update_config(self, value: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
-            if self.state["state"] == "RUNNING": raise RuntimeError("stop π0.5 inference before changing configuration")
             model = value.get("model") if isinstance(value, dict) else None
             cameras = value.get("cameras") if isinstance(value, dict) else None
             if isinstance(model, dict) and "prompt" in model:
@@ -267,6 +281,7 @@ class Pi05InputAdapter:
                 if not 1 <= len(prompt) <= 500: raise ValueError("prompt must contain 1-500 characters")
                 self.config["model"]["prompt"] = prompt; self.state["prompt"] = prompt
             if isinstance(cameras, dict):
+                if self.state["state"] == "RUNNING": raise RuntimeError("stop π0.5 inference before changing cameras")
                 if self.camera_resource:
                     self.camera_resource.update_config(cameras)
                     self.config["cameras"] = copy.deepcopy(self.camera_resource.config)
@@ -285,7 +300,8 @@ class Pi05InputAdapter:
     def activate_cameras(self) -> dict[str, Any]:
         if self.camera_resource:
             self.camera_resource.activate()
-            with self.lock: self.state.update({"state": "IDLE", "camera_state": "READY", "model_state": "UNKNOWN", "last_error": None, "updated_at": time.time()})
+            with self.lock: self.state.update({"camera_state": "READY", "last_error": None, "updated_at": time.time()})
+            self._ensure_worker()
             return self.snapshot()
         with self.lock:
             if self.state["state"] == "RUNNING": raise RuntimeError("cannot change cameras while π0.5 is running")
@@ -295,36 +311,34 @@ class Pi05InputAdapter:
             self.cameras = CameraPair(self.config["cameras"])
             self.frames = {}; self.frame_version = 0; self.preview_stop = threading.Event()
             self.preview_thread = threading.Thread(target=self._preview_loop, name="nero-pi05-camera-preview", daemon=True); self.preview_thread.start()
-            self.state.update({"state": "IDLE", "camera_state": "READY", "model_state": "UNKNOWN", "last_error": None, "updated_at": time.time()})
+            self.state.update({"camera_state": "READY", "last_error": None, "updated_at": time.time()})
+            self._ensure_worker()
             return self.snapshot()
 
     def start(self, session_id: str, client_id: str) -> dict[str, Any]:
         with self.lock:
-            if self.worker and self.worker.is_alive(): raise RuntimeError("π0.5 inference is already running")
             if (self.camera_resource is not None and not self.camera_resource.snapshot()["ready"]) or (self.camera_resource is None and self.cameras is None): raise RuntimeError("activate the external and wrist cameras first")
             osc = self.osc.state(); session = osc.get("session") or {}
             if session.get("state") != "ACTIVE" or session.get("id") != session_id or session.get("client_id") != client_id:
                 raise PermissionError("π0.5 requires the caller's active OSC session")
-            self.stop_event = threading.Event()
-            self.state.update({"state": "RUNNING", "session_id": session_id, "client_id": client_id,
+            self.state.update({"state": "RUNNING", "execution_enabled": True, "session_id": session_id, "client_id": client_id,
                                "execution_mode": session.get("execution_mode"), "last_error": None, "updated_at": time.time()})
-            self.worker = threading.Thread(target=self._run, name="nero-pi05-input-adapter", daemon=True); self.worker.start()
+            self._ensure_worker()
             return self.snapshot()
 
     def stop(self, reason: str = "π0.5 adapter stopped") -> dict[str, Any]:
-        self.stop_event.set()
         with self.lock:
-            if self.state["state"] == "RUNNING": self.state["state"] = "STOPPING"
-        worker = self.worker
-        if worker and worker is not threading.current_thread(): worker.join(timeout=2.0)
-        with self.lock:
-            self.state.update({"state": "IDLE", "updated_at": time.time()})
+            self.state.update({"execution_enabled": False, "updated_at": time.time()})
             return self.snapshot()
 
     def _observation(self, osc: dict[str, Any], external: Any, wrist: Any) -> dict[str, Any]:
         import numpy as np
         pose = (osc.get("execution") or {}).get("measured_tcp_pose") or (osc.get("command") or {}).get("target_tcp")
-        if not isinstance(pose, dict): raise RuntimeError("OSC did not publish a current TCP pose")
+        # Before an OSC session is opened there may be no published target
+        # pose yet. Inference is still useful in preview mode; execution will
+        # only be enabled after a session has supplied a real measured pose.
+        if not isinstance(pose, dict):
+            pose = {"position_m": [0.0, 0.0, 0.0], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]}
         position = _finite(pose.get("position_m"), 3, "TCP position")
         # π0.5's state receives its rotation-vector representation.  The current
         # system's OSC pose is xyzw; retaining zero rotvec is unsafe, so the policy
@@ -358,8 +372,9 @@ class Pi05InputAdapter:
             while not self.stop_event.is_set():
                 started = time.monotonic(); osc = self.osc.state(); session = osc.get("session") or {}
                 with self.lock: session_id, client_id = self.state["session_id"], self.state["client_id"]
-                if session.get("state") != "ACTIVE" or session.get("id") != session_id: raise RuntimeError("OSC session ended")
-                self.osc.heartbeat(str(client_id), str(session_id))
+                with self.lock: execution_enabled = bool(self.state.get("execution_enabled"))
+                active_session = session.get("state") == "ACTIVE" and session.get("id") == session_id and session.get("client_id") == client_id
+                if active_session: self.osc.heartbeat(str(client_id), str(session_id))
                 external, wrist = self.camera_resource.read() if self.camera_resource else (self.cameras.read() if self.cameras else (_ for _ in ()).throw(RuntimeError("cameras are unavailable")))
                 response = policy.infer(self._observation(osc, external, wrist)); actions = response.get("actions") if isinstance(response, dict) else None
                 if actions is None: raise RuntimeError("OpenPI response does not contain actions")
@@ -367,8 +382,11 @@ class Pi05InputAdapter:
                 if not isinstance(rows, list) or not rows: raise RuntimeError("OpenPI Action Chunk is empty")
                 limit = min(len(rows), int(self.config["execution"]["replan_steps"]), int(self.config["execution"]["max_chunk_steps"]))
                 with self.lock:
-                    self.state.update({"action_chunk": rows, "action_chunk_length": len(rows), "inference_ms": (time.monotonic()-started)*1000., "updated_at": time.time()})
+                    self.state.update({"action_chunk": rows, "action_chunk_length": len(rows), "chunk_sequence": int(self.state.get("chunk_sequence", 0)) + 1, "inference_ms": (time.monotonic()-started)*1000., "updated_at": time.time()})
                 base = (osc.get("command") or {}).get("target_tcp") or (osc.get("execution") or {}).get("measured_tcp_pose")
+                if not execution_enabled or not active_session:
+                    self.stop_event.wait(float(self.config["execution"]["period_s"]))
+                    continue
                 period_s = float(self.config["execution"]["period_s"])
                 next_step_at = started + period_s
                 for index, action in enumerate(rows[:limit]):
