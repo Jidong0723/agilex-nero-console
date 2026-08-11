@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import ctypes
 import json
 import math
@@ -111,43 +110,6 @@ def _mat_mul(left: list[list[float]], right: list[list[float]]) -> list[list[flo
 
 def _transpose(matrix: list[list[float]]) -> list[list[float]]:
     return [[matrix[column][row] for column in range(3)] for row in range(3)]
-
-
-def normalize_session_selection(
-    mode: str | None = None,
-    execution_mode: str | None = None,
-    input_source: str | None = None,
-) -> tuple[str, str, str]:
-    """Return execution target, input source, and a legacy combo name."""
-    legacy = str(mode or "").strip().lower()
-    if execution_mode is None and input_source is None:
-        legacy_map = {
-            "shadow": ("shadow", "joystick"),
-            "hardware": ("hardware", "joystick"),
-            "joystick_hardware": ("hardware", "joystick"),
-            "pico_hardware": ("hardware", "pico"),
-            "pico_shadow": ("shadow", "pico"),
-        }
-        if legacy not in legacy_map:
-            raise ValueError("mode must be shadow, hardware, joystick_hardware, pico_hardware, or pico_shadow")
-        execution_mode, input_source = legacy_map[legacy]
-    else:
-        execution_mode = str(execution_mode or "").strip().lower()
-        input_source = str(input_source or "").strip().lower()
-        if execution_mode not in {"shadow", "hardware"}:
-            raise ValueError("execution_mode must be shadow or hardware")
-        if input_source not in {"joystick", "pico"}:
-            raise ValueError("input_source must be joystick or pico")
-        derived = {
-            ("shadow", "joystick"): "shadow",
-            ("hardware", "joystick"): "joystick_hardware",
-            ("hardware", "pico"): "pico_hardware",
-            ("shadow", "pico"): "pico_shadow",
-        }[(execution_mode, input_source)]
-        if legacy and legacy != derived:
-            raise ValueError("mode conflicts with execution_mode/input_source")
-        legacy = derived
-    return str(execution_mode), str(input_source), legacy
 
 
 class KinematicsClient:
@@ -449,20 +411,19 @@ class KinematicsClient:
                     return None
                 self._response_condition.wait(timeout=min(remaining, 0.001))
 
-    def poll(self, epoch: int, anchor_id: int | None = None, reference_revision: int | None = None, max_reference_lag: int = 1) -> dict[str, Any] | None:
+    def poll(self, epoch: int, target_generation: int | None = None, max_target_lag: int = 1) -> dict[str, Any] | None:
         # A continuously updated target normally receives its Pink result one
         # control tick later.  Permit that bounded lag, but reject an older
         # result so a hold can never continue integrating a trajectory-era
         # velocity batch.
-        max_reference_lag = max(0, int(max_reference_lag))
+        max_target_lag = max(0, int(max_target_lag))
         latest = self._pending_solver_response
         self._pending_solver_response = None
         if latest is not None:
             if (
                 int(latest.get("motion_epoch", -1)) == int(epoch)
-                and (anchor_id is None or int(latest.get("anchor_id", -1)) == int(anchor_id))
-                and (reference_revision is None or int(latest.get("reference_revision", -1)) >= int(reference_revision) - max_reference_lag)
-                and (reference_revision is None or int(latest.get("reference_revision", -1)) <= int(reference_revision))
+                and (target_generation is None or int(latest.get("target_generation", -1)) >= int(target_generation) - max_target_lag)
+                and (target_generation is None or int(latest.get("target_generation", -1)) <= int(target_generation))
             ):
                 self._last_response_request_id = int(latest.get("solver_request_id", 0) or 0)
                 return latest
@@ -478,16 +439,14 @@ class KinematicsClient:
                 "ok": candidate.get("ok"),
                 "error": candidate.get("error"),
                 "motion_epoch": candidate.get("motion_epoch"),
-                "anchor_id": candidate.get("anchor_id"),
-                "reference_revision": candidate.get("reference_revision"),
+                "target_generation": candidate.get("target_generation"),
             }
             if (
                 int(candidate.get("motion_epoch", -1)) == int(epoch)
                 and request_id <= self._solver_request_id
                 and request_id > self._last_response_request_id
-                and (anchor_id is None or int(candidate.get("anchor_id", -1)) == int(anchor_id))
-                and (reference_revision is None or int(candidate.get("reference_revision", -1)) >= int(reference_revision) - max_reference_lag)
-                and (reference_revision is None or int(candidate.get("reference_revision", -1)) <= int(reference_revision))
+                and (target_generation is None or int(candidate.get("target_generation", -1)) >= int(target_generation) - max_target_lag)
+                and (target_generation is None or int(candidate.get("target_generation", -1)) <= int(target_generation))
             ):
                 latest = candidate
                 self._last_response_request_id = request_id
@@ -500,9 +459,8 @@ class KinematicsClient:
     def poll_until(
         self,
         epoch: int,
-        anchor_id: int | None = None,
-        reference_revision: int | None = None,
-        max_reference_lag: int = 0,
+        target_generation: int | None = None,
+        max_target_lag: int = 0,
         timeout_s: float = 0.0,
     ) -> dict[str, Any] | None:
         """Wait briefly for a fresh Pink response without extending a servo tick.
@@ -515,7 +473,7 @@ class KinematicsClient:
         """
         deadline = time.monotonic() + max(0.0, float(timeout_s))
         while True:
-            result = self.poll(epoch, anchor_id, reference_revision, max_reference_lag)
+            result = self.poll(epoch, target_generation, max_target_lag)
             if result is not None or time.monotonic() >= deadline:
                 return result
             time.sleep(0.0005)
@@ -812,10 +770,6 @@ class OperationalSpaceServo:
         self.ruckig = ruckig
         self.broker, self.root, self.config = broker, project_root, config
         self.limits, self.runtime = config.get("limits", {}), config.get("runtime", {})
-        pose_input = config.get("pose_input", {})
-        self.position_axis_map = _matrix3(pose_input.get("position_axis_map", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]), "position_axis_map")
-        self.orientation_axis_map = _matrix3(pose_input.get("orientation_axis_map", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]), "orientation_axis_map")
-        self.pose_input = pose_input
         self.solver = KinematicsClient(project_root, config)
         self.authority = JointLimitAuthority(self.solver.urdf, config)
         self.supervisor = SafetySupervisor(config.get("safety_supervisor", {}))
@@ -828,18 +782,10 @@ class OperationalSpaceServo:
         self.last_error: str | None = None
         self.input_enabled = False
         self._heartbeat_monotonic_ns = 0
-        self.intent: dict[str, Any] | None = None
-        self.anchor_id = 0
-        self.reference_revision = 0
-        self.clutch_active = False
-        self.absolute_target_active = False
-        self.absolute_target_mode: str | None = None
-        self.input_source: str | None = None
-        self.tcp_anchor: dict[str, list[float]] | None = None
+        self.command: dict[str, Any] | None = None
+        self.target_generation = 0
         self.reference_pose: dict[str, list[float]] | None = None
-        self.relative_pose: dict[str, list[float]] = {"position_m": [0.0, 0.0, 0.0], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]}
         self.motion_epoch = 0
-        self.filtered_velocity = [0.0] * 6
         self.last_sent_velocity = [0.0] * 7
         self.trajectory: dict[str, list[float]] | None = None
         self.ruckig_input = None
@@ -928,9 +874,7 @@ class OperationalSpaceServo:
             "state": session.get("state", "IDLE"),
             "id": session.get("session_id"),
             "client_id": session.get("client_id"),
-            "mode": session.get("mode"),
-            "execution_mode": session.get("execution_mode", "shadow" if session.get("mode") == "shadow" else "hardware" if session.get("mode") else None),
-            "input_source": session.get("input_source", "pico" if session.get("mode") == "pico_hardware" else "joystick" if session.get("mode") else None),
+            "execution_mode": session.get("execution_mode"),
             "sequence": session.get("sequence", 0),
             "last_input_age_s": session.get("last_input_age_s"),
         }
@@ -948,61 +892,20 @@ class OperationalSpaceServo:
         position = pose["position_m"]
         lower = _finite_vector(self.limits.get("workspace_min_m", [-0.45, -0.45, -0.01]), 3, "workspace_min_m")
         upper = _finite_vector(self.limits.get("workspace_max_m", [0.45, 0.60, 0.70]), 3, "workspace_max_m")
-        anchor_position = (self.tcp_anchor or {}).get("position_m")
         for index, (item, low, high) in enumerate(zip(position, lower, upper)):
-            if low <= item <= high:
-                continue
-            # If the current task-point anchor is already just outside the
-            # nominal box, allow that exact hold coordinate so the first
-            # already just outside the nominal box, allow that exact hold
-            # coordinate so clutch_begin/first pose cannot deadman-brake the
-            # arm.  Any subsequent excursion in that axis remains rejected.
-            if not anchor_position or abs(float(item) - float(anchor_position[index])) > 1e-6:
+            if not low <= item <= high:
                 return False
         min_tcp_z = float(self.limits.get("min_tcp_z_m", lower[2]))
-        if position[2] < min_tcp_z and (not anchor_position or abs(float(position[2]) - float(anchor_position[2])) > 1e-6):
+        if position[2] < min_tcp_z:
             return False
         return True
-
-    def _reference_from_relative(self, relative: dict[str, list[float]], scale: float) -> dict[str, list[float]]:
-        if self.tcp_anchor is None:
-            raise RuntimeError("teleop clutch anchor is unavailable")
-        position = _finite_vector(relative.get("position_m"), 3, "relative_pose.position_m")
-        orientation = _unit_quaternion(relative.get("orientation_xyzw"), "relative_pose.orientation_xyzw")
-        max_translation = float(self.pose_input.get("max_relative_translation_m", 0.25))
-        max_rotation = float(self.pose_input.get("max_relative_rotation_rad", 1.0472))
-        if math.sqrt(sum(item * item for item in position)) > max_translation:
-            raise ValueError("relative pose translation exceeds configured limit")
-        if _quat_angle(orientation) > max_rotation:
-            raise ValueError("relative pose rotation exceeds configured limit")
-        translation_gain = float(self.pose_input.get("translation_gain", 1.0)) * scale
-        rotation_gain = float(self.pose_input.get("rotation_gain", 1.0)) * scale
-        mapped_position = _mat_vec(self.position_axis_map, position)
-        mapped_position = [item * translation_gain for item in mapped_position]
-        mapped_rotation = _mat_mul(_mat_mul(self.orientation_axis_map, _quat_to_matrix(orientation)), _transpose(self.orientation_axis_map))
-        mapped_orientation = _quat_scale(_matrix_to_quat(mapped_rotation), rotation_gain)
-        anchor_position = self.tcp_anchor["position_m"]
-        return {
-            "position_m": [anchor_position[index] + mapped_position[index] for index in range(3)],
-            "orientation_xyzw": _unit_quaternion(_quat_multiply(self.tcp_anchor["orientation_xyzw"], mapped_orientation)),
-        }
-
-    def _set_anchor_locked(self, joints: list[float], source: str) -> int:
-        self.tcp_anchor = self._current_tcp_pose(joints)
-        self.reference_pose = dict(self.tcp_anchor)
-        self.relative_pose = {"position_m": [0.0, 0.0, 0.0], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]}
-        self.anchor_id += 1
-        self.reference_revision += 1
-        self.clutch_active = True
-        self.input_source = source
-        return self.anchor_id
 
     def _invalidate_motion(self, reason: str) -> None:
         # This is a P1 braking request, not an ownership transfer. The active
         # epoch remains valid long enough for Ruckig to transmit the braking
         # curve. Ownership transfers use freeze_for_authority_change().
         session = dict(self.session or {})
-        if session.get("execution_mode", "shadow" if session.get("mode") == "shadow" else "hardware") != "shadow":
+        if session.get("execution_mode") != "shadow":
             # This method is also called while ``self.lock`` is held by the
             # servo loop and the HTTP intent handler.  Authority transitions
             # acquire supervisor/transport locks and can be called back by
@@ -1015,16 +918,9 @@ class OperationalSpaceServo:
                 name="teleop-stop-authority",
                 daemon=True,
             ).start()
-        self.intent = None
-        self.clutch_active = False
-        self.absolute_target_active = False
-        self.absolute_target_mode = None
-        self.anchor_id += 1
-        self.reference_revision += 1
-        self.tcp_anchor = None
+        self.command = None
+        self.target_generation += 1
         self.reference_pose = None
-        self.relative_pose = {"position_m": [0.0, 0.0, 0.0], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]}
-        self.filtered_velocity = [0.0] * 6
         self.trajectory_state = "BRAKING"
         self.trajectory_brake_reason = reason
 
@@ -1035,10 +931,8 @@ class OperationalSpaceServo:
             self.solver.discard_before_epoch(self.motion_epoch)
             if self.session:
                 self.session["motion_epoch"] = self.motion_epoch
-            self.intent = None
-            self.absolute_target_active = False
-            self.absolute_target_mode = None
-            self.filtered_velocity = [0.0] * 6
+            self.command = None
+            self.target_generation += 1
             self.input_enabled = False
             self.feedback_sync_pending = True
             self.needs_resync = True
@@ -1059,37 +953,28 @@ class OperationalSpaceServo:
 
     def start_session(
         self,
-        mode: str | None = None,
-        confirm_hardware: bool = False,
         client_id: str = "anonymous",
-        execution_mode: str | None = None,
-        input_source: str | None = None,
+        execution_mode: str = "shadow",
     ) -> dict[str, Any]:
-        execution_mode, input_source, mode = normalize_session_selection(mode, execution_mode, input_source)
+        execution_mode = str(execution_mode).strip().lower()
+        if execution_mode not in {"shadow", "hardware"}:
+            raise ValueError("execution_mode must be shadow or hardware")
         client_id = str(client_id).strip() or "anonymous"
-        if execution_mode == "hardware" and input_source == "pico" and not bool(self.pose_input.get("mapping_verified", False)):
-            raise PermissionError("PICO pose mapping is not verified")
-        # Hardware mode is selected explicitly in the mode control. The
-        # legacy confirm_hardware argument remains accepted for API
-        # compatibility, but no longer blocks session startup.
         with self._session_transition_lock:
             session_id = uuid.uuid4().hex
             with self.lock:
                 active = self._session_active()
-                active_mode = str((self.session or {}).get("mode", "")) if active else None
                 active_client = str((self.session or {}).get("client_id", "anonymous"))
                 heartbeat_age = (time.monotonic_ns() - self._heartbeat_monotonic_ns) / 1e9 if self._heartbeat_monotonic_ns else float("inf")
             if active and heartbeat_age > float(self.config.get("session_timeout_s", 5.0)):
-                self.stop_session("teleop session heartbeat expired")
-                active_mode = None
-            if active_mode == mode and active_client != client_id:
-                raise PermissionError("teleop session is owned by another browser client")
-            if active_mode == mode:
+                self.stop_session("OSC session heartbeat expired")
+                active = False
+            if active and active_client != client_id:
+                raise PermissionError("OSC session is owned by another client")
+            if active:
                 return self.status()
-            if active_mode:
-                raise RuntimeError("an active teleop session must be stopped before changing mode")
             self.last_error = None
-            self.session = {"state": "STARTING", "session_id": None, "client_id": client_id, "mode": mode, "sequence": 0}
+            self.session = {"state": "STARTING", "session_id": None, "client_id": client_id, "execution_mode": execution_mode, "sequence": 0}
             self._bump_state()
             try:
                 if execution_mode == "shadow":
@@ -1128,7 +1013,7 @@ class OperationalSpaceServo:
                 self._feedback_thread = None
                 with self.lock:
                     self.session = None
-                    self.intent = None
+                    self.command = None
                     self.input_enabled = False
                     self.last_error = f"teleop start failed: {type(exc).__name__}: {exc}"
                     self.last_result = {"ok": False, "reason": self.last_error, "timestamp": time.time(), "robot_commands_sent": False}
@@ -1144,7 +1029,7 @@ class OperationalSpaceServo:
                 self._feedback_thread = None
                 with self.lock:
                     self.session = None
-                    self.intent = None
+                    self.command = None
                     self.input_enabled = False
                     self.last_error = "teleop tracking authority could not be granted"
                     self.last_result = {"ok": False, "reason": self.last_error, "timestamp": time.time(), "robot_commands_sent": False}
@@ -1173,14 +1058,10 @@ class OperationalSpaceServo:
                                             "measurement_error_rad": [0.0] * 7, "correction_rad": [0.0] * 7}
                 self.motion_epoch = int(broker_authority["control_epoch"]) if execution_mode != "shadow" else self.motion_epoch
                 self.solver.discard_before_epoch(self.motion_epoch)
-                self.session = {"state": "ACTIVE", "session_id": session_id, "client_id": client_id, "mode": mode, "execution_mode": execution_mode, "input_source": input_source, "started_at": time.time(), "sequence": 0, "last_input_age_s": None, "motion_epoch": self.motion_epoch}
-                self.intent = None
-                self.anchor_id += 1
-                self.clutch_active = False
-                self.input_source = input_source
-                self.tcp_anchor = self._current_tcp_pose([float(x) for x in joints])
-                self.reference_pose = dict(self.tcp_anchor)
-                self.relative_pose = {"position_m": [0.0, 0.0, 0.0], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]}
+                self.session = {"state": "ACTIVE", "session_id": session_id, "client_id": client_id, "execution_mode": execution_mode, "started_at": time.time(), "sequence": 0, "last_input_age_s": None, "motion_epoch": self.motion_epoch}
+                self.command = None
+                self.target_generation += 1
+                self.reference_pose = self._current_tcp_pose([float(x) for x in joints])
                 self.input_enabled = True
                 self._heartbeat_monotonic_ns = time.monotonic_ns()
                 self.trajectory_state, self.trajectory_brake_reason, self.feedback_sync_pending = "HOLD_READY", None, True
@@ -1212,18 +1093,17 @@ class OperationalSpaceServo:
                     break
             time.sleep(0.02)
         with self.lock:
-            mode = (self.session or {}).get("mode")
             # A remembered hardware session is not proof that CPV still owns
             # the controller.  Sending a CPV sample after HOLD would initialise
             # CPV again, creating an unnecessary mode transition.
             cpv_stream_active = bool(
-            (self.session or {}).get("execution_mode", "shadow" if mode == "shadow" else "hardware") != "shadow" and self.broker.teleop_stream_active()
+            (self.session or {}).get("execution_mode") != "shadow" and self.broker.teleop_stream_active()
             )
             if self.session:
                 self.session.update({"state": "STOPPING", "stopped_reason": reason})
             self.input_enabled = False
             self._bump_state()
-            self.stop_event.set(); self._feedback_stop.set(); self.intent = None
+            self.stop_event.set(); self._feedback_stop.set(); self.command = None
         servo_thread, feedback_thread = self.thread, self._feedback_thread
         if servo_thread and servo_thread is not threading.current_thread(): servo_thread.join(timeout=1.0)
         if feedback_thread and feedback_thread is not threading.current_thread(): feedback_thread.join(timeout=1.0)
@@ -1260,7 +1140,7 @@ class OperationalSpaceServo:
         """
         with self.lock:
             session = dict(self.session or {})
-            execution_mode = session.get("execution_mode", "shadow" if session.get("mode") == "shadow" else "hardware")
+            execution_mode = session.get("execution_mode")
             if not self._session_active() or execution_mode != "shadow":
                 raise RuntimeError("shadow HOLD requires an active shadow OSC session")
             self._invalidate_motion(reason)
@@ -1282,8 +1162,7 @@ class OperationalSpaceServo:
             self.solver.discard_before_epoch(self.motion_epoch)
             if self.session:
                 self.session.update({"state": "STOPPING", "stopped_reason": reason, "motion_epoch": self.motion_epoch})
-            self.intent = None
-            self.filtered_velocity = [0.0] * 6
+            self.command = None
             self.input_enabled = False
             self.feedback_sync_pending = True
             self.needs_resync = True
@@ -1322,23 +1201,6 @@ class OperationalSpaceServo:
             "zero_velocity_sent": False,
         }
         return result
-
-    def recenter(self) -> dict[str, Any]:
-        with self.lock:
-            if not self._session_active():
-                raise RuntimeError("teleop session is not active")
-            if self.clutch_active:
-                raise PermissionError("release the clutch before recentering")
-            q = list(self.shadow_joints or []) if self.session.get("execution_mode", self.session.get("mode")) == "shadow" else list((self._feedback_snapshot() or {}).get("joints") or [])
-            if len(q) != 7:
-                raise RuntimeError("teleop recenter requires seven-joint feedback")
-            self.tcp_anchor = self._current_tcp_pose(q)
-            self.reference_pose = dict(self.tcp_anchor)
-            self.relative_pose = {"position_m": [0.0, 0.0, 0.0], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]}
-            self.anchor_id += 1
-            self.reference_revision += 1
-            self._bump_state()
-        return self.status()
 
     def submit_absolute_target(self, body: dict[str, Any], *, mode: str) -> dict[str, Any]:
         """Accept a base-frame TCP target without any clutch semantics."""
@@ -1400,20 +1262,17 @@ class OperationalSpaceServo:
             now_ns = time.monotonic_ns()
             self.reference_pose = reference
             if not same_reference:
-                self.reference_revision += 1
+                self.target_generation += 1
                 self._target_changed_monotonic_ns = now_ns
                 self._arrival_since_monotonic_ns = 0
                 self._arrival_reached = False
-            self.intent = {
+            self.command = {
                 "sequence": sequence,
                 "host_monotonic_ns": time.monotonic_ns(),
-                "reference_revision": self.reference_revision,
+                "target_generation": self.target_generation,
                 "reference_pose": dict(reference),
-                "persistent": True,
                 "osc_mode": mode,
             }
-            self.absolute_target_active = True
-            self.absolute_target_mode = mode
             self._bump_state()
             return {
                 "accepted": True,
@@ -1422,100 +1281,6 @@ class OperationalSpaceServo:
                 "target_pose": reference,
                 "mode": mode,
             }
-
-    def submit_intent(self, body: dict[str, Any]) -> dict[str, Any]:
-        with self.lock:
-            if not self._session_active():
-                raise RuntimeError("teleop session is not active")
-            trusted_pico = bool(body.pop("_trusted_pico", False))
-            if self.session.get("input_source", "pico" if self.session.get("mode") == "pico_hardware" else "joystick") == "pico" and not trusted_pico:
-                raise PermissionError("PICO mode only accepts the paired WebSocket input")
-            client_id = str(body.get("client_id", "anonymous")).strip() or "anonymous"
-            if client_id != str(self.session.get("client_id", "anonymous")):
-                raise PermissionError("teleop intent rejected: session belongs to another browser client")
-            sequence = int(body.get("sequence", -1))
-            if sequence <= int(self.session.get("sequence", 0)):
-                return {"accepted": False, "reason": "stale sequence", "accepted_sequence": self.session["sequence"], "session_id": self.session["session_id"]}
-            if "tcp_velocity" in body:
-                raise ValueError("tcp_velocity is deprecated; submit a clutch pose intent")
-            event = str(body.get("event", "pose"))
-            scale = float(body.get("pose_scale", body.get("speed_scale", 1.0)))
-            if not 0.05 <= scale <= 1.0: raise ValueError("pose_scale must be within [0.05, 1]")
-            if str(body.get("session_id", self.session["session_id"])) != str(self.session["session_id"]):
-                raise PermissionError("teleop intent rejected: session id mismatch")
-            if self.trajectory_state == "FAULT":
-                raise PermissionError(f"teleop input rejected: FAULT ({self.trajectory_brake_reason or 'trajectory fault'})")
-            if event == "clutch_begin":
-                if self.trajectory_state != "HOLD_READY":
-                    raise PermissionError("teleop clutch can begin only from HOLD_READY")
-                resumed, reason = self._resume_from_hold_locked()
-                if not resumed:
-                    raise PermissionError(f"teleop input rejected: cannot resume from HOLD_READY ({reason})")
-                q = list(self.shadow_joints or []) if self.session.get("execution_mode", self.session.get("mode")) == "shadow" else list((self._feedback_snapshot() or {}).get("joints") or [])
-                if len(q) != 7:
-                    raise PermissionError("teleop clutch cannot anchor without seven-joint feedback")
-                anchor = self._set_anchor_locked(q, "pico" if trusted_pico else "joystick")
-                self.session["sequence"] = sequence
-                self.intent = {"sequence": sequence, "host_monotonic_ns": time.monotonic_ns(), "anchor_id": anchor, "reference_revision": self.reference_revision, "reference_pose": dict(self.reference_pose or {}), "pose_scale": scale}
-                self._bump_state()
-                return {"accepted": True, "event": event, "anchor_id": anchor, "accepted_sequence": sequence, "session_id": self.session["session_id"]}
-            if event == "clutch_release":
-                if int(body.get("anchor_id", -1)) != self.anchor_id:
-                    raise PermissionError("teleop clutch release rejected: anchor id mismatch")
-                self.session["sequence"] = sequence
-                self._invalidate_motion("clutch released")
-                self._bump_state()
-                return {"accepted": True, "event": event, "accepted_sequence": sequence, "session_id": self.session["session_id"]}
-            if event != "pose":
-                raise ValueError("teleop event must be clutch_begin, pose, or clutch_release")
-            if not self.clutch_active or self.trajectory_state != "RUNNING":
-                raise PermissionError("teleop pose rejected: clutch is not active")
-            if int(body.get("anchor_id", -1)) != self.anchor_id:
-                raise PermissionError("teleop pose rejected: anchor id mismatch")
-            relative = dict(body.get("relative_pose") or {})
-            if trusted_pico and body.get("tracking_valid") is False:
-                self._invalidate_motion("PICO tracking is invalid")
-                raise PermissionError("teleop pose rejected: PICO tracking is invalid")
-            previous = self.relative_pose
-            position_candidate = _finite_vector(relative.get("position_m"), 3, "relative_pose.position_m")
-            orientation_candidate = _unit_quaternion(relative.get("orientation_xyzw"), "relative_pose.orientation_xyzw")
-            packet_translation = math.sqrt(sum((position_candidate[index] - previous["position_m"][index]) ** 2 for index in range(3)))
-            packet_rotation = _quat_angle(_quat_multiply(_quat_conjugate(previous["orientation_xyzw"]), orientation_candidate))
-            if packet_translation > float(self.pose_input.get("max_packet_translation_m", 0.05)) or packet_rotation > float(self.pose_input.get("max_packet_rotation_rad", 0.35)):
-                self._invalidate_motion("pose input discontinuity")
-                raise PermissionError("teleop pose rejected: pose input discontinuity")
-            reference = self._reference_from_relative(relative, scale)
-            if not self._pose_in_workspace(reference):
-                self._invalidate_motion("reference pose is outside the configured workspace")
-                raise PermissionError("teleop pose rejected: reference pose is outside the configured workspace")
-            old_reference = self.reference_pose or {}
-            old_position = old_reference.get("position_m") or []
-            old_orientation = old_reference.get("orientation_xyzw") or []
-            reference_changed = (
-                len(old_position) != 3
-                or len(old_orientation) != 4
-                or max(abs(float(a) - float(b)) for a, b in zip(reference["position_m"], old_position)) > 1e-9
-                or _quat_angle(_quat_multiply(_quat_conjugate(_unit_quaternion(old_orientation)), reference["orientation_xyzw"])) > 1e-8
-            )
-            self.session["sequence"] = sequence
-            self.relative_pose = {"position_m": position_candidate, "orientation_xyzw": orientation_candidate}
-            self.reference_pose = reference
-            if reference_changed:
-                self.reference_revision += 1
-            self.intent = {"sequence": sequence, "host_monotonic_ns": time.monotonic_ns(), "anchor_id": self.anchor_id, "reference_revision": self.reference_revision, "reference_pose": dict(reference), "pose_scale": scale}
-            self._bump_state()
-            return {"accepted": True, "accepted_sequence": sequence, "session_id": self.session["session_id"], "accepted_monotonic_ns": self.intent["host_monotonic_ns"]}
-
-    def submit_pico_intent(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Trusted ingress used only by the paired PICO WebSocket gateway."""
-        with self.lock:
-            if not self._session_active() or self.session.get("input_source", "pico" if self.session.get("mode") == "pico_hardware" else "joystick") != "pico":
-                raise PermissionError("PICO input rejected: no active PICO session")
-            payload = dict(body)
-            payload["_trusted_pico"] = True
-            payload["client_id"] = str(self.session.get("client_id", "anonymous"))
-            payload["session_id"] = str(self.session.get("session_id", ""))
-        return self.submit_intent(payload)
 
     def heartbeat(self, client_id: str, session_id: str) -> dict[str, Any]:
         with self.lock:
@@ -1648,7 +1413,7 @@ class OperationalSpaceServo:
         with self.lock:
             debug_fn = getattr(self.solver, "debug_status", None)
             debug = debug_fn() if callable(debug_fn) else {}
-            return {"state_sequence": self.state_sequence, "session": self._session_view(), "intent": dict(self.intent) if self.intent else None, "input_enabled": self.input_enabled, "input_source": self.input_source, "clutch_active": self.clutch_active, "anchor_id": self.anchor_id, "reference_revision": self.reference_revision, "tcp_anchor": dict(self.tcp_anchor) if self.tcp_anchor else None, "relative_pose": dict(self.relative_pose), "reference_pose": dict(self.reference_pose) if self.reference_pose else None, "last_error": self.last_error, "last_result": dict(self.last_result), "last_output": dict(self.last_output), "execution_sample": dict(self.execution_sample) if self.execution_sample else None, "arrival": {"reached": self._arrival_reached, "stable_since_monotonic_ns": self._arrival_since_monotonic_ns or None, "target_generation": self.reference_revision}, "pose_mapping_verified": bool(self.pose_input.get("mapping_verified", False)), "solver": {"running": bool(self.solver.process and self.solver.process.poll() is None), "python": str(self.solver.python), "tcp_verified": True, "debug": debug}, "workspace": {"min_xyz_m": list(self.limits.get("workspace_min_m", [-0.45, -0.15, -0.02])), "max_xyz_m": list(self.limits.get("workspace_max_m", [0.45, 0.60, 0.70])), "min_tcp_z_m": float(self.limits.get("min_tcp_z_m", -0.02))}, "diagnostics": {"trajectory_state": self.trajectory_state, "trajectory_brake_reason": self.trajectory_brake_reason, "motion_epoch": self.motion_epoch, "needs_resync": self.needs_resync, "last_sent_velocity_rad_s": list(self.last_sent_velocity), "trajectory": dict(self.trajectory) if self.trajectory else None, "state_estimator": dict(self._estimator_snapshot), "shadow_transport": self.shadow_plant.diagnostics() if self.shadow_plant else {"enabled": False}, "cpv_parameters": dict(self._cpv_parameters), "limit_authority": dict(self.authority.effective) if self.authority.effective else None, "supervisor": dict(self.supervisor.limit_data) if self.supervisor.limit_data else None, "timing": dict(self._timing), "cycle_trace": self._trace_public(), "loop_count": self.loop_count, "output_count": self.output_count, "cpv_dispatch_count": self.cpv_send_count, "recent_cpv_batches": list(self._batch_history)[-10:]}}
+            return {"state_sequence": self.state_sequence, "session": self._session_view(), "command": dict(self.command) if self.command else None, "input_enabled": self.input_enabled, "target_generation": self.target_generation, "reference_pose": dict(self.reference_pose) if self.reference_pose else None, "last_error": self.last_error, "last_result": dict(self.last_result), "last_output": dict(self.last_output), "execution_sample": dict(self.execution_sample) if self.execution_sample else None, "arrival": {"reached": self._arrival_reached, "stable_since_monotonic_ns": self._arrival_since_monotonic_ns or None, "target_generation": self.target_generation}, "solver": {"running": bool(self.solver.process and self.solver.process.poll() is None), "python": str(self.solver.python), "tcp_verified": True, "debug": debug}, "workspace": {"min_xyz_m": list(self.limits.get("workspace_min_m", [-0.45, -0.15, -0.02])), "max_xyz_m": list(self.limits.get("workspace_max_m", [0.45, 0.60, 0.70])), "min_tcp_z_m": float(self.limits.get("min_tcp_z_m", -0.02))}, "diagnostics": {"trajectory_state": self.trajectory_state, "trajectory_brake_reason": self.trajectory_brake_reason, "motion_epoch": self.motion_epoch, "needs_resync": self.needs_resync, "last_sent_velocity_rad_s": list(self.last_sent_velocity), "trajectory": dict(self.trajectory) if self.trajectory else None, "state_estimator": dict(self._estimator_snapshot), "shadow_transport": self.shadow_plant.diagnostics() if self.shadow_plant else {"enabled": False}, "cpv_parameters": dict(self._cpv_parameters), "limit_authority": dict(self.authority.effective) if self.authority.effective else None, "supervisor": dict(self.supervisor.limit_data) if self.supervisor.limit_data else None, "timing": dict(self._timing), "cycle_trace": self._trace_public(), "loop_count": self.loop_count, "output_count": self.output_count, "cpv_dispatch_count": self.cpv_send_count, "recent_cpv_batches": list(self._batch_history)[-10:]}}
 
     def kinematics(self) -> dict[str, Any]:
         return {"schema_version": "nero.teleop.v1", "tcp_verified": True, "tcp_offset_m": self.config.get("tcp", {}).get("offset_from_link7_m"), "last_result": dict(self.last_result), "shadow_default": True}
@@ -1756,9 +1521,9 @@ class OperationalSpaceServo:
             actual_dt = period if previous_tick is None else max(0.001, tick - previous_tick); previous_tick = tick
             try:
                 with self.lock:
-                    session = dict(self.session) if self.session else None; intent = dict(self.intent) if self.intent else None; self.loop_count += 1
+                    session = dict(self.session) if self.session else None; command = dict(self.command) if self.command else None; self.loop_count += 1
                 if not session or session.get("state") != "ACTIVE": continue
-                shadow = session.get("execution_mode", "shadow" if session.get("mode") == "shadow" else "hardware") == "shadow"
+                shadow = session.get("execution_mode") == "shadow"
                 feedback = None if shadow else self._feedback_snapshot()
                 if shadow:
                     if self.shadow_plant is not None:
@@ -1779,15 +1544,10 @@ class OperationalSpaceServo:
                     self._fault_zero("seven-joint measured feedback unavailable", shadow); continue
                 soft_stale = feedback_age > float(self.limits.get("feedback_soft_stale_s", 0.06))
                 hard_stale = feedback_age > float(self.limits.get("feedback_hard_stale_s", 0.15))
-                age = float("inf") if not intent else max(0.0, (time.monotonic_ns() - int(intent["host_monotonic_ns"])) / 1e9)
-                # OSC absolute targets are persistent setpoints. Clutch is a
-                # legacy input-adapter concern and is never required by OSC.
-                persistent_target = bool((intent or {}).get("persistent"))
-                deadman = bool(self.clutch_active or self.absolute_target_active)
-                valid_input = bool(intent) and (persistent_target or age <= float(self.limits.get("deadman_timeout_s", 0.25)))
+                age = float("inf") if not command else max(0.0, (time.monotonic_ns() - int(command["host_monotonic_ns"])) / 1e9)
                 with self.lock:
                     if self.session: self.session["last_input_age_s"] = age if math.isfinite(age) else None
-                    explicit_nonzero = bool(self.clutch_active and intent)
+                    command_active = bool(command)
                     state_before_input_check = self.trajectory_state
                     heartbeat_age = (
                         max(0.0, (time.monotonic_ns() - self._heartbeat_monotonic_ns) / 1e9)
@@ -1812,23 +1572,19 @@ class OperationalSpaceServo:
                         # A persistent OSC target is never permission to run
                         # unattended.  The browser heartbeat is the owner
                         # lease; immediately brake it when that lease expires.
-                        self._invalidate_motion("teleop session heartbeat expired")
-                    elif self.trajectory_state == "RUNNING" and intent and (not valid_input or not deadman):
-                        self._invalidate_motion("input timed out" if not valid_input else "clutch released")
+                        self._invalidate_motion("OSC session heartbeat expired")
                     # A stationary session has no active motion to protect.
                     # Keep an old sample visible while HOLD_READY; the next
                     # nonzero input still performs its own freshness check.
                     motion_or_brake_active = (
                         brake_is_still_moving
-                        or (state_before_input_check == "RUNNING" and explicit_nonzero)
+                        or (state_before_input_check == "RUNNING" and command_active)
                     )
                     if hard_stale and motion_or_brake_active:
                         self.trajectory_state, self.trajectory_brake_reason = "FAULT", "feedback hard stale"
                         self.input_enabled = False
                     state = self.trajectory_state; epoch = self.motion_epoch
-                # HOLD_READY is a frozen state.  It must not integrate or
-                # resynchronise until submit_intent receives a fresh deadman
-                # input from the owning client.
+                # HOLD_READY is a frozen state until a fresh absolute OSC target arrives.
                 if state == "HOLD_READY":
                     with self.lock:
                         self._timing = {
@@ -1843,12 +1599,12 @@ class OperationalSpaceServo:
                             "gate_ok": True,
                         }
                     reason = (
-                        "HOLD_READY; feedback temporarily stale; waiting for fresh deadman"
-                        if hard_stale else "HOLD_READY; waiting for fresh deadman"
+                        "HOLD_READY; feedback temporarily stale; waiting for fresh target"
+                        if hard_stale else "HOLD_READY; waiting for fresh target"
                     )
                     self._set_result(False, reason, robot_commands_sent=False)
                     continue
-                target_pose = dict((intent or {}).get("reference_pose") or self.reference_pose or {})
+                target_pose = dict((command or {}).get("reference_pose") or self.reference_pose or {})
                 if state != "RUNNING" or not target_pose:
                     # Braking must not issue a second asynchronous FK request
                     # while session shutdown is closing the Pink bridge. The
@@ -1870,8 +1626,7 @@ class OperationalSpaceServo:
                     continue
                 data = self.supervisor._require()
                 cycle_started_perf_ns = time.perf_counter_ns()
-                anchor_id = int((intent or {}).get("anchor_id", self.anchor_id))
-                reference_revision = int((intent or {}).get("reference_revision", self.reference_revision))
+                target_generation = int((command or {}).get("target_generation", self.target_generation))
                 self.control_sample_id += 1
                 sample_id = self.control_sample_id
                 now_ns = time.monotonic_ns()
@@ -1881,16 +1636,16 @@ class OperationalSpaceServo:
                 # OSC accepts an absolute TCP setpoint.  Never extrapolate a
                 # jittery, paused, or discontinuous adapter stream beyond
                 # that setpoint; Pink receives exactly what the adapter sent.
-                request = {"sequence": int((intent or {}).get("sequence", session.get("sequence", 0))), "control_sample_id": sample_id, "target_generation": reference_revision, "motion_epoch": epoch, "anchor_id": anchor_id, "reference_revision": reference_revision, "joint_angles_rad": q, "measured_joint_angles_rad": measured_q, "joint_state_monotonic_ns": now_ns, "target_position_m": target_pose["position_m"], "target_orientation_xyzw": target_pose["orientation_xyzw"], "command_target_position_m": target_pose["position_m"], "command_target_orientation_xyzw": target_pose["orientation_xyzw"], "last_sent_joint_velocity_rad_s": self.last_sent_velocity, "joint_speed_limit_rad_s": data["speed_rad_s"], "joint_acceleration_limit_rad_s2": data["acceleration_rad_s2"], "soft_lower_rad": data["soft_lower_rad"], "soft_upper_rad": data["soft_upper_rad"], "posture_reference_rad": self.posture_reference or q, "posture_cost": float(self.config.get("solver", {}).get("posture_cost", 0.005)), "damping_cost": float(self.config.get("solver", {}).get("damping_cost", 0.05)), "frame_position_cost": float(self.config.get("solver", {}).get("frame_position_cost", 10.0)), "frame_orientation_cost": float(self.config.get("solver", {}).get("frame_orientation_cost", 1.0)), "frame_gain": float(self.config.get("solver", {}).get("frame_gain", 0.5)), "frame_lm_damping": float(self.config.get("solver", {}).get("frame_lm_damping", 0.0)), "joint_center_cost": float(self.config.get("solver", {}).get("joint_center_cost", 0.0)), "joint_center_deadband": float(self.config.get("solver", {}).get("joint_center_deadband", 0.70)), "feedback_limit_tolerance_rad": float(self.config.get("solver", {}).get("feedback_limit_tolerance_rad", 0.05)), "dt_s": dispatch_dt}
+                request = {"sequence": int((command or {}).get("sequence", session.get("sequence", 0))), "control_sample_id": sample_id, "target_generation": target_generation, "motion_epoch": epoch, "joint_angles_rad": q, "measured_joint_angles_rad": measured_q, "joint_state_monotonic_ns": now_ns, "target_position_m": target_pose["position_m"], "target_orientation_xyzw": target_pose["orientation_xyzw"], "command_target_position_m": target_pose["position_m"], "command_target_orientation_xyzw": target_pose["orientation_xyzw"], "last_sent_joint_velocity_rad_s": self.last_sent_velocity, "joint_speed_limit_rad_s": data["speed_rad_s"], "joint_acceleration_limit_rad_s2": data["acceleration_rad_s2"], "soft_lower_rad": data["soft_lower_rad"], "soft_upper_rad": data["soft_upper_rad"], "posture_reference_rad": self.posture_reference or q, "posture_cost": float(self.config.get("solver", {}).get("posture_cost", 0.005)), "damping_cost": float(self.config.get("solver", {}).get("damping_cost", 0.05)), "frame_position_cost": float(self.config.get("solver", {}).get("frame_position_cost", 10.0)), "frame_orientation_cost": float(self.config.get("solver", {}).get("frame_orientation_cost", 1.0)), "frame_gain": float(self.config.get("solver", {}).get("frame_gain", 0.5)), "frame_lm_damping": float(self.config.get("solver", {}).get("frame_lm_damping", 0.0)), "joint_center_cost": float(self.config.get("solver", {}).get("joint_center_cost", 0.0)), "joint_center_deadband": float(self.config.get("solver", {}).get("joint_center_deadband", 0.70)), "feedback_limit_tolerance_rad": float(self.config.get("solver", {}).get("feedback_limit_tolerance_rad", 0.05)), "dt_s": dispatch_dt}
                 solve_current = getattr(self.solver, "solve_current", None)
                 if callable(solve_current):
                     pink = solve_current(request, float(self.config.get("solver", {}).get("synchronous_response_budget_s", 0.008)))
                 else:
                     self.solver.submit(request)
                     try:
-                        pink = self.solver.poll(epoch, anchor_id, reference_revision, 0)
+                        pink = self.solver.poll(epoch, target_generation, 0)
                     except TypeError:
-                        pink = self.solver.poll(epoch, anchor_id, reference_revision)
+                        pink = self.solver.poll(epoch, target_generation)
                 if pink and pink.get("ok"):
                     self._solver_reuse_count = 0
                 solver_age = None if not pink else max(0.0, (time.monotonic_ns() - int(pink.get("joint_state_monotonic_ns") or pink.get("solver_monotonic_ns", time.monotonic_ns()))) / 1e9)
@@ -1910,7 +1665,7 @@ class OperationalSpaceServo:
                     with self.lock:
                         self.execution_sample = {
                             "sample_id": sample_id,
-                            "target_generation": reference_revision,
+                            "target_generation": target_generation,
                             "sample_monotonic_ns": int(pink.get("joint_state_monotonic_ns") or now_ns),
                             "solver_finished_monotonic_ns": solver_finished_ns,
                             "joint_state_rad": list(q),
@@ -2063,7 +1818,7 @@ class OperationalSpaceServo:
                     arrival_sample = pink if pink and pink.get("ok") else self.execution_sample
                     arrival_matches_target = bool(
                         arrival_sample
-                        and int(arrival_sample.get("target_generation", -1)) == reference_revision
+                        and int(arrival_sample.get("target_generation", -1)) == target_generation
                     )
                     arrival_ok = bool(
                         arrival_matches_target
@@ -2082,7 +1837,7 @@ class OperationalSpaceServo:
                         self._arrival_since_monotonic_ns = 0
                         self._arrival_reached = False
                     if (
-                        self.absolute_target_mode == "move_tcp"
+                        str((command or {}).get("osc_mode")) == "move_tcp"
                         and self._arrival_reached
                     ):
                         self._invalidate_motion("OSC move_tcp target reached")
@@ -2108,7 +1863,7 @@ class OperationalSpaceServo:
                     cycle_finished_ns = time.monotonic_ns()
                     cycle_finished_perf_ns = time.perf_counter_ns()
                     cycle_duration_ms = (cycle_finished_perf_ns - cycle_started_perf_ns) / 1e6
-                    self._timing = {"actual_dt_s": actual_dt, "dispatch_interval_s": dispatch_dt, "feedback_age_s": feedback_age, "estimated_feedback_delay_s": feedback_age, "feedback_read_duration_s": None if shadow else float((feedback or {}).get("read_duration_s", 0.0)), "feedback_requested_monotonic_ns": None if shadow else (feedback or {}).get("requested_monotonic_ns"), "feedback_received_monotonic_ns": None if shadow else (feedback or {}).get("received_monotonic_ns"), "feedback_sdk_timestamp": None if shadow else (feedback or {}).get("sdk_joint_timestamp"), "feedback_sdk_hz": None if shadow else (feedback or {}).get("joint_feedback_hz"), "feedback_soft_stale": soft_stale, "feedback_hard_stale": hard_stale, "solver_age_s": solver_age, "pink_requested_monotonic_ns": None if not pink else pink.get("osc_pink_requested_monotonic_ns"), "pink_written_monotonic_ns": None if not pink else pink.get("osc_pink_written_monotonic_ns"), "pink_started_monotonic_ns": None if not pink else pink.get("solver_monotonic_ns"), "pink_finished_monotonic_ns": None if not pink else pink.get("solver_finished_monotonic_ns"), "solver_latency_s": None if not pink else max(0.0, (int(pink.get("solver_finished_monotonic_ns") or cycle_finished_ns) - int(pink.get("joint_state_monotonic_ns") or cycle_finished_ns)) / 1e9), "batch_duration_ms": (batch or {}).get("batch_duration_ms"), "batch_skew_ms": (batch or {}).get("batch_skew_ms"), "queue_delay_ms": (batch or {}).get("queue_delay_ms"), "transport_duration_ms": (batch or {}).get("transport_duration_ms"), "joint_sent_monotonic_ns": (batch or {}).get("joint_sent_monotonic_ns"), "actuator_feedback_response": actuator_response, "delay_budget_s": delay_budget, "motion_epoch": epoch, "control_sample_id": sample_id, "target_generation": reference_revision, "gate_ok": gate_ok, "gate_limited": gate_limited, "gate_reason": gate_reason, "cycle_duration_ms": cycle_duration_ms, "deadline_overrun_ms": max(0.0, cycle_duration_ms - period * 1000)}
+                    self._timing = {"actual_dt_s": actual_dt, "dispatch_interval_s": dispatch_dt, "feedback_age_s": feedback_age, "estimated_feedback_delay_s": feedback_age, "feedback_read_duration_s": None if shadow else float((feedback or {}).get("read_duration_s", 0.0)), "feedback_requested_monotonic_ns": None if shadow else (feedback or {}).get("requested_monotonic_ns"), "feedback_received_monotonic_ns": None if shadow else (feedback or {}).get("received_monotonic_ns"), "feedback_sdk_timestamp": None if shadow else (feedback or {}).get("sdk_joint_timestamp"), "feedback_sdk_hz": None if shadow else (feedback or {}).get("joint_feedback_hz"), "feedback_soft_stale": soft_stale, "feedback_hard_stale": hard_stale, "solver_age_s": solver_age, "pink_requested_monotonic_ns": None if not pink else pink.get("osc_pink_requested_monotonic_ns"), "pink_written_monotonic_ns": None if not pink else pink.get("osc_pink_written_monotonic_ns"), "pink_started_monotonic_ns": None if not pink else pink.get("solver_monotonic_ns"), "pink_finished_monotonic_ns": None if not pink else pink.get("solver_finished_monotonic_ns"), "solver_latency_s": None if not pink else max(0.0, (int(pink.get("solver_finished_monotonic_ns") or cycle_finished_ns) - int(pink.get("joint_state_monotonic_ns") or cycle_finished_ns)) / 1e9), "batch_duration_ms": (batch or {}).get("batch_duration_ms"), "batch_skew_ms": (batch or {}).get("batch_skew_ms"), "queue_delay_ms": (batch or {}).get("queue_delay_ms"), "transport_duration_ms": (batch or {}).get("transport_duration_ms"), "joint_sent_monotonic_ns": (batch or {}).get("joint_sent_monotonic_ns"), "actuator_feedback_response": actuator_response, "delay_budget_s": delay_budget, "motion_epoch": epoch, "control_sample_id": sample_id, "target_generation": target_generation, "gate_ok": gate_ok, "gate_limited": gate_limited, "gate_reason": gate_reason, "cycle_duration_ms": cycle_duration_ms, "deadline_overrun_ms": max(0.0, cycle_duration_ms - period * 1000)}
                     self._cycle_trace.append(dict(self._timing))
             except PermissionError as exc:
                 # Authority revocation is an expected ownership handoff, not a
@@ -2130,7 +1885,3 @@ class OperationalSpaceServo:
             self.broker.trigger_safety_fault(reason)
         self.last_sent_velocity = [0.0] * 7
         self._set_result(False, reason, robot_commands_sent=not shadow)
-
-
-# Backwards-compatible name for the legacy clutch input adapter and tests.
-TeleopController = OperationalSpaceServo

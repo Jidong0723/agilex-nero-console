@@ -12,9 +12,14 @@ class Broker:
         self.state = {"session": {"state": "ACTIVE", "id": "osc-1", "client_id": "browser", "execution_mode": "shadow"},
                       "command": {"sequence": 10, "target_tcp": {"position_m": [0.1, 0.2, 0.3], "orientation_xyzw": [0, 0, 0, 1]}},
                       "execution": {"measured_tcp_pose": {"position_m": [0.1, 0.2, 0.3], "orientation_xyzw": [0, 0, 0, 1]}}}
-    def osc_state(self): return self.state
-    def osc_command(self, command): self.commands.append(command); return {"ok": True, "result": {"accepted": True}}
-    def osc_heartbeat(self, client_id, session_id): self.heartbeats.append((client_id, session_id)); return {"ok": True}
+    def state(self): return self.state
+    def track_tcp(self, session_id, client_id, sequence, target_pose):
+        self.commands.append({"session_id": session_id, "client_id": client_id, "sequence": sequence, "type": "track_tcp", "payload": {"target_pose": target_pose}}); return {"ok": True, "result": {"accepted": True}}
+    def hold(self, session_id, client_id, sequence, reason):
+        self.commands.append({"session_id": session_id, "client_id": client_id, "sequence": sequence, "type": "hold", "payload": {"reason": reason}}); return {"ok": True}
+    def gripper(self, session_id, client_id, sequence, payload):
+        self.commands.append({"session_id": session_id, "client_id": client_id, "sequence": sequence, "type": "gripper", "payload": payload}); return {"ok": True}
+    def heartbeat(self, client_id, session_id): self.heartbeats.append((client_id, session_id)); return {"ok": True}
 
 
 def adapter() -> tuple[PicoInputAdapter, Broker]:

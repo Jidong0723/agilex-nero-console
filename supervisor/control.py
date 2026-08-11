@@ -18,9 +18,6 @@ from .authority import (
 from nero_backend.robot import NeroRobot
 from shared.schemas import jsonable, now_iso
 from motion.teleop import OperationalSpaceServo
-from .pi05_adapter import Pi05InputAdapter
-from .pico_adapter import PicoInputAdapter
-from .camera_resource import SharedCameraResource
 from .telemetry import TelemetryReader
 from .hardware_maintenance import HardwareMaintenance
 
@@ -183,12 +180,6 @@ class OperationalSpaceController:
         self.osc_servo = OperationalSpaceServo(self, Path(__file__).resolve().parents[1], teleop_config)
         # Legacy adapters and callers retain this name, but it is the same
         # single OSC servo instance, never a second control loop.
-        self.teleop = self.osc_servo
-        pi05_path = Path(__file__).resolve().parents[1] / "config" / "pi05.json"
-        pi05_config = json.loads(pi05_path.read_text(encoding="utf-8"))
-        self.cameras = SharedCameraResource(pi05_config["cameras"])
-        self.pi05 = Pi05InputAdapter(self, pi05_path, self.cameras)
-        self.pico = PicoInputAdapter(self, dict(config_data.get("pico_adapter") or {}))
 
     # ---- Sole transport-owner entry points ---------------------------------
     # Teleop and HTTP handlers deliberately use these methods rather than the
@@ -511,7 +502,7 @@ class OperationalSpaceController:
         """Atomically invalidate old output while leaving SERVO able to brake."""
         with self._handoff_lock:
             state = self._set_authority(ArmWriter.SERVO, ServoMode.STOPPING, reason, advance_epoch=True)
-            self.teleop.freeze_for_authority_change(int(state["control_epoch"]), reason)
+            self.osc_servo.freeze_for_authority_change(int(state["control_epoch"]), reason)
             return state
 
     def latch_teleop_hold(self, reason: str) -> dict[str, Any]:
@@ -524,7 +515,7 @@ class OperationalSpaceController:
         """P0 path: revoke normal writers and hold the measured joint pose."""
         with self._handoff_lock:
             state = self._set_authority(ArmWriter.SAFETY, ServoMode.STOPPING, reason, advance_epoch=True)
-            self.teleop.freeze_for_authority_change(int(state["control_epoch"]), reason)
+            self.osc_servo.freeze_for_authority_change(int(state["control_epoch"]), reason)
             try:
                 safety_timeout_s = float(
                     self.robot.config.get("control_service", {}).get(
@@ -629,10 +620,7 @@ class OperationalSpaceController:
 
     def close(self) -> dict[str, Any]:
         self._running.clear()
-        self.pi05.close()
-        self.cameras.close()
-        self.pico.disconnected("control service shutdown")
-        self.teleop.stop_session("control service shutdown")
+        self.osc_servo.stop_session("control service shutdown")
         if self._status_monitor is not None and self._status_monitor is not threading.current_thread():
             self._status_monitor.join(timeout=1.0)
         if self._watchdog is not None and self._watchdog is not threading.current_thread():
@@ -677,7 +665,7 @@ class OperationalSpaceController:
             result["lease"] = lease.public() if lease else None
             result["active_action"] = self._active_action_public()
             result["service_health"] = self.health()
-            result["teleop"] = self.teleop.status()
+            result["osc"] = self.osc_servo.status()
             result["broker"] = self.authority_status(result.get("control"))
             result["feedback_ready"] = self._feedback_readiness(
                 result.get("control", {}), result["status_age_s"]
@@ -772,7 +760,7 @@ class OperationalSpaceController:
             # During hardware teleop the P1 CPV stream owns the transport.
             # Concurrent P2 status reads can race the vendor SDK's motion
             # calls and block the backend's single CAN owner.
-            teleop_session = self.teleop.status().get("session", {}) if self.teleop else {}
+            teleop_session = self.osc_servo.status().get("session", {})
             teleop_state = teleop_session.get("state")
             # ``mode`` is an adapter-qualified compatibility value such as
             # ``joystick_hardware``. The canonical execution selector is
@@ -827,48 +815,21 @@ class OperationalSpaceController:
             "last_sdk_read_duration_ms": self._last_sdk_read_duration_ms,
             "running": self._running.is_set(),
             "hardware_transport_available": self._hardware_transport_available,
-            "teleop": self.teleop.status(),
+            "osc": self.osc_servo.status(),
         }
-
-    def teleop_status(self) -> dict[str, Any]:
-        return self.teleop.status()
 
     def broker_status(self) -> dict[str, Any]:
         """Read-only ownership and safety state for diagnostics/UI."""
         snapshot = self.status()
         return {
             **self.authority_status(snapshot.get("control")),
-            "teleop": self.teleop.status(),
+            "osc": self.osc_servo.status(),
             "active_action": self._active_action_public(),
             "feedback_age_s": snapshot.get("status_age_s"),
         }
 
-    def teleop_kinematics(self) -> dict[str, Any]:
-        return self.teleop.kinematics()
-
-    def teleop_start(
-        self,
-        mode: str | None = None,
-        confirm_hardware: bool = False,
-        client_id: str = "anonymous",
-        execution_mode: str | None = None,
-        input_source: str | None = None,
-    ) -> dict[str, Any]:
-        return self.teleop.start_session(mode, confirm_hardware, client_id, execution_mode, input_source)
-
-    def teleop_intent(self, body: dict[str, Any]) -> dict[str, Any]:
-        return self.teleop.submit_intent(body)
-
-    def teleop_pico_intent(self, body: dict[str, Any]) -> dict[str, Any]:
-        return self.teleop.submit_pico_intent(body)
-
-    def teleop_heartbeat(self, client_id: str, session_id: str) -> dict[str, Any]:
-        return self.teleop.heartbeat(client_id, session_id)
-
-    def teleop_stop(self, reason: str = "teleop stopped") -> dict[str, Any]:
-        result = self.teleop.stop_session(reason)
-        self._log("teleop_stop", reason=reason, result=result)
-        return result
+    def osc_kinematics(self) -> dict[str, Any]:
+        return self.osc_servo.kinematics()
 
     # ---- Public OSC facade -------------------------------------------------
     # OSC accepts only base-frame absolute targets and mode/end-effector
@@ -881,7 +842,6 @@ class OperationalSpaceController:
     ) -> dict[str, Any]:
         result = self.osc_servo.start_session(
             execution_mode=execution_mode,
-            input_source="joystick",
             client_id=client_id,
         )
         return {"ok": True, "state": self.osc_state(), "session": result.get("session", {})}
@@ -938,14 +898,7 @@ class OperationalSpaceController:
 
     def osc_state(self) -> dict[str, Any]:
         servo = dict(self.osc_servo.status())
-        # Deliberately exclude every legacy clutch/input-adapter concept.
-        for key in ("clutch_active", "anchor_id", "relative_pose", "tcp_anchor", "input_source", "pose_mapping_verified"):
-            servo.pop(key, None)
-        raw_session = servo.get("session")
-        session = (
-            {key: value for key, value in raw_session.items() if key != "input_source"}
-            if isinstance(raw_session, dict) else raw_session
-        )
+        session = servo.get("session")
         snapshot = self.status()
         execution_sample = dict(servo.get("execution_sample") or {})
         solver = dict((servo.get("last_result") or {}).get("solver") or {})
@@ -1052,7 +1005,7 @@ class OperationalSpaceController:
             "session": session,
             "command": {
                 "target_tcp": sampled_target if active_session else None,
-                "target_generation": servo.get("reference_revision", execution_sample.get("target_generation")),
+                "target_generation": servo.get("target_generation", execution_sample.get("target_generation")),
                 "final_joint_target_rad": last_output.get("final_joint_target_rad"),
                 "final_joint_velocity_rad_s": last_output.get("final_joint_velocity_rad_s"),
                 "sequence": last_output.get("sequence", (session or {}).get("sequence", 0)),
@@ -1150,61 +1103,6 @@ class OperationalSpaceController:
         calibration = self.osc_calibrate_readonly_hardware(20)
         return {"ok": True, "written": written, "calibration": calibration["applied"], "state": self.osc_state()}
 
-    # π0.5 stays outside OSC: this adapter reads OSC state and only returns
-    # standard OSC commands.  It never receives a transport/robot handle.
-    def pi05_state(self) -> dict[str, Any]:
-        return self.pi05.snapshot()
-
-    def pi05_update_config(self, body: dict[str, Any]) -> dict[str, Any]:
-        return self.pi05.update_config(body)
-
-    def pi05_activate_cameras(self) -> dict[str, Any]:
-        return self.cameras.activate()
-
-    def pi05_start(self, session_id: str, client_id: str) -> dict[str, Any]:
-        return self.pi05.start(session_id, client_id)
-
-    def pi05_stop(self, reason: str = "pi05 adapter stopped") -> dict[str, Any]:
-        return self.pi05.stop(reason)
-
-    def pi05_camera_devices(self) -> list[dict[str, Any]]:
-        return self.cameras.devices()
-
-    def pi05_frame_jpeg(self, source: str) -> bytes | None:
-        return self.cameras.frame_jpeg(source)
-
-    def camera_state(self) -> dict[str, Any]: return self.cameras.snapshot()
-    def camera_update_config(self, body: dict[str, Any]) -> dict[str, Any]: return self.cameras.update_config(body.get("cameras", body))
-    def camera_activate(self) -> dict[str, Any]: return self.cameras.activate()
-    def camera_deactivate(self) -> dict[str, Any]:
-        # π0.5 consumes the shared frames; stopping it first prevents a policy
-        # request from racing a released OpenCV capture.
-        if self.pi05.snapshot().get("state") == "RUNNING": self.pi05.stop("cameras closed by operator")
-        return self.cameras.deactivate()
-
-    # PICO is an external input adapter.  Its status has its own endpoint and
-    # is deliberately not folded into the public OSC state snapshot.
-    def pico_state(self) -> dict[str, Any]:
-        return self.pico.snapshot()
-
-    def pico_begin_pairing(self, session_id: str, client_id: str) -> None:
-        self.pico.begin_pairing(session_id, client_id)
-
-    def pico_paired(self) -> None:
-        self.pico.paired()
-
-    def pico_message(self, kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-        if kind == "heartbeat":
-            self.pico.heartbeat(); return None
-        if kind == "anchor_begin": return self.pico.anchor_begin(payload)
-        if kind == "pose": return self.pico.pose(payload)
-        if kind == "gripper": return self.pico.gripper(payload.get("value", 0.0))
-        if kind in {"anchor_release", "hold"}: return self.pico.stop("PICO operator HOLD" if kind == "hold" else "PICO right Grip released")
-        raise ValueError("unsupported PICO adapter message")
-
-    def pico_disconnected(self, reason: str) -> None:
-        self.pico.disconnected(reason)
-
     @staticmethod
     def _tcp_tracking_error(current: Any, target: Any) -> dict[str, Any] | None:
         """Return base-frame target-minus-current TCP error, when both poses exist."""
@@ -1260,7 +1158,7 @@ class OperationalSpaceController:
                 advance_epoch=True,
                 transport_exclusive_category="follower_hold_transition",
             )
-            direct_handoff = self.teleop.abandon_session_without_braking(
+            direct_handoff = self.osc_servo.abandon_session_without_braking(
                 int(transition["control_epoch"]),
                 f"{reason}: revoke teleop for Follower/HOLD",
             )
@@ -1315,7 +1213,7 @@ class OperationalSpaceController:
         """Shared P1 brake + CPV-zero barrier for official mode changes."""
         self._mark_active_preempted(reason)
         self.robot.request_preempt(reason)
-        teleop = self.teleop.stop_session(f"{reason}: brake before mode transition")
+        teleop = self.osc_servo.stop_session(f"{reason}: brake before mode transition")
         if not teleop.get("handoff", {}).get("servo_stopped", False):
             return {"ok": False, "reason": "teleop servo did not stop", "teleop": teleop}
         try:
@@ -1332,9 +1230,6 @@ class OperationalSpaceController:
             "cpv_stop": cpv_stop,
             "revoked_lease": revoked.public() if revoked else None,
         }
-
-    def teleop_recenter(self) -> dict[str, Any]:
-        return self.teleop.recenter()
 
     def action_status(self, action_id: str) -> dict[str, Any]:
         with self._jobs_lock:
@@ -1475,7 +1370,7 @@ class OperationalSpaceController:
                 advance_epoch=True,
                 transport_exclusive_category="freedrive_transition",
             )
-            direct_handoff = self.teleop.abandon_session_without_braking(
+            direct_handoff = self.osc_servo.abandon_session_without_braking(
                 int(transition["control_epoch"]),
                 f"{reason}: revoke teleop for direct FREEDRIVE",
             )
@@ -1546,7 +1441,7 @@ class OperationalSpaceController:
         # stale full snapshot must never prevent this revocation/handoff.
         self._require_operational_control(allow_stale=True)
         reason = f"operator requested gripper {mode}"
-        teleop_before = self.teleop.status().get("session") or {}
+        teleop_before = self.osc_servo.status().get("session") or {}
         # Gripper I/O does not change the arm control mode. Keep an active
         # teleoperation session; arm mode transitions still take over.
         teleop_preserved = teleop_before.get("state") == "ACTIVE"
@@ -1668,13 +1563,7 @@ class OperationalSpaceController:
             # heartbeat is therefore a real ownership lease: terminate the
             # session through the same official Follower/HOLD path rather
             # than leaving an ACTIVE session waiting for a later reconnect.
-            osc_session = self.osc_servo.status().get("session") or {}
-            pico_pairing_shadow = (
-                osc_session.get("state") == "ACTIVE"
-                and osc_session.get("execution_mode") == "shadow"
-                and self.pico.snapshot().get("state") == "PAIRING"
-            )
-            if self.osc_servo.heartbeat_expired() and not pico_pairing_shadow:
+            if self.osc_servo.heartbeat_expired():
                 reason = "OSC session heartbeat expired"
                 try:
                     result = self.hold(reason)
@@ -1700,7 +1589,7 @@ class OperationalSpaceController:
 
     def _operator_takeover(self, operation: str, reason: str) -> dict[str, Any] | None:
         """Revoke model control before applying an operator-selected control mode."""
-        self.teleop.stop_session(f"operator takeover: {operation}")
+        self.osc_servo.stop_session(f"operator takeover: {operation}")
         revoked = self.leases.release(force=True)
         self._mark_active_preempted(reason)
         self.robot.request_preempt(reason)
@@ -1791,8 +1680,3 @@ class OperationalSpaceController:
             raise
         self._emit_action_event(action_id, "completed", requested_action, result, "operator")
         return result
-
-
-# Compatibility import for existing local integrations. New code must use
-# OperationalSpaceController; both names refer to the same sole CAN owner.
-RobotControlBroker = OperationalSpaceController

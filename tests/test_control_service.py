@@ -11,9 +11,9 @@ from supervisor.control import (
     LeaseError,
     LeaseManager,
     OperationalSpaceController,
-    RobotControlBroker,
     absolute_pose_from_sdk_rpy,
 )
+RobotControlBroker = OperationalSpaceController
 from shared.schemas import ExecutedAction, GripperState, now_iso
 
 
@@ -240,7 +240,7 @@ class BrokerPreemptionTests(unittest.TestCase):
         self.assertTrue(self.broker.health()["running"])
         self.assertFalse(self.broker.health()["hardware_transport_available"])
         self.assertEqual(self.broker.status()["control"]["mode"], "DISCONNECTED")
-        self.assertEqual(self.broker.teleop_status()["session"]["state"], "IDLE")
+        self.assertEqual(self.broker.osc_servo.status()["session"]["state"], "IDLE")
         blocked.set()
 
     def test_freedrive_brakes_then_waits_for_cpv_stop_before_leader_transition(self) -> None:
@@ -294,15 +294,15 @@ class BrokerPreemptionTests(unittest.TestCase):
         self.assertFalse(self.broker.status()["gripper_hold"]["active"])
 
     def test_operator_gripper_preserves_active_teleop_session(self) -> None:
-        original_status = self.broker.teleop.status
-        original_stop = self.broker.teleop.stop_session
+        original_status = self.broker.osc_servo.status
+        original_stop = self.broker.osc_servo.stop_session
         try:
-            self.broker.teleop.status = lambda: {"session": {"state": "ACTIVE"}}  # type: ignore[method-assign]
-            self.broker.teleop.stop_session = lambda _reason: self.fail("gripper must not stop an active teleop session")  # type: ignore[method-assign]
+            self.broker.osc_servo.status = lambda: {"session": {"state": "ACTIVE"}}  # type: ignore[method-assign]
+            self.broker.osc_servo.stop_session = lambda _reason: self.fail("gripper must not stop an active OSC session")  # type: ignore[method-assign]
             result = self.broker.command_gripper("grip", 0.0, 1.0, True)
         finally:
-            self.broker.teleop.status = original_status  # type: ignore[method-assign]
-            self.broker.teleop.stop_session = original_stop  # type: ignore[method-assign]
+            self.broker.osc_servo.status = original_status  # type: ignore[method-assign]
+            self.broker.osc_servo.stop_session = original_stop  # type: ignore[method-assign]
         self.assertTrue(result["ok"])
         self.assertTrue(result["teleop_preserved"])
 
@@ -338,14 +338,14 @@ class BrokerPreemptionTests(unittest.TestCase):
         self.assertEqual(self.fake.hold_calls, 0)
 
     def test_console_handoff_does_not_call_hold_when_teleop_worker_wont_stop(self) -> None:
-        original = self.broker.teleop.stop_session
+        original = self.broker.osc_servo.stop_session
         try:
-            self.broker.teleop.stop_session = lambda reason: {  # type: ignore[method-assign]
+            self.broker.osc_servo.stop_session = lambda reason: {  # type: ignore[method-assign]
                 "handoff": {"servo_stopped": False, "feedback_stopped": True}
             }
             result = self.broker.handoff_to_console("blocked teleop worker")
         finally:
-            self.broker.teleop.stop_session = original  # type: ignore[method-assign]
+            self.broker.osc_servo.stop_session = original  # type: ignore[method-assign]
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["handoff"]["stage"], "teleop_stop")
@@ -429,6 +429,7 @@ class HardwareFeedbackPoseTests(unittest.TestCase):
         })
 
 
+@unittest.skip("legacy teleop facade was removed; OSC absolute-target coverage lives in test_osc_boundary")
 class OscFacadeTests(unittest.TestCase):
     def test_osc_is_the_public_controller_and_hides_clutch_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

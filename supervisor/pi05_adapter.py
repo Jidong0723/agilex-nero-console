@@ -133,15 +133,15 @@ class _LegacyCameraPair:
 
 
 class Pi05InputAdapter:
-    def __init__(self, broker: Any, config_path: Path, camera_resource: SharedCameraResource | None = None) -> None:
-        self.broker, self.config_path = broker, Path(config_path)
+    def __init__(self, osc: Any, config_path: Path, camera_resource: SharedCameraResource | None = None) -> None:
+        self.osc, self.config_path = osc, Path(config_path)
         self.config = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.lock = threading.RLock(); self.stop_event = threading.Event(); self.worker: threading.Thread | None = None
         self._connection_stop = threading.Event(); self._policy: OpenPIClient | None = None
         self._connection_thread = threading.Thread(target=self._connection_loop, name="nero-pi05-websocket", daemon=True)
         self.camera_resource = camera_resource
         # Compatibility seam for direct adapter tests; production always uses
-        # the broker-owned shared camera resource.
+        # the HTTP-process shared camera resource.
         self.cameras: Any | None = None if camera_resource else None
         self._last_connection_probe = 0.0
         self._connections: dict[str, Any] = {}
@@ -231,7 +231,7 @@ class Pi05InputAdapter:
         host = str(connection.get("policy_host", self.config["model"]["host"]))
         port = int(connection.get("policy_port", self.config["model"]["port"]))
         port_ok = self._port_open(host, port)
-        osc = self.broker.osc_state(); transport = osc.get("transport") or {}
+        osc = self.osc.state(); transport = osc.get("transport") or {}
         self._connections = {
             "control": {"state": "ok" if transport.get("connected") else "warn", "label": "NERO 控制服务", "endpoint": "127.0.0.1:8765", "message": "OSC 状态可读"},
             "ssh_forward": {"state": "ok" if port_ok else "bad", "label": "SSH 本地转发", "endpoint": f"{host}:{port}", "message": "端口已连通" if port_ok else "未连接"},
@@ -302,7 +302,7 @@ class Pi05InputAdapter:
         with self.lock:
             if self.worker and self.worker.is_alive(): raise RuntimeError("π0.5 inference is already running")
             if (self.camera_resource is not None and not self.camera_resource.snapshot()["ready"]) or (self.camera_resource is None and self.cameras is None): raise RuntimeError("activate the external and wrist cameras first")
-            osc = self.broker.osc_state(); session = osc.get("session") or {}
+            osc = self.osc.state(); session = osc.get("session") or {}
             if session.get("state") != "ACTIVE" or session.get("id") != session_id or session.get("client_id") != client_id:
                 raise PermissionError("π0.5 requires the caller's active OSC session")
             self.stop_event = threading.Event()
@@ -356,9 +356,10 @@ class Pi05InputAdapter:
         try:
             policy = self._policy_client()
             while not self.stop_event.is_set():
-                started = time.monotonic(); osc = self.broker.osc_state(); session = osc.get("session") or {}
+                started = time.monotonic(); osc = self.osc.state(); session = osc.get("session") or {}
                 with self.lock: session_id, client_id = self.state["session_id"], self.state["client_id"]
                 if session.get("state") != "ACTIVE" or session.get("id") != session_id: raise RuntimeError("OSC session ended")
+                self.osc.heartbeat(str(client_id), str(session_id))
                 external, wrist = self.camera_resource.read() if self.camera_resource else (self.cameras.read() if self.cameras else (_ for _ in ()).throw(RuntimeError("cameras are unavailable")))
                 response = policy.infer(self._observation(osc, external, wrist)); actions = response.get("actions") if isinstance(response, dict) else None
                 if actions is None: raise RuntimeError("OpenPI response does not contain actions")
@@ -374,7 +375,7 @@ class Pi05InputAdapter:
                     if self.stop_event.is_set(): break
                     target, gripper = self._target_from_action(action, base)
                     with self.lock: self.state["sequence"] += 1; sequence = max(self.state["sequence"], int(time.time()*1000))
-                    result = self.broker.osc_command({"session_id": session_id, "client_id": client_id, "sequence": sequence, "type": "track_tcp", "acknowledgement_only": True, "payload": {"target_pose": target}})
+                    result = self.osc.track_tcp(session_id, client_id, sequence, target)
                     if not result.get("ok"): raise RuntimeError(f"OSC rejected π0.5 target: {result}")
                     base = target
                     if abs(gripper) >= float(self.config["gripper"]["switch_threshold"]):
@@ -383,7 +384,7 @@ class Pi05InputAdapter:
                         # migrated π0.5 bridge.
                         opening = gripper <= -float(self.config["gripper"]["switch_threshold"])
                         self.state["sequence"] += 1
-                        self.broker.osc_command({"session_id": session_id, "client_id": client_id, "sequence": max(self.state["sequence"], int(time.time()*1000)+1), "type": "gripper", "payload": {"mode": "open" if opening else "position", "width_m": self.config["gripper"]["open_width_m"] if opening else self.config["gripper"]["closed_width_m"], "force_n": self.config["gripper"]["force_n"]}})
+                        self.osc.gripper(session_id, client_id, max(self.state["sequence"], int(time.time()*1000)+1), {"mode": "open" if opening else "position", "width_m": self.config["gripper"]["open_width_m"] if opening else self.config["gripper"]["closed_width_m"], "force_n": self.config["gripper"]["force_n"]})
                     with self.lock: self.state["executed_steps"] += 1; self.state["updated_at"] = time.time()
                     # period_s is the complete observation-to-command cadence;
                     # policy inference time must not be added on top of it.
@@ -392,7 +393,16 @@ class Pi05InputAdapter:
         except Exception as exc:
             with self.lock: self.state.update({"state": "ERROR", "last_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
         finally:
-            pass
+            with self.lock:
+                session_id, client_id = self.state.get("session_id"), self.state.get("client_id")
+                self.state["state"] = "IDLE" if self.stop_event.is_set() else self.state["state"]
+                self.state["updated_at"] = time.time()
+            if session_id and client_id and not self.stop_event.is_set():
+                try:
+                    self.state["sequence"] += 1
+                    self.osc.hold(str(session_id), str(client_id), max(int(self.state["sequence"]), int(time.time() * 1000)), "π0.5 adapter failed")
+                except Exception:
+                    pass
 
     def close(self) -> None:
         self.stop("service closing")

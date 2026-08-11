@@ -1,2 +1,2 @@
 -r control.txt
-
+pytest>=8,<9

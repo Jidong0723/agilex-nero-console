@@ -91,7 +91,7 @@ class ControlSupervisor:
             return self._state
 
     def allows_servo(self, session_id: str | None, epoch: int) -> bool:
-        del session_id  # Session identity is checked by TeleopController; epoch gates cross-session output.
+        del session_id  # OSC validates session identity; epoch gates cross-session output.
         with self._lock:
             return (
                 self._state.writer is ArmWriter.SERVO

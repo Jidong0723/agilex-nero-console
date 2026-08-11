@@ -36,13 +36,20 @@ class _Broker:
         self.commands = []
         self.session = {"state": "ACTIVE", "id": "session-1", "client_id": "client-1", "execution_mode": "shadow"}
 
-    def osc_state(self):
+    def state(self):
         return {"session": dict(self.session), "command": {"target_tcp": {"position_m": [0., 0., .3], "orientation_xyzw": [0., 0., 0., 1.]}},
                 "execution": {"measured_tcp_pose": {"position_m": [0., 0., .3], "orientation_xyzw": [0., 0., 0., 1.]}}, "gripper": {"width_m": .02}}
 
-    def osc_command(self, command):
-        self.commands.append(command)
+    def track_tcp(self, session_id, client_id, sequence, target_pose):
+        self.commands.append({"session_id": session_id, "client_id": client_id, "sequence": sequence, "type": "track_tcp", "payload": {"target_pose": target_pose}})
         return {"ok": True, "result": {"accepted": True}}
+    def gripper(self, session_id, client_id, sequence, payload):
+        self.commands.append({"session_id": session_id, "client_id": client_id, "sequence": sequence, "type": "gripper", "payload": payload})
+        return {"ok": True}
+    def hold(self, session_id, client_id, sequence, reason):
+        self.commands.append({"session_id": session_id, "client_id": client_id, "sequence": sequence, "type": "hold", "payload": {"reason": reason}})
+        return {"ok": True}
+    def heartbeat(self, client_id, session_id): return {"ok": True}
 
 
 class Pi05AdapterTests(unittest.TestCase):

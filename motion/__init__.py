@@ -1,5 +1,5 @@
 """Deterministic motion safety, Pink, Ruckig, and teleoperation."""
 
-from .teleop import OperationalSpaceServo, TeleopController
+from .teleop import OperationalSpaceServo
 
-__all__ = ["OperationalSpaceServo", "TeleopController"]
+__all__ = ["OperationalSpaceServo"]

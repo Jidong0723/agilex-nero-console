@@ -33,6 +33,7 @@ if str(VENDOR_ROOT) not in sys.path:
 
 from supervisor.instance_lock import InstanceLock  # noqa: E402
 from nero_console.runtime import assert_control_interpreter, control_python  # noqa: E402
+from nero_console.application.adapter_runtime import AdapterRuntime  # noqa: E402
 
 if TYPE_CHECKING:
     from supervisor.control import OperationalSpaceController
@@ -183,9 +184,15 @@ class ServiceRuntime:
         self._initial: dict[str, Any] | None = None
         self._started_monotonic = time.monotonic()
         self._backend_process: Any | None = None
+        self._adapters: AdapterRuntime | None = None
+        self._runtime_config: dict[str, Any] = {}
 
     def initialize(self, config: Path, broker_factory: Any | None = None) -> None:
         try:
+            self._runtime_config = (
+                {} if broker_factory is not None
+                else json.loads(Path(config).read_text(encoding="utf-8-sig"))
+            )
             if broker_factory is not None:
                 # Unit tests can inject a harmless in-process fake. Production
                 # always uses the crash boundary below.
@@ -238,6 +245,15 @@ class ServiceRuntime:
             self._initial = dict(initial) if isinstance(initial, dict) else {"result": initial}
             self._phase = "ready"
             self._error = None
+        try:
+            adapters = AdapterRuntime(broker, PROJECT_ROOT, self._runtime_config)
+        except BaseException as exc:
+            with self._lock:
+                self._phase = "error"
+                self._error = f"AdapterRuntime: {type(exc).__name__}: {exc}"
+            return
+        with self._lock:
+            self._adapters = adapters
         print(json.dumps({"control_backend_ready": True, "initial": initial}, ensure_ascii=False, default=str), flush=True)
 
     def require_broker(self) -> OperationalSpaceController:
@@ -246,6 +262,12 @@ class ServiceRuntime:
                 return self._broker
             detail = self._error or "control backend is still initializing"
             raise ControlServiceUnavailable(detail)
+
+    def require_adapters(self) -> AdapterRuntime:
+        with self._lock:
+            if self._adapters is not None and self._phase == "ready":
+                return self._adapters
+            raise ControlServiceUnavailable(self._error or "input adapters are still initializing")
 
     def health(self) -> dict[str, Any]:
         with self._lock:
@@ -265,13 +287,21 @@ class ServiceRuntime:
                 result.update(broker.health())
             except Exception as exc:
                 result["broker_health_error"] = f"{type(exc).__name__}: {exc}"
+        with self._lock:
+            adapters = self._adapters
+        if adapters is not None:
+            result.update(adapters.health())
         return result
 
     def close(self) -> None:
         with self._lock:
             broker = self._broker
             self._broker = None
+            adapters = self._adapters
+            self._adapters = None
             self._phase = "stopped"
+        if adapters is not None:
+            adapters.close()
         if isinstance(broker, BackendProcessProxy):
             broker.terminate()
         elif broker is not None:
@@ -544,7 +574,7 @@ class PicoGateway:
     def create_pairing(self, session_id: str, client_id: str) -> dict[str, Any]:
         if self._server is None:
             raise RuntimeError(self.error or "PICO WebSocket gateway is unavailable")
-        self.runtime.require_broker().pico_begin_pairing(session_id, client_id)
+        self.runtime.require_adapters().pico_begin_pairing(session_id, client_id)
         code = f"{secrets.randbelow(1_000_000):06d}"
         expires = time.monotonic() + float(self.config.get("pair_ttl_s", 120.0))
         with self._lock:
@@ -558,7 +588,7 @@ class PicoGateway:
             self._pair = None
             self._connection_active = False
         try:
-            self.runtime.require_broker().pico_disconnected("PICO pairing invalidated")
+            self.runtime.require_adapters().pico_disconnected("PICO pairing invalidated")
         except Exception:
             pass
 
@@ -629,7 +659,7 @@ class PicoGateway:
                 self._pair["paired"] = True
                 self._connection_active = True
                 paired_session = str(pair["session_id"])
-            self.runtime.require_broker().pico_paired()
+            self.runtime.require_adapters().pico_paired()
             self._send(connection, {"ok": True, "type": "paired", "session_id": paired_session})
             while True:
                 raw = connection.recv(timeout=float(self.config.get("message_timeout_s", 0.25)))
@@ -645,7 +675,7 @@ class PicoGateway:
                 if kind not in {"heartbeat", "anchor_begin", "pose", "anchor_release", "gripper", "hold"}:
                     raise ValueError("unsupported PICO adapter message type")
                 payload: dict[str, Any] = {"position_m": message.get("position_m"), "orientation_xyzw": message.get("orientation_xyzw"), "tracking_valid": bool(message.get("tracking_valid", True)), "value": message.get("value", 0.0)}
-                result = self.runtime.require_broker().pico_message(kind, payload)
+                result = self.runtime.require_adapters().pico_message(kind, payload)
                 last_sequence = sequence
                 with self._lock:
                     self._last_input_monotonic = time.monotonic()
@@ -667,7 +697,7 @@ class PicoGateway:
                     self._pair["paired"] = False
             if paired_session:
                 try:
-                    self.runtime.require_broker().pico_disconnected("PICO WebSocket disconnected")
+                    self.runtime.require_adapters().pico_disconnected("PICO WebSocket disconnected")
                 except Exception:
                     pass
 
@@ -677,7 +707,7 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
     pico_gateway: PicoGateway | None = None
 
     @property
-    def broker(self) -> RobotControlBroker:
+    def broker(self) -> OperationalSpaceController:
         return self.runtime.require_broker()
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -692,25 +722,22 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 return self._json_ok(self.broker.action_status(parsed.path.rsplit("/", 1)[-1]))
             if parsed.path == "/api/health":
                 return self._json_ok(self.runtime.health())
-            if parsed.path == "/api/teleop/status":
-                status = self.broker.teleop_status()
-                if self.pico_gateway is not None:
-                    status["pico_gateway"] = self.pico_gateway.status()
-                return self._json_ok(status)
             if parsed.path == "/api/broker/status":
                 return self._json_ok(self.broker.broker_status())
             if parsed.path == "/api/osc/state":
                 return self._json_ok(self.broker.osc_state())
+            if parsed.path == "/api/osc/kinematics":
+                return self._json_ok(self.broker.osc_kinematics())
             if parsed.path == "/api/osc/telemetry/read-only":
                 query = parse_qs(parsed.query)
                 samples = int((query.get("samples") or [50])[0])
                 return self._json_ok(self.broker.osc_calibrate_readonly_hardware(samples))
             if parsed.path == "/api/pi05/state":
-                return self._json_ok(self.broker.pi05_state())
+                return self._json_ok(self.runtime.require_adapters().pi05_state())
             if parsed.path == "/api/cameras/state":
-                return self._json_ok(self.broker.camera_state())
+                return self._json_ok(self.runtime.require_adapters().camera_state())
             if parsed.path == "/api/adapters/pico/state":
-                result = self.broker.pico_state()
+                result = self.runtime.require_adapters().pico_state()
                 if self.pico_gateway is not None:
                     result["gateway"] = self.pico_gateway.status()
                 return self._json_ok(result)
@@ -722,14 +749,12 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     return self.send_error(HTTPStatus.NOT_FOUND, "PICO pairing QR is not available")
                 return self._send_bytes(payload, "image/svg+xml")
             if parsed.path in {"/api/cameras/list", "/api/pi05/cameras/list"}:
-                return self._json_ok({"cameras": self.broker.pi05_camera_devices()})
+                return self._json_ok({"cameras": self.runtime.require_adapters().camera_devices()})
             if parsed.path in {"/api/cameras/frame/external.jpg", "/api/cameras/frame/wrist.jpg", "/api/pi05/frame/external.jpg", "/api/pi05/frame/wrist.jpg"}:
-                payload = self.broker.pi05_frame_jpeg("external" if "external" in parsed.path else "wrist")
+                payload = self.runtime.require_adapters().camera_frame_jpeg("external" if "external" in parsed.path else "wrist")
                 if payload is None:
                     return self.send_error(HTTPStatus.NOT_FOUND, "π0.5 camera frame is not available")
                 return self._send_bytes(payload, "image/jpeg")
-            if parsed.path == "/api/teleop/kinematics":
-                return self._json_ok(self.broker.teleop_kinematics())
             return self._static(parsed.path)
         except ControlServiceUnavailable as exc:
             self._json_error(exc, HTTPStatus.SERVICE_UNAVAILABLE)
@@ -762,19 +787,19 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             if self.path == "/api/osc/cpv-profile/sync":
                 return self._json_ok(self.broker.osc_sync_cpv_profile_to_osc_limits())
             if self.path == "/api/pi05/config":
-                return self._json_ok(self.broker.pi05_update_config(body))
+                return self._json_ok(self.runtime.require_adapters().pi05_update_config(body))
             if self.path in {"/api/cameras/config", "/api/pi05/cameras/config"}:
-                return self._json_ok(self.broker.camera_update_config(body))
+                return self._json_ok(self.runtime.require_adapters().camera_update_config(body))
             if self.path in {"/api/cameras/activate", "/api/pi05/cameras/activate"}:
-                return self._json_ok(self.broker.camera_activate())
+                return self._json_ok(self.runtime.require_adapters().camera_activate())
             if self.path in {"/api/cameras/deactivate", "/api/pi05/cameras/deactivate"}:
-                return self._json_ok(self.broker.camera_deactivate())
+                return self._json_ok(self.runtime.require_adapters().camera_deactivate())
             if self.path == "/api/pi05/start":
-                return self._json_ok(self.broker.pi05_start(
+                return self._json_ok(self.runtime.require_adapters().pi05_start(
                     str(body.get("session_id", "")), str(body.get("client_id", "anonymous"))
                 ))
             if self.path == "/api/pi05/stop":
-                return self._json_ok(self.broker.pi05_stop(str(body.get("reason", "pi05 adapter stopped"))))
+                return self._json_ok(self.runtime.require_adapters().pi05_stop(str(body.get("reason", "pi05 adapter stopped"))))
             if self.path == "/api/adapters/pico/pair":
                 if self.pico_gateway is None:
                     raise RuntimeError("PICO WebSocket gateway is unavailable")
@@ -783,40 +808,9 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             if self.path == "/api/adapters/pico/disconnect":
                 if self.pico_gateway is not None:
                     self.pico_gateway.invalidate()
-                return self._json_ok(self.broker.pico_state())
-            if self.path == "/api/teleop/session/start":
-                result = self.broker.teleop_start(
-                        body.get("mode"),
-                        bool(body.get("confirm_hardware", False)),
-                        str(body.get("client_id", "anonymous")),
-                        body.get("execution_mode"),
-                        body.get("input_source"),
-                    )
-                if result.get("session", {}).get("input_source") == "pico":
-                    if self.pico_gateway is None:
-                        raise RuntimeError("PICO WebSocket gateway is unavailable")
-                    result["pico_gateway"] = self.pico_gateway.create_pairing(
-                        str(result["session"]["id"]),
-                        str(result["session"].get("client_id", body.get("client_id", "anonymous"))),
-                    )
-                return self._json_ok(result)
-            if self.path == "/api/teleop/intent":
-                return self._json_ok(self.broker.teleop_intent(body))
-            if self.path == "/api/teleop/session/stop":
-                result = self.broker.teleop_stop(str(body.get("reason", "teleop stopped")))
-                if self.pico_gateway is not None:
-                    self.pico_gateway.invalidate()
-                return self._json_ok(result)
-            if self.path == "/api/teleop/session/heartbeat":
-                return self._json_ok(self.broker.teleop_heartbeat(str(body.get("client_id", "anonymous")), str(body.get("session_id", ""))))
-            if self.path == "/api/teleop/handoff-to-console":
-                return self._json_ok(
-                    self.broker.handoff_to_console(
-                        str(body.get("reason", "operator returned to the control console"))
-                    )
-                )
-            if self.path == "/api/teleop/session/recenter":
-                return self._json_ok(self.broker.teleop_recenter())
+                return self._json_ok(self.runtime.require_adapters().pico_state())
+            if self.path == "/api/operator/handoff-to-console":
+                return self._json_ok(self.broker.handoff_to_console(str(body.get("reason", "operator returned to the control console"))))
             if self.path == "/api/lease/acquire":
                 return self._json_ok(self.broker.acquire(str(body.get("owner", "client")), body.get("ttl_s")))
             if self.path == "/api/lease/renew":

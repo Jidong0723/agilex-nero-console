@@ -349,8 +349,6 @@ def main() -> int:
             "solver_request_id": latest.get("solver_request_id"),
             "control_sample_id": latest.get("control_sample_id"),
             "target_generation": latest.get("target_generation"),
-            "anchor_id": latest.get("anchor_id"),
-            "reference_revision": latest.get("reference_revision"),
             "joint_state_rad": latest.get("joint_angles_rad"),
             "joint_state_monotonic_ns": latest.get("joint_state_monotonic_ns"),
             "motion_epoch": latest.get("motion_epoch"),

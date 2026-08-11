@@ -2,16 +2,18 @@
 
 ## Ownership model
 
-Exactly one `OperationalSpaceController` process owns the NERO USB-CAN adapter. Browser input, policy clients, and operator actions must pass through OSC; no other component may write CAN frames. `RobotControlBroker` remains only as a source-compatible alias for legacy integrations.
+Exactly one `OperationalSpaceController` process owns the NERO USB-CAN adapter. Browser input, policy clients, and operator actions must pass through OSC; no other component may write CAN frames.
 
 ```text
 Browser / local client
         |
         v
-HTTP service (127.0.0.1:8765)
+HTTP service / AdapterRuntime (127.0.0.1:8765)
+  |-- WebAdapter, pi0.5, PICO, cameras
+  |-- narrow OSC client
         |
         v
-OperationalSpaceController
+OperationalSpaceController process
   |-- lease manager
   |-- authority epoch / writer arbitration
   |-- single Pink/Ruckig operational-space servo
@@ -32,10 +34,12 @@ CLI, deterministic environment discovery, and future application/domain/
 infrastructure/adapters namespaces. Existing modules below remain compatible
 implementation modules while callers migrate to the package boundary.
 
-- `application`: HTTP service lifecycle and OSC use cases.
+- `application`: HTTP service lifecycle, AdapterRuntime, and OSC use cases.
 - `domain`: OSC commands, state snapshots, safety and authority concepts.
 - `infrastructure`: runtime discovery, process boundaries, CAN/SDK and solver transport.
-- `adapters`: browser, pi0.5 and external PICO input adaptation.
+- `adapters`: browser, pi0.5 and external PICO input adaptation. Adapters own
+  anchors, device tracking, policy/camera lifecycle, and only emit absolute
+  base-frame TCP targets to OSC.
 
 The runtime is intentionally split: `.venv`/Python 3.12 owns the HTTP service,
 watchdog, reset helper, SDK and CAN; `.conda/nero-kinematics`/Python 3.11 owns
@@ -49,7 +53,7 @@ can construct hardware transport.
 - `supervisor/authority.py`: current hardware writer, servo mode, and monotonically increasing authority epoch.
 - `nero_backend/robot.py`: NERO SDK access, feedback, mode transitions, CPV, joint/Cartesian motion, and gripper commands.
 - `motion/safety.py`: finite-value, dimension, status, speed, workspace, and gripper validation.
-- `motion/teleop.py`: the OSC Pink/Ruckig/CPV servo plus legacy clutch input adaptation.
+- `motion/teleop.py`: the OSC Pink/Ruckig/CPV servo for absolute TCP targets.
 - `motion/teleop_kinematics_server.py`: separate Python 3.11 kinematics process.
 
 ## Priorities

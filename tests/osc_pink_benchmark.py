@@ -137,6 +137,7 @@ def run(settings: dict[str, float]) -> dict[str, Any]:
     config = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     runtime_config = json.loads((ROOT / "config" / "runtime.json").read_text(encoding="utf-8-sig"))
     solver_config = config["solver"]
+    limits = config["limits"]
     settings = {
         "posture_cost": float(solver_config.get("posture_cost", 0.005)),
         "damping_cost": float(solver_config.get("damping_cost", 0.05)),

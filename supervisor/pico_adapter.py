@@ -48,13 +48,13 @@ def _map(matrix: list[list[float]], value: list[float], gain: float) -> list[flo
 class PicoInputAdapter:
     """Convert raw headset input to absolute base-frame OSC targets."""
 
-    def __init__(self, broker: Any, config: dict[str, Any]) -> None:
+    def __init__(self, osc: Any, config: dict[str, Any]) -> None:
         defaults = {"mapping_verified": True, "translation_gain": 1.0, "rotation_gain": 1.0,
                     "position_axis_map": [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
                     "orientation_axis_map": [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
                     "gripper_open_width_m": 0.095, "gripper_force_n": 1.0}
         defaults.update(config or {})
-        self.broker, self.config = broker, defaults
+        self.osc, self.config = osc, defaults
         self.lock = threading.RLock()
         self.state: dict[str, Any] = self._empty_state()
         self._session_id: str | None = None
@@ -62,6 +62,8 @@ class PicoInputAdapter:
         self._anchor_controller: dict[str, list[float]] | None = None
         self._anchor_tcp: dict[str, list[float]] | None = None
         self._sequence = 0
+        self._pairing_stop = threading.Event()
+        self._pairing_thread: threading.Thread | None = None
 
     def _empty_state(self) -> dict[str, Any]:
         return {"adapter": "pico", "state": "IDLE", "session_id": None,
@@ -80,7 +82,7 @@ class PicoInputAdapter:
             return result
 
     def begin_pairing(self, session_id: str, client_id: str) -> None:
-        osc = self.broker.osc_state(); session = osc.get("session") or {}
+        osc = self.osc.state(); session = osc.get("session") or {}
         if session.get("state") != "ACTIVE" or session.get("id") != session_id or session.get("client_id") != client_id:
             raise PermissionError("PICO requires the caller's active OSC session")
         with self.lock:
@@ -89,30 +91,52 @@ class PicoInputAdapter:
             self._sequence = int((osc.get("command") or {}).get("sequence") or 0)
             self.state = self._empty_state()
             self.state.update({"state": "PAIRING", "session_id": session_id, "updated_at": time.time()})
+            self._pairing_stop.set()
+            self._pairing_stop = threading.Event()
+            self._pairing_thread = threading.Thread(target=self._pairing_heartbeat_loop, name="nero-pico-pairing-heartbeat", daemon=True)
+            self._pairing_thread.start()
 
     def paired(self) -> None:
         with self.lock:
             if not self._session_id:
                 raise RuntimeError("PICO pairing has not been started")
             self.state.update({"state": "READY", "connected": True, "paired": True, "updated_at": time.time(), "last_error": None})
+            self._pairing_stop.set()
+
+    def _pairing_heartbeat_loop(self) -> None:
+        while not self._pairing_stop.wait(1.0):
+            with self.lock:
+                if self.state.get("state") != "PAIRING" or not self._session_id or not self._client_id:
+                    return
+                session_id, client_id = self._session_id, self._client_id
+            try:
+                self.osc.heartbeat(client_id, session_id)
+            except Exception as exc:
+                with self.lock:
+                    self.state.update({"state": "ERROR", "last_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
+                return
 
     def _command(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not self._session_id or not self._client_id:
             raise RuntimeError("PICO has no bound OSC session")
         self._sequence = max(self._sequence + 1, int(time.time() * 1000))
-        return self.broker.osc_command({"session_id": self._session_id, "client_id": self._client_id,
-                                        "sequence": self._sequence, "type": kind,
-                                        "acknowledgement_only": kind == "track_tcp", "payload": payload})
+        if kind == "track_tcp":
+            return self.osc.track_tcp(self._session_id, self._client_id, self._sequence, payload["target_pose"])
+        if kind == "hold":
+            return self.osc.hold(self._session_id, self._client_id, self._sequence, str(payload.get("reason", "PICO HOLD")))
+        if kind == "gripper":
+            return self.osc.gripper(self._session_id, self._client_id, self._sequence, payload)
+        raise ValueError(f"unsupported PICO OSC command {kind}")
 
     def heartbeat(self) -> None:
         with self.lock:
             if self._session_id and self._client_id:
-                self.broker.osc_heartbeat(self._client_id, self._session_id)
+                self.osc.heartbeat(self._client_id, self._session_id)
                 self.state["updated_at"] = time.time()
 
     def anchor_begin(self, pose: dict[str, Any]) -> dict[str, Any]:
         position, orientation = _vector(pose.get("position_m"), 3, "controller position"), _normalise(_vector(pose.get("orientation_xyzw"), 4, "controller orientation"))
-        osc = self.broker.osc_state()
+        osc = self.osc.state()
         tcp = (osc.get("execution") or {}).get("measured_tcp_pose") or (osc.get("command") or {}).get("target_tcp")
         if not isinstance(tcp, dict):
             raise RuntimeError("OSC did not publish a current TCP pose")
@@ -155,7 +179,7 @@ class PicoInputAdapter:
     def stop(self, reason: str) -> dict[str, Any]:
         with self.lock:
             self._anchor_controller = self._anchor_tcp = None
-            osc_session = (self.broker.osc_state().get("session") or {}) if self._session_id else {}
+            osc_session = (self.osc.state().get("session") or {}) if self._session_id else {}
             session_is_current = bool(
                 self._session_id
                 and osc_session.get("state") == "ACTIVE"
@@ -167,6 +191,7 @@ class PicoInputAdapter:
             return result
 
     def disconnected(self, reason: str) -> None:
+        self._pairing_stop.set()
         try:
             self.stop(reason)
         except Exception as exc:
