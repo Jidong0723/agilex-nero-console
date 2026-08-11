@@ -222,3 +222,5 @@
 .osc-card .layer-strip{order:unset;margin:0}
 .maintenance{order:5}
 #tcp-reference-readout{order:6}
+.teleop-panel .pi05-help .help-content{grid-template-columns:repeat(2,minmax(0,1fr))}
+@media(max-width:720px){.teleop-panel .pi05-help .help-content{grid-template-columns:1fr}}

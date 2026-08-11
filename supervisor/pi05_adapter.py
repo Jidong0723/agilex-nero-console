@@ -137,6 +137,8 @@ class Pi05InputAdapter:
         self.broker, self.config_path = broker, Path(config_path)
         self.config = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.lock = threading.RLock(); self.stop_event = threading.Event(); self.worker: threading.Thread | None = None
+        self._connection_stop = threading.Event(); self._policy: OpenPIClient | None = None
+        self._connection_thread = threading.Thread(target=self._connection_loop, name="nero-pi05-websocket", daemon=True)
         self.camera_resource = camera_resource
         # Compatibility seam for direct adapter tests; production always uses
         # the broker-owned shared camera resource.
@@ -144,6 +146,7 @@ class Pi05InputAdapter:
         self._last_connection_probe = 0.0
         self._connections: dict[str, Any] = {}
         self.state: dict[str, Any] = self._new_state()
+        self._connection_thread.start()
 
     def _new_state(self) -> dict[str, Any]:
         return {"adapter": "pi05", "state": "IDLE", "camera_state": "IDLE", "model_state": "UNKNOWN",
@@ -180,6 +183,46 @@ class Pi05InputAdapter:
         try:
             with socket.create_connection((host, port), timeout=.25): return True
         except OSError: return False
+
+    def _connection_loop(self) -> None:
+        """Keep a lightweight policy WebSocket handshake independent of inference."""
+        while not self._connection_stop.is_set():
+            with self.lock:
+                connected = self._policy is not None
+                model = dict(self.config["model"])
+            if not connected:
+                try:
+                    policy = OpenPIClient(str(model["host"]), int(model["port"]), float(model["request_timeout_s"]))
+                    with self.lock:
+                        if self._connection_stop.is_set():
+                            policy.close()
+                        else:
+                            self._policy = policy
+                            self.state.update({"model_state": "CONNECTED", "last_error": None, "updated_at": time.time()})
+                except Exception as exc:
+                    with self.lock:
+                        self.state.update({"model_state": "CONNECTING", "last_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
+            self._connection_stop.wait(1.0)
+
+    def _policy_client(self) -> OpenPIClient:
+        deadline = time.monotonic() + float(self.config["model"]["request_timeout_s"])
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            with self.lock:
+                if self._policy is not None:
+                    return self._policy
+            # The synchronous fallback also keeps direct adapter users and
+            # tests deterministic when the background connector has not run.
+            try:
+                model = self.config["model"]
+                policy = OpenPIClient(str(model["host"]), int(model["port"]), float(model["request_timeout_s"]))
+                with self.lock:
+                    self._policy = policy
+                    self.state.update({"model_state": "CONNECTED", "last_error": None, "updated_at": time.time()})
+                return policy
+            except Exception:
+                pass
+            time.sleep(.05)
+        raise RuntimeError("π0.5 WebSocket is not connected")
 
     def _refresh_connections_locked(self) -> None:
         if time.monotonic() - self._last_connection_probe < 1.0: return
@@ -311,8 +354,7 @@ class Pi05InputAdapter:
     def _run(self) -> None:
         policy = None
         try:
-            model = self.config["model"]; policy = OpenPIClient(str(model["host"]), int(model["port"]), float(model["request_timeout_s"]))
-            with self.lock: self.state["model_state"] = "CONNECTED"
+            policy = self._policy_client()
             while not self.stop_event.is_set():
                 started = time.monotonic(); osc = self.broker.osc_state(); session = osc.get("session") or {}
                 with self.lock: session_id, client_id = self.state["session_id"], self.state["client_id"]
@@ -350,10 +392,15 @@ class Pi05InputAdapter:
         except Exception as exc:
             with self.lock: self.state.update({"state": "ERROR", "last_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
         finally:
-            if policy:
-                try: policy.close()
-                except Exception: pass
+            pass
 
     def close(self) -> None:
         self.stop("service closing")
+        self._connection_stop.set()
+        with self.lock:
+            policy = self._policy
+            self._policy = None
+        if policy:
+            try: policy.close()
+            except Exception: pass
         if self.camera_resource is None and self.cameras: self.cameras.close()
