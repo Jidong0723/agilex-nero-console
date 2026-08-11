@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import threading
+import time
 from typing import Any
 
 
@@ -50,6 +51,7 @@ class SharedCameraResource:
         self.preview_stop = threading.Event(); self.preview_thread: threading.Thread | None = None
         self.frames: dict[str, Any] = {}; self.frame_version = 0; self.last_error: str | None = None
         self._devices: list[dict[str, Any]] | None = None
+        self._devices_at = 0.0
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -58,20 +60,33 @@ class SharedCameraResource:
 
     def devices(self) -> list[dict[str, Any]]:
         with self.lock:
-            if self._devices is not None: return copy.deepcopy(self._devices)
+            if self._devices is not None and time.monotonic() - self._devices_at < 2.0:
+                return copy.deepcopy(self._devices)
         try:
             import cv2
+            devices: dict[int, dict[str, Any]] = {}
             try:
                 from cv2_enumerate_cameras import enumerate_cameras
-                devices = [{"index": int(item.index), "name": str(item.name), "backend": int(item.backend)} for item in enumerate_cameras(cv2.CAP_DSHOW)]
+                for item in enumerate_cameras(cv2.CAP_DSHOW):
+                    devices[int(item.index)] = {"index": int(item.index), "name": str(item.name), "backend": int(item.backend)}
             except Exception:
-                devices = []
+                pass
+            # The enumeration package is not installed in every service
+            # environment. Probe all usable OpenCV backends as a fallback and
+            # merge the results instead of stopping after the first backend.
+            backends = [getattr(cv2, "CAP_DSHOW", 700), getattr(cv2, "CAP_MSMF", 1400), getattr(cv2, "CAP_ANY", 0)]
+            for backend in dict.fromkeys(backends):
                 for index in range(10):
-                    capture = cv2.VideoCapture(index, cv2.CAP_DSHOW if hasattr(cv2, "CAP_DSHOW") else 0)
+                    if index in devices: continue
+                    capture = cv2.VideoCapture(index, backend)
                     opened = capture.isOpened(); capture.release()
-                    if opened: devices.append({"index": index, "name": f"OpenCV camera {index}", "backend": int(getattr(cv2, "CAP_DSHOW", 0))})
+                    if opened:
+                        devices[index] = {"index": index, "name": f"OpenCV camera {index}", "backend": int(backend)}
+            devices = [devices[index] for index in sorted(devices)]
         except Exception as exc: raise RuntimeError(f"camera enumeration failed: {exc}") from exc
-        with self.lock: self._devices = devices; return copy.deepcopy(devices)
+        with self.lock:
+            self._devices = devices; self._devices_at = time.monotonic()
+            return copy.deepcopy(devices)
 
     def update_config(self, cameras: dict[str, Any]) -> dict[str, Any]:
         with self.lock:

@@ -345,9 +345,10 @@
     const result = $("pi05-result"); if (result) result.textContent = pi.last_error || "";
     $("pi05-external-preview").textContent = pi.camera_ready ? "模型输入 224 × 224 RGB" : "等待画面";
     $("pi05-wrist-preview").textContent = pi.camera_ready ? "模型输入 224 × 224 RGB" : "等待画面";
-    if (pi.frame_version) {
-      $("pi05-external-frame").src = `/api/pi05/frame/external.jpg?v=${pi.frame_version}`;
-      $("pi05-wrist-frame").src = `/api/pi05/frame/wrist.jpg?v=${pi.frame_version}`;
+    const frameVersion = Number(pi.frame_version || state.cameras?.frame_version || 0);
+    if (frameVersion) {
+      $("pi05-external-frame").src = `/api/cameras/frame/external.jpg?v=${frameVersion}`;
+      $("pi05-wrist-frame").src = `/api/cameras/frame/wrist.jpg?v=${frameVersion}`;
       $("pi05-external-frame").classList.add("ready"); $("pi05-wrist-frame").classList.add("ready");
     }
     if ($("pi05-cameras")) $("pi05-cameras").disabled = pi.state === "RUNNING";
