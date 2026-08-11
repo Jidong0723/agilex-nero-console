@@ -172,16 +172,6 @@ class AgxCandoBus(BusABC):
         self._loopback = local_loopback
         self._queue = collections.deque()
         self._queue_cond = threading.Condition()
-        # cando.dll does not document concurrent calls on one device handle.
-        # The reader thread and command thread previously entered
-        # cando_frame_read/cando_frame_send at the same time, which can corrupt
-        # the native heap (0xC0000374). Serialize every operation touching the
-        # handle and make shutdown one-shot.
-        self._native_lock = threading.RLock()
-        self._shutdown_lock = threading.Lock()
-        self._closed = False
-        self._device_opened = False
-        self._device_started = False
         self._rx_thread = None  # type: Optional[threading.Thread]
         self._shutdown_flag = threading.Event()
         self._list_handle = _VOID_P()
@@ -211,24 +201,13 @@ class AgxCandoBus(BusABC):
                     % (self._channel_index, int(count.value))
                 )
 
+            if not dll.cando_malloc(self._list_handle, self._channel_index, ctypes.byref(self._dev_handle)):
+                raise CanInitializationError("cando_malloc failed for channel %s" % self._channel_index)
             opened = False
-            for _ in range(3):
-                self._dev_handle = _VOID_P()
-                if not dll.cando_malloc(
-                    self._list_handle,
-                    self._channel_index,
-                    ctypes.byref(self._dev_handle),
-                ):
-                    raise CanInitializationError("cando_malloc failed for channel %s" % self._channel_index)
+            for _ in range(20):
                 if dll.cando_open(self._dev_handle):
                     opened = True
-                    self._device_opened = True
                     break
-                # A failed open leaves an allocated but unopened instance.
-                # Calling stop/close on it corrupts some cando.dll versions;
-                # free it and create a brand-new instance for any retry.
-                dll.cando_free(self._dev_handle)
-                self._dev_handle = _VOID_P()
                 time.sleep(0.1)
             if not opened:
                 raise CanInitializationError("cando_open failed for channel %s" % self._channel_index)
@@ -242,7 +221,6 @@ class AgxCandoBus(BusABC):
                 mode |= CANDO_MODE_NO_ECHO_BACK
             if not dll.cando_start(self._dev_handle, mode):
                 raise CanInitializationError("cando_start failed")
-            self._device_started = True
         except Exception:
             self._close_handles()
             raise
@@ -252,52 +230,40 @@ class AgxCandoBus(BusABC):
         self._rx_thread.start()
 
     def _close_handles(self):
-        with self._native_lock:
-            dll = self._api.dll
-            if self._dev_handle:
-                if self._device_started:
-                    try:
-                        dll.cando_stop(self._dev_handle)
-                    except Exception:
-                        pass
-                    self._device_started = False
-                if self._device_opened:
-                    try:
-                        dll.cando_close(self._dev_handle)
-                    except Exception:
-                        pass
-                    self._device_opened = False
-                try:
-                    dll.cando_free(self._dev_handle)
-                except Exception:
-                    pass
-            if self._list_handle:
-                try:
-                    dll.cando_list_free(self._list_handle)
-                except Exception:
-                    pass
-            self._dev_handle = _VOID_P()
-            self._list_handle = _VOID_P()
+        dll = self._api.dll
+        if self._dev_handle:
+            try:
+                dll.cando_stop(self._dev_handle)
+            except Exception:
+                pass
+            try:
+                dll.cando_close(self._dev_handle)
+            except Exception:
+                pass
+            try:
+                dll.cando_free(self._dev_handle)
+            except Exception:
+                pass
+        if self._list_handle:
+            try:
+                dll.cando_list_free(self._list_handle)
+            except Exception:
+                pass
+        self._dev_handle = _VOID_P()
+        self._list_handle = _VOID_P()
 
     def _recv_loop(self):
         dll = self._api.dll
         while not self._shutdown_flag.is_set():
             first = CandoFrame()
-            with self._native_lock:
-                if self._closed or not self._dev_handle:
-                    break
-                received = dll.cando_frame_read(self._dev_handle, ctypes.byref(first), 10)
-            if not received:
+            if not dll.cando_frame_read(self._dev_handle, ctypes.byref(first), 10):
                 continue
             self._enqueue_frame(first)
 
             # Drain any frames already queued in the device without another blocking wait.
             while not self._shutdown_flag.is_set():
                 frame = CandoFrame()
-                with self._native_lock:
-                    if self._closed or not self._dev_handle:
-                        return
-                    received = dll.cando_frame_read(self._dev_handle, ctypes.byref(frame), 0)
+                received = dll.cando_frame_read(self._dev_handle, ctypes.byref(frame), 0)
                 if not received:
                     break
                 self._enqueue_frame(frame)
@@ -330,11 +296,8 @@ class AgxCandoBus(BusABC):
         frame.channel = 0
         for idx, value in enumerate(bytes(msg.data)):
             frame.data[idx] = value
-        with self._native_lock:
-            if self._closed or not self._dev_handle:
-                raise CanOperationError("agx_cando device is closed")
-            if not self._api.dll.cando_frame_send(self._dev_handle, ctypes.byref(frame)):
-                raise CanOperationError("cando_frame_send failed")
+        if not self._api.dll.cando_frame_send(self._dev_handle, ctypes.byref(frame)):
+            raise CanOperationError("cando_frame_send failed")
 
     def _recv_internal(self, timeout):
         deadline = None
@@ -372,17 +335,15 @@ class AgxCandoBus(BusABC):
         self._filters = filters
 
     def shutdown(self):
-        with self._shutdown_lock:
-            if self._closed:
-                return
-            self._shutdown_flag.set()
-            with self._queue_cond:
-                self._queue_cond.notify_all()
-            if self._rx_thread and self._rx_thread.is_alive():
-                self._rx_thread.join(timeout=0.5)
-            self._close_handles()
-            self._closed = True
-            super(AgxCandoBus, self).shutdown()
+        if getattr(self, "_shutdown_flag", None) is None:
+            return
+        self._shutdown_flag.set()
+        with self._queue_cond:
+            self._queue_cond.notify_all()
+        if self._rx_thread and self._rx_thread.is_alive():
+            self._rx_thread.join(timeout=0.2)
+        self._close_handles()
+        super(AgxCandoBus, self).shutdown()
 
     @staticmethod
     def _detect_available_configs():

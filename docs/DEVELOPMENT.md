@@ -20,10 +20,16 @@ powershell -ExecutionPolicy Bypass -File .\setup-kinematics.ps1
 
 The test suite uses fakes and shadow transport. Do not add a test that opens real CAN hardware to CI.
 
+## Vendored CANDO baseline
+
+`vendor/python-can-agx-cando` is synchronized with AgileX upstream commit
+[`b222c4027ad4f6599f7634c72c67184619177972`](https://github.com/agilexrobotics/python-can-agx-cando/commit/b222c4027ad4f6599f7634c72c67184619177972).
+Keep the upstream RX/TX concurrency model intact; ownership of CAN writes is
+enforced by this project's `HardwareTxOwner`, not by private locks in CANDO.
+
 ## Dependency groups
 
 - `requirements/control.txt`: runtime and local SDK dependencies.
 - `requirements/pi05.txt`: optional pi0.5 camera/inference adapter dependencies.
 - `requirements/dev.txt`: development test dependency entry point.
 - `environment-kinematics.yml`: only the Pinocchio/Pink Conda environment.
-

@@ -59,6 +59,14 @@ class NeroRobot:
         }
         self._gripper_requires_enable_clear = False
         self._cpv_stream_started = False
+        self._cpv_auto_mode_before_stream: bool | None = None
+        self._arm_status_lock = threading.Lock()
+        self._arm_status_revision = 0
+        self._arm_status_snapshot: dict[str, Any] = {
+            "revision": 0, "received_monotonic_ns": None,
+            "sdk_timestamp": None, "ctrl_mode": None, "mode_feedback": None,
+        }
+        self._arm_status_observer_installed = False
         self._connect_stage = "idle"
         self._task_tcp_offset_m = self._configured_task_tcp_offset()
 
@@ -109,6 +117,13 @@ class NeroRobot:
             self._leader_sdk_timestamp = None
             self._leader_seen_monotonic = None
             self._leader_feedback_hz = None
+        with self._arm_status_lock:
+            self._arm_status_revision = 0
+            self._arm_status_snapshot = {
+                "revision": 0, "received_monotonic_ns": None,
+                "sdk_timestamp": None, "ctrl_mode": None, "mode_feedback": None,
+            }
+            self._arm_status_observer_installed = False
         if interface == "agx_cando":
             self._connect_stage = "detect_usb_can"
             available = can.detect_available_configs(["agx_cando"])
@@ -129,6 +144,7 @@ class NeroRobot:
         try:
             self._connect_stage = "open_sdk_can_bus"
             self.robot.connect()
+            self._install_arm_status_observer()
             self._connect_stage = "configure_task_tcp"
             task_tcp = self._apply_task_tcp_offset()
             self._connect_stage = "initialize_gripper"
@@ -221,8 +237,56 @@ class NeroRobot:
         self.gripper = None
         self._control_mode = "DISCONNECTED"
         self._cpv_stream_started = False
+        self._cpv_auto_mode_before_stream = None
         self._last_control_reason = "disconnected"
         return result
+
+    def bind_tx_owner_thread(self, thread_id: int) -> dict[str, Any]:
+        """Bind CAN send to the HardwareTxOwner worker after connection."""
+        if self.robot is None:
+            raise RuntimeError("robot is not connected")
+        context = getattr(self.robot, "_ctx", None)
+        getter = getattr(context, "get_comm", None)
+        comm = getter() if callable(getter) else None
+        binder = getattr(comm, "bind_tx_owner_thread", None)
+        if not callable(binder):
+            return {"bound": False, "reason": "CAN comm does not expose a TX owner gate"}
+        binder(int(thread_id))
+        return {"bound": True, "thread_id": int(thread_id)}
+
+    def _install_arm_status_observer(self) -> None:
+        """Capture immutable 0x2A1 snapshots after the SDK parser runs."""
+        context = getattr(self.robot, "_ctx", None)
+        register = getattr(context, "register_parser_packet_fun", None)
+        if not callable(register):
+            return
+        register(self._capture_arm_status_frame)
+        self._arm_status_observer_installed = True
+
+    def _capture_arm_status_frame(self, frame: Any) -> None:
+        if int(getattr(frame, "arbitration_id", -1)) != 0x2A1 or self.robot is None:
+            return
+        try:
+            status = self.robot.get_arm_status()
+            message = getattr(status, "msg", None)
+            ctrl_mode = self._enum_int(getattr(message, "ctrl_mode", None))
+            mode_feedback = self._enum_int(getattr(message, "mode_feedback", None))
+            sdk_timestamp = getattr(status, "timestamp", None)
+        except Exception:
+            return
+        with self._arm_status_lock:
+            self._arm_status_revision += 1
+            self._arm_status_snapshot = {
+                "revision": self._arm_status_revision,
+                "received_monotonic_ns": time.monotonic_ns(),
+                "sdk_timestamp": jsonable(sdk_timestamp),
+                "ctrl_mode": ctrl_mode,
+                "mode_feedback": mode_feedback,
+            }
+
+    def arm_status_snapshot(self) -> dict[str, Any]:
+        with self._arm_status_lock:
+            return dict(self._arm_status_snapshot)
 
     def stop(self, reason: str = "stop requested") -> ExecutedAction:
         # Normal stops do not create a new J-mode position target.
@@ -269,6 +333,7 @@ class NeroRobot:
             "emergency_latched": self._emergency_latched,
             "freedrive_recovery": dict(self._freedrive_recovery),
             "continuous_stream_active": self._cpv_stream_started,
+            "arm_status_feedback": self.arm_status_snapshot(),
             "error": error,
         }
 
@@ -875,16 +940,7 @@ class NeroRobot:
         }
         joint_sent_ns: list[int] = []
         with self._command_lock:
-            if not self._cpv_stream_started:
-                enabled, enable_status = self._enable_all_with_retry(
-                    timeout=float(self.motion_config.get("enable_timeout_s", 8.0))
-                )
-                if not enabled:
-                    raise RuntimeError(f"required joints are not enabled: {enable_status}")
-                mode = getattr(getattr(self.robot, "OPTIONS", None), "MOTION_MODE", None)
-                cpv = getattr(mode, "CPV", "cpv")
-                self.robot.set_motion_mode(cpv)
-                self._cpv_stream_started = True
+            cpv_entry = self._enter_cpv_stream_if_needed()
             move = getattr(self.robot, "move_cpv_pos", None)
             if move is None:
                 raise RuntimeError("NERO SDK does not expose move_cpv_pos")
@@ -911,8 +967,72 @@ class NeroRobot:
             "joint_sent_monotonic_ns": joint_sent_ns,
             "batch_duration_ms": (finished_ns - started_ns) / 1e6,
             "batch_skew_ms": ((max(joint_sent_ns) - min(joint_sent_ns)) / 1e6) if joint_sent_ns else 0.0,
+            "cpv_mode_entry": cpv_entry,
             "can_diagnostics": self.can_dispatch_diagnostics(consume_slow=True),
         }
+
+    def _enter_cpv_stream_if_needed(self) -> dict[str, Any]:
+        """Enter CPV once and require a post-command Arm Status revision."""
+        if self._cpv_stream_started:
+            return {"entered": False, "confirmed": True, **self.arm_status_snapshot()}
+        if self.robot is None:
+            raise RuntimeError("robot is not connected")
+        enabled, enable_status = self._enable_all_with_retry(
+            timeout=float(self.motion_config.get("enable_timeout_s", 8.0))
+        )
+        if not enabled:
+            raise RuntimeError(f"required joints are not enabled: {enable_status}")
+        if not self._arm_status_observer_installed:
+            raise RuntimeError("cannot enter CPV: Arm Status RX revision observer is unavailable")
+        baseline = self.arm_status_snapshot()
+        auto_mode = True
+        getter = getattr(self.robot, "get_auto_set_motion_mode_enabled", None)
+        if callable(getter):
+            auto_mode = bool(getter())
+        setter = getattr(self.robot, "set_auto_set_motion_mode_enabled", None)
+        if callable(setter):
+            setter(False)
+        try:
+            mode = getattr(getattr(self.robot, "OPTIONS", None), "MOTION_MODE", None)
+            cpv = getattr(mode, "CPV", "cpv")
+            command_sent_ns = time.monotonic_ns()
+            self.robot.set_motion_mode(cpv)
+            confirmed = self._wait_for_cpv_mode_revision(
+                baseline_revision=int(baseline["revision"]),
+                timeout=float(self.motion_config.get("cpv_mode_confirm_timeout_s", 1.0)),
+            )
+            if confirmed is None:
+                current = self.arm_status_snapshot()
+                raise RuntimeError(
+                    "CPV mode confirmation timed out: "
+                    f"baseline_revision={baseline['revision']}, current={current}, "
+                    f"command_sent_monotonic_ns={command_sent_ns}"
+                )
+        except Exception:
+            if callable(setter):
+                setter(auto_mode)
+            raise
+        self._cpv_auto_mode_before_stream = auto_mode
+        self._cpv_stream_started = True
+        return {
+            "entered": True, "confirmed": True,
+            "baseline_revision": baseline["revision"],
+            "command_sent_monotonic_ns": command_sent_ns,
+            **confirmed,
+        }
+
+    def _wait_for_cpv_mode_revision(self, baseline_revision: int, timeout: float) -> dict[str, Any] | None:
+        deadline = time.monotonic() + max(0.05, timeout)
+        while time.monotonic() < deadline:
+            snapshot = self.arm_status_snapshot()
+            if (
+                int(snapshot.get("revision") or 0) > int(baseline_revision)
+                and snapshot.get("ctrl_mode") == 0x01
+                and snapshot.get("mode_feedback") == 0x05
+            ):
+                return snapshot
+            time.sleep(0.005)
+        return None
 
     def can_dispatch_diagnostics(self, *, consume_slow: bool = False) -> dict[str, Any]:
         """Read bounded SDK/CAN TX diagnostics without issuing a CAN query."""
@@ -971,12 +1091,19 @@ class NeroRobot:
         move = getattr(self.robot, "move_cpv_pos", None)
         if move is None:
             raise RuntimeError("NERO SDK does not expose move_cpv_pos for CPV handoff")
-        with self._command_lock:
-            for index, value in enumerate(joints, start=1):
-                move(joint_index=index, pos=value)
-        if not self._wait_joint_velocity_settled(timeout=timeout):
-            raise RuntimeError("CPV position hold was sent but joint motion did not settle")
-        self._cpv_stream_started = False
+        try:
+            with self._command_lock:
+                for index, value in enumerate(joints, start=1):
+                    move(joint_index=index, pos=value)
+            if not self._wait_joint_velocity_settled(timeout=timeout):
+                raise RuntimeError("CPV position hold was sent but joint motion did not settle")
+        finally:
+            previous_auto_mode = self._cpv_auto_mode_before_stream
+            setter = getattr(self.robot, "set_auto_set_motion_mode_enabled", None)
+            if previous_auto_mode is not None and callable(setter):
+                setter(previous_auto_mode)
+            self._cpv_auto_mode_before_stream = None
+            self._cpv_stream_started = False
 
     def prime_cpv_position_from_feedback(self) -> dict[str, Any]:
         """Start CPV with a measured joint-position hold, never a velocity."""

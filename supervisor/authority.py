@@ -108,13 +108,13 @@ class ControlSupervisor:
             return self._state.writer is ArmWriter.SAFETY
 
 
-class HardwareTransportOwner:
-    """The only active SDK caller, with P0/P1/P2 request priority.
+class HardwareTxOwner:
+    """The only SDK/CAN TX owner, with P0/P1/P2 request priority.
 
     A vendor call already in progress cannot be interrupted safely from Python,
-    but queued P0 work always wins at the next SDK-call boundary.  P2 calls are
-    intentionally dispatched only through this owner and are therefore never
-    concurrent with feedback or CPV writes.
+    but queued P0 work always wins at the next SDK-call boundary. Every SDK
+    operation that can emit a CAN frame runs on this one thread; the vendor
+    CANDO RX thread remains independent and can receive while TX is active.
     """
 
     _PRIORITY = {"p0": 0, "p1": 1, "p2": 2}
@@ -132,7 +132,7 @@ class HardwareTransportOwner:
         self._active: dict[str, Any] | None = None
         self._active_lock = threading.Lock()
         self._closed = threading.Event()
-        self._thread = threading.Thread(target=self._loop, name="nero-hardware-transport", daemon=True)
+        self._thread = threading.Thread(target=self._loop, name="nero-hardware-tx", daemon=True)
         self._thread.start()
 
     def call(
@@ -307,13 +307,21 @@ class HardwareTransportOwner:
                 raise ServoWriteRevoked(
                     f"queued {category}/{method} was revoked before SDK dispatch"
                 )
-            return getattr(self.backend, method)(*args, **kwargs)
+            result = getattr(self.backend, method)(*args, **kwargs)
+            # Connecting necessarily emits SDK traffic before a CAN comm
+            # exists. Bind the gate immediately afterwards so every later
+            # send must originate from this owner thread.
+            if method == "connect":
+                binder = getattr(self.backend, "bind_tx_owner_thread", None)
+                if callable(binder):
+                    binder(threading.get_ident())
+            return result
 
 
 class TransportRobotProxy:
     """Compatibility proxy: default Broker operations are P2 transactions."""
 
-    def __init__(self, owner: HardwareTransportOwner, backend: Any) -> None:
+    def __init__(self, owner: HardwareTxOwner, backend: Any) -> None:
         self._owner, self._backend = owner, backend
 
     def call(

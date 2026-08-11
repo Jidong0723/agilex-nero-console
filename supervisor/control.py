@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 from .logging import JsonlExperimentLogger
 from .authority import (
-    CommandRevoked, CommandStream, ArmWriter, ControlSupervisor, HardwareTransportOwner,
+    CommandRevoked, CommandStream, ArmWriter, ControlSupervisor, HardwareTxOwner,
     ServoMode, ServoWriteRevoked, TransportRobotProxy,
 )
 from nero_backend.robot import NeroRobot
@@ -144,7 +144,7 @@ class OperationalSpaceController:
         self._handoff_lock = threading.RLock()
         self._authority_epoch_lock = threading.RLock()
         self._status_lock = threading.Lock()
-        self._transport_owner = HardwareTransportOwner(backend)
+        self._transport_owner = HardwareTxOwner(backend)
         self._transport_reset_lock = threading.Lock()
         self._transport_reset_scheduled = False
         self._hardware_transport_available = True
@@ -153,6 +153,7 @@ class OperationalSpaceController:
         self.maintenance = HardwareMaintenance(self.robot)
         self.supervisor = ControlSupervisor()
         self._status_cache: tuple[float, dict[str, Any]] | None = None
+        self._last_cpv_mode_entry: dict[str, Any] | None = None
         self._active_action: dict[str, Any] | None = None
         self._action_observers: list[Callable[..., None]] = []
         self._jobs: dict[str, dict[str, Any]] = {}
@@ -280,13 +281,15 @@ class OperationalSpaceController:
             # sample from being a partially-dispatched batch.
             epoch = int(state["control_epoch"])
             try:
-                self.robot.call(
+                prime_result = self.robot.call(
                     "p1", "prime_cpv_position_from_feedback",
                     command_epoch=epoch,
                     category="servo_position",
                     execute_guard=lambda: self.supervisor.allows_servo(None, epoch),
                     dispatch_timeout_s=5.0,
                 )
+                if isinstance(prime_result, dict):
+                    self._last_cpv_mode_entry = dict(prime_result.get("cpv_mode_entry") or {})
             except TimeoutError as exc:
                 self._schedule_transport_reset(f"CPV position prime timeout: {exc}")
                 raise RuntimeError(f"CPV prime timed out; control service reset scheduled: {exc}") from exc
@@ -1027,6 +1030,7 @@ class OperationalSpaceController:
             "tcp_source": hardware_raw.get("tcp_pose_source") if isinstance(hardware_raw, dict) else None,
             "joint_angles_rad": hardware_robot.get("joint_angles_rad") if isinstance(hardware_robot, dict) else None,
             "arm_status": hardware_robot.get("arm_status") if isinstance(hardware_robot, dict) else None,
+            "arm_status_feedback": (snapshot.get("control") or {}).get("arm_status_feedback"),
             "joint_feedback_source": (snapshot.get("control") or {}).get("joint_feedback_source"),
             "timestamp": hardware_robot.get("timestamp") if isinstance(hardware_robot, dict) else None,
             "feedback_age_s": snapshot.get("status_age_s"),
@@ -1083,6 +1087,7 @@ class OperationalSpaceController:
                 "participation": "shadow_simulated" if shadow else "active" if active_session else "not_participating",
                 "cpv_dispatch_count": raw_diagnostics.get("cpv_dispatch_count", 0),
                 "last_cpv_dispatch": None if shadow else (recent_batches[-1] if recent_batches else None),
+                "last_cpv_mode_entry": None if shadow else self._last_cpv_mode_entry,
                 "cpv_parameters": raw_diagnostics.get("cpv_parameters", {"status": "not_read"}),
             },
             "solver": servo.get("solver"),
@@ -1237,7 +1242,10 @@ class OperationalSpaceController:
         the teleop page's return action.  It prevents a console command from
         reaching the arm between a residual CPV command and a verified hold.
         """
-        self._require_operational_control()
+        # Full status polling is intentionally paused while hardware CPV is
+        # tracking. A stale aggregate snapshot must never block the safety
+        # path that revokes the stream and returns to Follower/HOLD.
+        self._require_operational_control(allow_stale=True)
         with self._handoff_lock:
             stopped = self._stop_teleop_for_mode_transition(reason)
             if not stopped.get("ok"):
@@ -1533,7 +1541,10 @@ class OperationalSpaceController:
         preserve_on_freedrive: bool,
         resume_teleop: bool = False,
     ) -> dict[str, Any]:
-        self._require_operational_control()
+        # HOLD is the safety escape from a tracking session. Hardware status
+        # polling is deliberately paused while CPV owns the transport, so a
+        # stale full snapshot must never prevent this revocation/handoff.
+        self._require_operational_control(allow_stale=True)
         reason = f"operator requested gripper {mode}"
         teleop_before = self.teleop.status().get("session") or {}
         # Gripper I/O does not change the arm control mode. Keep an active

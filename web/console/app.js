@@ -1063,7 +1063,15 @@
   void loadSharedCameras();
   $("input-adapter")?.addEventListener("change", applyAdapterSelection);
   $("execution-mode")?.addEventListener("change", () => { resetWebAdapter(); render(); });
-  $("right-mode")?.addEventListener("change", () => { state.rightMode = $("right-mode").value; resetInput(true); updateRightLabels(); });
+  $("right-mode")?.addEventListener("change", () => {
+    // Changing the axis mapping must not clear the active joystick or the
+    // accumulated relative TCP pose. Only the interpretation of the right
+    // stick changes; the current target remains continuous across the switch.
+    state.rightMode = $("right-mode").value;
+    updateRightLabels();
+    updateInputView();
+    if (state.webAdapterActive) requestIntent();
+  });
   $("scale")?.addEventListener("input", () => { $("scale-value").textContent = `${Math.round(Number($("scale").value) * 100)}%`; });
   window.addEventListener("keydown", (event) => { if (!keys.has(event.code) || event.repeat || ["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement?.tagName)) return; event.preventDefault(); state.keys.add(event.code); updateInputView(); });
   window.addEventListener("keyup", (event) => { if (!keys.has(event.code)) return; event.preventDefault(); state.keys.delete(event.code); updateInputView(); });

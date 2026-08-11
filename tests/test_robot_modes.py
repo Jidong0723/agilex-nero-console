@@ -98,6 +98,10 @@ class FakeSdkRobot:
         self.events: list[str] = []
         self.motion_mode_calls = 0
         self.motion_modes: list[str] = []
+        self.auto_set_motion_mode = True
+        self.mode_feedback = 1
+        self._parser_callbacks = []
+        self._ctx = SimpleNamespace(register_parser_packet_fun=self._parser_callbacks.append)
         self.cartesian_calls: list[tuple[str, list[float]]] = []
         self.cpv_position_calls: list[tuple[int, float]] = []
         self.cpv_profile = {"acc": [1.0] * 7, "dcc": [1.0] * 7, "cv": [0.1] * 7}
@@ -124,7 +128,7 @@ class FakeSdkRobot:
         return SimpleNamespace(msg=SimpleNamespace(
             ctrl_mode=2 if self.drag_teach else 1,
             arm_status=self.arm_status_value,
-            mode_feedback=1,
+            mode_feedback=self.mode_feedback,
             teach_status=1 if self.drag_teach else 0,
             motion_status=0, trajectory_num=0, err_status={},
         ))
@@ -149,7 +153,18 @@ class FakeSdkRobot:
         self.motion_mode_calls += 1
         self.motion_modes.append(value)
         self.events.append(f"motion:{value}")
+        if value == "cpv":
+            self.mode_feedback = 5
+            frame = SimpleNamespace(arbitration_id=0x2A1)
+            for callback in list(self._parser_callbacks):
+                callback(frame)
         return None
+
+    def set_auto_set_motion_mode_enabled(self, enabled):
+        self.auto_set_motion_mode = bool(enabled)
+
+    def get_auto_set_motion_mode_enabled(self):
+        return self.auto_set_motion_mode
 
     def set_cpv_acc(self, joint_index, acc, timeout=1.0):
         self.cpv_profile["acc"][int(joint_index) - 1] = float(acc); return True
@@ -248,6 +263,7 @@ class RobotModeTests(unittest.TestCase):
         sdk.gripper = gripper
         robot.robot = sdk
         robot.gripper = gripper
+        robot._install_arm_status_observer()
         robot._control_mode = "FREEDRIVE"
         robot._freedrive_backend = "leader"
         return robot, sdk
@@ -280,6 +296,30 @@ class RobotModeTests(unittest.TestCase):
         ])
         self.assertEqual(result["joint_target_rad"], [0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7])
         self.assertNotIn("enable", sdk.events)
+
+    def test_cpv_stream_switches_mode_once_until_it_is_stopped(self) -> None:
+        robot, sdk = self.make_robot()
+        robot.send_cpv_position([0.1] * 7)
+        robot.send_cpv_position([0.2] * 7)
+        self.assertEqual(sdk.motion_modes, ["cpv"])
+        self.assertFalse(sdk.auto_set_motion_mode)
+
+        sdk.motor_velocity = [0.0] * 7
+        robot._stop_cpv_stream(timeout=0.1)
+        self.assertTrue(sdk.auto_set_motion_mode)
+        robot.send_cpv_position([0.3] * 7)
+        self.assertEqual(sdk.motion_modes, ["cpv", "cpv"])
+
+    def test_cpv_does_not_send_position_without_new_mode_feedback_revision(self) -> None:
+        robot, sdk = self.make_robot()
+        robot.motion_config["cpv_mode_confirm_timeout_s"] = 0.01
+        sdk._parser_callbacks.clear()
+        with self.assertRaisesRegex(RuntimeError, "CPV mode confirmation timed out"):
+            robot.send_cpv_position([0.1] * 7)
+        self.assertEqual(sdk.motion_modes, ["cpv"])
+        self.assertEqual(sdk.cpv_position_calls, [])
+        self.assertFalse(robot._cpv_stream_started)
+        self.assertTrue(sdk.auto_set_motion_mode)
 
     def test_follower_hold_exits_cpv_without_sending_j_target(self) -> None:
         robot, sdk = self.make_robot()

@@ -81,6 +81,7 @@ class CanCommImpl(CanCommBase):
         self._send_diagnostics_lock = threading.Lock()
         self._active_send_diagnostic = None
         self._slow_send_events = deque(maxlen=16)
+        self._tx_owner_thread_id: int | None = None
         self._is_connected = False
         self._is_stopped = False
         if self._interface == "socketcan":
@@ -183,20 +184,27 @@ class CanCommImpl(CanCommBase):
             )
 
     def close(self):
-        try:
-            self.recv_bus.shutdown()
-        except Exception:
-            pass
-
-        try:
-            self.send_bus.shutdown()
-        except Exception:
-            pass
+        # ``send_bus`` and ``recv_bus`` intentionally share one official
+        # CANDO bus.  Upstream shutdown is not specified as idempotent, so do
+        # not close that same native handle twice.
+        buses = []
+        for bus in (self.recv_bus, self.send_bus):
+            if bus is not None and all(bus is not existing for existing in buses):
+                buses.append(bus)
+        for bus in buses:
+            try:
+                bus.shutdown()
+            except Exception:
+                pass
 
         self.recv_bus = None
         self.send_bus = None
         self._is_connected = False
         self._is_stopped = True
+
+    def bind_tx_owner_thread(self, thread_id: int) -> None:
+        """Permit CAN sends only from the HardwareTxOwner worker thread."""
+        self._tx_owner_thread_id = int(thread_id)
 
     @staticmethod
     def _message_diagnostic(msg: Message) -> dict:
@@ -232,6 +240,13 @@ class CanCommImpl(CanCommBase):
         if self.send_bus is None:
             self.close()
             raise RuntimeError("CAN bus is not connected.")
+        expected_thread = self._tx_owner_thread_id
+        actual_thread = threading.get_ident()
+        if expected_thread is not None and actual_thread != expected_thread:
+            raise RuntimeError(
+                "CAN TX rejected outside HardwareTxOwner "
+                f"(expected_thread={expected_thread}, actual_thread={actual_thread})"
+            )
 
         started_ns = time.monotonic_ns()
         diagnostic = {

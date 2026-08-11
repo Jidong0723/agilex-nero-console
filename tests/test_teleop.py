@@ -10,7 +10,7 @@ from typing import Any
 
 from motion.teleop import JointConvention, JointLimitAuthority, SafetySupervisor, ShadowCpvPlant, TeleopController
 from supervisor.authority import (
-    ArmWriter, CommandRevoked, ControlSupervisor, HardwareTransportOwner, ServoMode,
+    ArmWriter, CommandRevoked, ControlSupervisor, HardwareTxOwner, ServoMode,
     ServoWriteRevoked,
 )
 
@@ -726,7 +726,7 @@ class TransportOwnerEpochTests(unittest.TestCase):
                 self.calls.append("freedrive")
 
         backend = Backend()
-        owner = HardwareTransportOwner(backend)
+        owner = HardwareTxOwner(backend)
         blocker = threading.Thread(target=lambda: owner.call("p1", "block"))
         queued_errors: list[Exception] = []
 
