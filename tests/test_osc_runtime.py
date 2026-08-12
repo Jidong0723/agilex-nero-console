@@ -160,10 +160,22 @@ class FakeBroker:
         del session_id
         return self.writer == "SERVO" and epoch == self.epoch
 
-    def send_servo_position(self, joints: list[float], session_id: str, epoch: int) -> dict[str, Any]:
+    def publish_servo_position(self, command: dict[str, Any], session_id: str, epoch: int) -> dict[str, Any]:
         if not self.servo_can_write(session_id, epoch):
             raise ServoWriteRevoked("servo writer revoked")
-        return self.robot.send_cpv_position(joints)
+        result = self.robot.send_cpv_position(list(command["joint_target_rad"]))
+        return {"status": "pending", "mailbox_revision": len(self.robot.positions), **result}
+
+    def servo_transport_diagnostics(self) -> dict[str, Any]:
+        if not self.robot.positions:
+            return {}
+        return {"last_result": {"status": "sent", "mailbox_revision": len(self.robot.positions),
+                                "joint_target_rad": list(self.robot.positions[-1]),
+                                "finished_monotonic_ns": time.monotonic_ns()}}
+
+    def wait_for_servo_result(self, mailbox_revision: int, timeout_s: float) -> dict[str, Any]:
+        del timeout_s
+        return {"status": "sent", "mailbox_revision": mailbox_revision}
 
     def trigger_safety_fault(self, reason: str) -> dict[str, Any]:
         self.writer = "SAFETY"
@@ -873,6 +885,52 @@ class OscRxParallelTests(unittest.TestCase):
             self.assertTrue(retained["running"])
         finally:
             self.assertTrue(rx.close())
+
+
+class CpvMailboxTests(unittest.TestCase):
+    def test_slow_sdk_keeps_only_latest_cpv(self) -> None:
+        class Backend:
+            def __init__(self) -> None:
+                self.entered = threading.Event(); self.release = threading.Event(); self.sent: list[list[float]] = []
+            def send_cpv_position(self, values: list[float]) -> dict[str, Any]:
+                self.entered.set(); self.release.wait(0.5); self.sent.append(list(values))
+                now = time.monotonic_ns()
+                return {"finished_monotonic_ns": now, "batch_duration_ms": 80.0, "batch_skew_ms": 10.0}
+
+        backend = Backend(); owner = HardwareTxOwner(backend)
+        try:
+            first = owner.publish_cpv({"joint_target_rad": [0.01] * 7, "epoch": 0, "control_sample_id": 1})
+            self.assertTrue(backend.entered.wait(0.3))
+            middle = owner.publish_cpv({"joint_target_rad": [0.02] * 7, "epoch": 0, "control_sample_id": 2})
+            latest = owner.publish_cpv({"joint_target_rad": [0.03] * 7, "epoch": 0, "control_sample_id": 3})
+            self.assertEqual(owner.wait_cpv_result(middle["mailbox_revision"], 0.1)["status"], "superseded")
+            backend.release.set()
+            self.assertEqual(owner.wait_cpv_result(first["mailbox_revision"], 0.8)["status"], "sent")
+            self.assertEqual(owner.wait_cpv_result(latest["mailbox_revision"], 0.8)["status"], "sent")
+            self.assertEqual(backend.sent, [[0.01] * 7, [0.03] * 7])
+        finally:
+            backend.release.set(); owner.close()
+
+    def test_epoch_revokes_pending_cpv_before_send(self) -> None:
+        class Backend:
+            def __init__(self) -> None:
+                self.entered = threading.Event(); self.release = threading.Event(); self.sent: list[list[float]] = []
+            def block(self) -> None:
+                self.entered.set(); self.release.wait(0.5)
+            def send_cpv_position(self, values: list[float]) -> dict[str, Any]:
+                self.sent.append(list(values)); return {"finished_monotonic_ns": time.monotonic_ns()}
+
+        backend = Backend(); owner = HardwareTxOwner(backend)
+        blocker = threading.Thread(target=lambda: owner.call("p1", "block"))
+        try:
+            blocker.start(); self.assertTrue(backend.entered.wait(0.3))
+            pending = owner.publish_cpv({"joint_target_rad": [0.1] * 7, "epoch": 0, "control_sample_id": 1})
+            owner.advance_epoch(1)
+            self.assertEqual(owner.wait_cpv_result(pending["mailbox_revision"], 0.1)["status"], "revoked")
+            backend.release.set(); blocker.join(0.8); time.sleep(0.05)
+            self.assertEqual(backend.sent, [])
+        finally:
+            backend.release.set(); blocker.join(0.8); owner.close()
 
 
 class JointLimitAuthorityTests(unittest.TestCase):

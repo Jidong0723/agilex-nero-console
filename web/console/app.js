@@ -769,6 +769,16 @@
     };
     const hardwarePose = hardwareFeedback.tcp_pose || execution.measured_tcp_pose || null;
     $("tcp-pose-values").textContent = formatAbsolutePose(hardwarePose);
+    const cpv = transport.cpv_parameters?.values || {};
+    const cpvSummary = (name, unit) => {
+      const values = Array.isArray(cpv[name]) ? cpv[name].map(Number).filter(Number.isFinite) : [];
+      if (!values.length) return "--";
+      const min = Math.min(...values); const max = Math.max(...values);
+      return `${min === max ? fixed(min, 3) : `${fixed(min, 3)}–${fixed(max, 3)}`} ${unit}`;
+    };
+    $("hardware-cpv-cv").textContent = cpvSummary("cv", "rad/s");
+    $("hardware-cpv-acc").textContent = cpvSummary("acc", "rad/s²");
+    $("hardware-cpv-dcc").textContent = cpvSummary("dcc", "rad/s²");
     const hardwareSource = hardwareFeedback.tcp_source || "none";
     const feedbackAgeMs = Number.isFinite(hardwareFeedbackAge) ? hardwareFeedbackAge : executionFeedbackAge;
     const feedbackSourceText = hardwareSource === "sdk_tcp_from_leader_fk" ? "SDK TCP · Leader FK" : hardwareSource === "sdk_tcp_from_follower_feedback" ? "SDK TCP · Follower" : "反馈未就绪";

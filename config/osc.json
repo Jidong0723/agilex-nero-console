@@ -10,16 +10,16 @@
     "ruckig_target_horizon_s": 0.1,
     "ruckig_max_acceleration": 5.0,
     "ruckig_max_jerk": 20.0,
-    "posture_cost": 0.005,
-    "damping_cost": 0.0005,
-    "frame_position_cost": 1000.0,
-    "frame_orientation_cost": 100.0,
-    "frame_gain": 1.0,
-    "frame_lm_damping": 0.0,
+    "posture_cost": 0.001,
+    "damping_cost": 0.01,
+    "frame_position_cost": 8.0,
+    "frame_orientation_cost": 1.0,
+    "frame_gain": 0.5,
+    "frame_lm_damping": 1.0,
     "synchronous_response_budget_s": 0.019,
-    "joint_center_cost": 0.001,
+    "joint_center_cost": 0.0003,
     "joint_center_deadband": 0.7,
-    "feedback_limit_tolerance_rad": 0.05,
+    "feedback_limit_tolerance_rad": 0.03,
     "hold_velocity_epsilon_rad_s": 0.005,
     "hold_acceleration_epsilon_rad_s2": 0.02,
     "urdf": "vendor/nero_description/nero_description.urdf"
@@ -32,7 +32,8 @@
     "arrival_timeout_s": 10.0
   },
   "state_estimator": {
-    "max_prediction_s": 0.03274775,
+    "enabled": false,
+    "max_prediction_s": 0.031802199999999996,
     "correction_time_constant_s": 0.2,
     "max_correction_rad_s": 0.5
   },
@@ -40,8 +41,8 @@
     "enabled": true,
     "dispatch_delay_s": 0.01,
     "dispatch_jitter_s": 0.002,
-    "feedback_delay_s": 0.011232049999999999,
-    "feedback_jitter_s": 0.00020129999999999996,
+    "feedback_delay_s": 0.010628799999999999,
+    "feedback_jitter_s": 2.8e-05,
     "position_time_constant_s": 0.06,
     "max_joint_speed_rad_s": 1.5,
     "max_joint_acceleration_rad_s2": 5.0
@@ -63,8 +64,8 @@
     "velocity_error_fault_rad_s": 0.45,
     "velocity_error_fault_cycles": 10,
     "feedback_soft_stale_s": 0.06,
-    "feedback_hard_stale_s": 0.75,
-    "solver_stale_s": 0.1,
+    "feedback_hard_stale_s": 0.15,
+    "solver_stale_s": 0.04,
     "max_stale_velocity_repeats": 0,
     "input_filter_alpha": 1.0,
     "workspace_min_m": [
@@ -81,10 +82,42 @@
     "singularity_condition_max": 2500.0
   },
   "hardware_limits": {
-    "lower_rad": [-2.705260340591211, -1.7453292519943295, -2.7576202181510405, -1.0122909661567112, -2.7576202181510405, -0.7330382858376184, -1.5707963267948966],
-    "upper_rad": [2.705260340591211, 1.7453292519943295, 2.7576202181510405, 2.1467549799530254, 2.7576202181510405, 0.9599310885968813, 1.5707963267948966],
-    "speed_rad_s": [3.14, 3.14, 3.14, 3.14, 3.92, 3.92, 3.92],
-    "acceleration_rad_s2": [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
+    "lower_rad": [
+      -2.705260340591211,
+      -1.7453292519943295,
+      -2.7576202181510405,
+      -1.0122909661567112,
+      -2.7576202181510405,
+      -0.7330382858376184,
+      -1.5707963267948966
+    ],
+    "upper_rad": [
+      2.705260340591211,
+      1.7453292519943295,
+      2.7576202181510405,
+      2.1467549799530254,
+      2.7576202181510405,
+      0.9599310885968813,
+      1.5707963267948966
+    ],
+    "speed_rad_s": [
+      3.14,
+      3.14,
+      3.14,
+      3.14,
+      3.92,
+      3.92,
+      3.92
+    ],
+    "acceleration_rad_s2": [
+      5.0,
+      5.0,
+      5.0,
+      5.0,
+      5.0,
+      5.0,
+      5.0
+    ]
   },
   "joint_conventions": [
     {
@@ -157,7 +190,7 @@
       0.015
     ],
     "controller_response_delay_s": 0.04,
-    "feedback_limit_tolerance_rad": 0.05
+    "feedback_limit_tolerance_rad": 0.03
   },
   "runtime": {
     "control_hz": 50,
@@ -173,14 +206,14 @@
   },
   "hardware_readonly_calibration": {
     "source": "read_only_idle_can_probe",
-    "sample_count": 10,
-    "feedback_delay_s": 0.011232049999999999,
-    "feedback_jitter_s": 0.00020129999999999996,
+    "sample_count": 20,
+    "feedback_delay_s": 0.010628799999999999,
+    "feedback_jitter_s": 2.8e-05,
     "actuator_response_identified": false,
     "actuator_response_note": "requires an explicitly authorized CPV position-response experiment",
-    "feedback_read_duration_p50_s": 0.0002729,
-    "feedback_read_duration_p95_s": 0.0004742,
-    "feedback_inter_request_p95_s": 0.0215157,
+    "feedback_read_duration_p50_s": 1.41e-05,
+    "feedback_read_duration_p95_s": 4.21e-05,
+    "feedback_inter_request_p95_s": 0.0211734,
     "cpv_parameters": {
       "status": "available",
       "values": {
@@ -203,13 +236,13 @@
           5.0
         ],
         "cv": [
-          0.09,
-          0.09,
-          0.089,
-          0.089,
-          0.09,
-          0.09,
-          0.09
+          1.5,
+          1.5,
+          1.5,
+          1.5,
+          1.5,
+          1.5,
+          1.5
         ],
         "pp": [
           5.0,
@@ -240,9 +273,18 @@
         ]
       },
       "missing": [],
-      "read_started_monotonic_ns": 1956625000000,
-      "read_finished_monotonic_ns": 1956968000000
+      "read_started_monotonic_ns": 76500828000000,
+      "read_finished_monotonic_ns": 76501171000000
     },
-    "applied_at": "2026-08-10T18:35:42.456"
+    "applied_at": "2026-08-12T14:02:38"
+  },
+  "tcp": {
+    "offset_from_link7_m": [
+      0.175,
+      0.0,
+      -0.0235
+    ],
+    "verified": true,
+    "source": "runtime.sdk.task_tcp_offset_from_flange_m"
   }
 }

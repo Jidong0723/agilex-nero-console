@@ -175,8 +175,14 @@ class Solver:
         # OSC output path independently enforces joint velocity and the
         # 5 rad/s² acceleration limit, so permit a bounded gain above one for
         # critically faster Cartesian error correction.
-        if not all(math.isfinite(value) and value > 0.0 for value in (position_cost, orientation_cost, damping_cost)) or not math.isfinite(frame_gain) or not 0.0 < frame_gain <= 5.0 or not math.isfinite(frame_lm_damping) or frame_lm_damping < 0.0:
-            raise ValueError("Pink task costs or gain are invalid")
+        if (
+            not math.isfinite(position_cost) or not 2.0 <= position_cost <= 10.0
+            or not math.isfinite(orientation_cost) or not 0.5 <= orientation_cost <= 5.0
+            or not math.isfinite(damping_cost) or not 1e-4 <= damping_cost <= 1e-1
+            or not math.isfinite(frame_gain) or not 0.3 <= frame_gain <= 0.8
+            or not math.isfinite(frame_lm_damping) or not 0.1 <= frame_lm_damping <= 5.0
+        ):
+            raise ValueError("Pink parameters are outside the approved tuning ranges")
         frame_task = self.FrameTask(
             self.frame_name,
             position_cost=position_cost,
@@ -196,7 +202,7 @@ class Solver:
         # motion merely because the session posture is not centered.
         center_deadband = float(request.get("joint_center_deadband", 0.70))
         center_cost = float(request.get("joint_center_cost", 0.0))
-        if not 0.0 <= center_deadband < 1.0 or not math.isfinite(center_cost) or center_cost < 0.0:
+        if not 0.6 <= center_deadband <= 0.8 or not math.isfinite(center_cost) or not 0.0 <= center_cost <= 3e-3:
             raise ValueError("joint-center parameters are invalid")
         midpoint = 0.5 * (solver_lower + solver_upper)
         half_range = np.maximum(1e-6, 0.5 * (solver_upper - solver_lower))

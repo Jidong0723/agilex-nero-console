@@ -131,7 +131,9 @@ class _ControllerOscCommandPort:
     def grant_osc_tracking(self, session_id: str, epoch: int) -> bool: return self._controller.grant_osc_tracking(session_id, epoch)
     def mark_osc_stopping(self, session_id: str, epoch: int, reason: str) -> bool: return self._controller.mark_osc_stopping(session_id, epoch, reason)
     def servo_can_write(self, session_id: str, epoch: int) -> bool: return self._controller.servo_can_write(session_id, epoch)
-    def send_servo_position(self, joints: list[float], session_id: str, epoch: int) -> dict[str, Any]: return self._controller.send_servo_position(joints, session_id, epoch)
+    def publish_servo_position(self, command: dict[str, Any], session_id: str, epoch: int) -> dict[str, Any]: return self._controller.publish_servo_position(command, session_id, epoch)
+    def servo_transport_diagnostics(self) -> dict[str, Any]: return self._controller.servo_transport_diagnostics()
+    def wait_for_servo_result(self, mailbox_revision: int, timeout_s: float) -> dict[str, Any]: return self._controller.wait_for_servo_result(mailbox_revision, timeout_s)
     def latch_osc_hold(self, reason: str) -> dict[str, Any]: return self._controller.latch_osc_hold(reason)
     def trigger_safety_fault(self, reason: str) -> dict[str, Any]: return self._controller.trigger_safety_fault(reason)
 
@@ -178,12 +180,19 @@ class OperationalSpaceController:
         self.supervisor = ControlSupervisor()
         self._status_cache: tuple[float, dict[str, Any]] | None = None
         self._last_cpv_mode_entry: dict[str, Any] | None = None
+        self._cpv_profile_cache: dict[str, Any] = {"status": "not_read"}
         self._active_action: dict[str, Any] | None = None
         self._action_observers: list[Callable[..., None]] = []
         self._jobs: dict[str, dict[str, Any]] = {}
         self._jobs_lock = threading.RLock()
         self._status_monitor: threading.Thread | None = None
         self._status_monitor_interval_s = 0.2
+        self._osc_diagnostics_stop = threading.Event()
+        self._osc_diagnostics_thread: threading.Thread | None = None
+        self._osc_diagnostics_interval_s = max(
+            0.02,
+            1.0 / max(1.0, float((service_config.get("osc_diagnostics_hz") or 20.0))),
+        )
         self._last_sdk_read_duration_ms: float | None = None
         osc_path = Path(__file__).resolve().parents[1] / "config" / "osc.json"
         osc_config = json.loads(osc_path.read_text(encoding="utf-8-sig")) if osc_path.is_file() else {}
@@ -363,7 +372,9 @@ class OperationalSpaceController:
 
     def read_osc_cpv_parameters(self) -> dict[str, Any]:
         """Compatibility facade for the hardware-maintenance diagnostic API."""
-        return self.maintenance.read_cpv_parameters()
+        profile = self.maintenance.read_cpv_parameters()
+        self._cpv_profile_cache = dict(profile)
+        return profile
 
     def sync_cpv_profile_to_osc_limits(self) -> dict[str, Any]:
         """Apply current OSC limits only while the arm is safely idle/HOLD."""
@@ -486,57 +497,40 @@ class OperationalSpaceController:
     def servo_can_write(self, session_id: str, epoch: int) -> bool:
         return self.supervisor.allows_servo(session_id, epoch)
 
-    def send_servo_position(self, joints: list[float], session_id: str, epoch: int) -> dict[str, Any]:
+    def publish_servo_position(self, command: dict[str, Any], session_id: str, epoch: int) -> dict[str, Any]:
+        """Publish one CPV target without waiting for SDK/CAN completion."""
         guard = lambda: self.supervisor.allows_servo(session_id, epoch)
         if not guard():
             raise ServoWriteRevoked("SERVO write authority is not valid for this osc epoch")
-        values = [float(value) for value in joints]
+        values = [float(value) for value in command.get("joint_target_rad") or []]
         if len(values) != 7 or not all(math.isfinite(value) for value in values):
             self.trigger_safety_fault("non-finite or malformed servo position")
             raise ValueError("servo position must contain seven finite values")
         if not guard():
             raise ServoWriteRevoked("SERVO write authority was revoked before transport dispatch")
-        # The same guard is evaluated again by Transport Owner immediately
-        # before the SDK call, so an old P1 batch cannot survive an epoch
-        # revocation while it waits in the queue.  If the vendor call blocks,
-        # quarantine the whole service instead of letting a partially
-        # dispatched position batch survive into a new session.
-        dispatch_timeout_s = float(
-            self.robot.config.get("control_service", {}).get(
-                "servo_position_dispatch_timeout_s",
-                self.robot.config.get("control_service", {}).get("servo_velocity_dispatch_timeout_s", 0.75),
-            )
-        )
-        try:
-            result = self.robot.call(
-                "p1", "send_cpv_position", values, command_epoch=epoch,
-                category="servo_position", execute_guard=guard,
-                dispatch_timeout_s=max(0.1, dispatch_timeout_s),
-            )
-            can_diagnostics = result.get("can_diagnostics") if isinstance(result, dict) else None
-            slow_events = can_diagnostics.get("slow_send_events", []) if isinstance(can_diagnostics, dict) else []
-            if slow_events:
-                self._log(
-                    "cpv_slow_can_send",
-                    diagnostics={
-                        "cpv_batch": {
-                            "started_monotonic_ns": result.get("started_monotonic_ns"),
-                            "finished_monotonic_ns": result.get("finished_monotonic_ns"),
-                            "batch_duration_ms": result.get("batch_duration_ms"),
-                            "batch_skew_ms": result.get("batch_skew_ms"),
-                        },
-                        "can": can_diagnostics,
-                    },
-                )
-            return result
-        except TimeoutError as exc:
-            transport = self._transport_owner.diagnostics()
+        return self._transport_owner.publish_cpv({**command, "joint_target_rad": values, "epoch": epoch}, execute_guard=guard)
+
+    def servo_transport_diagnostics(self) -> dict[str, Any]:
+        """Read the latest CPV send result without touching SDK/CAN."""
+        cpv = self._transport_owner.cpv_diagnostics()
+        active = (self._transport_owner.diagnostics().get("active") or {})
+        timeout_s = float(self.robot.config.get("control_service", {}).get(
+            "servo_position_dispatch_timeout_s",
+            self.robot.config.get("control_service", {}).get("servo_velocity_dispatch_timeout_s", 0.75),
+        ))
+        if (
+            active.get("method") == "send_cpv_position"
+            and float(active.get("age_ms") or 0.0) > timeout_s * 1000.0
+        ):
             progress = getattr(self._transport_owner.backend, "cpv_dispatch_progress", lambda: {})()
-            can_diagnostics = getattr(self._transport_owner.backend, "can_dispatch_diagnostics", lambda: {})()
-            detail = {"transport": transport, "cpv_progress": progress, "can": can_diagnostics}
-            self._log("cpv_position_timeout", error=str(exc), diagnostics=detail)
-            self._schedule_transport_reset(f"CPV position timeout: {exc}; diagnostics={detail}")
-            raise
+            can = getattr(self._transport_owner.backend, "can_dispatch_diagnostics", lambda: {})()
+            detail = {"transport": active, "cpv_progress": progress, "can": can}
+            self._log("cpv_position_timeout", diagnostics=detail)
+            self._schedule_transport_reset(f"asynchronous CPV position timeout: {detail}")
+        return cpv
+
+    def wait_for_servo_result(self, mailbox_revision: int, timeout_s: float) -> dict[str, Any]:
+        return self._transport_owner.wait_cpv_result(mailbox_revision, timeout_s)
 
     def begin_osc_stop(self, reason: str) -> dict[str, Any]:
         """Atomically invalidate old output while leaving SERVO able to brake."""
@@ -623,6 +617,13 @@ class OperationalSpaceController:
         # remains independent from the serial TX/P0/P1/P2 owner.
         self._osc.start()
         self._running.set()
+        self._osc_diagnostics_stop.clear()
+        self._osc_diagnostics_thread = threading.Thread(
+            target=self._osc_diagnostics_loop,
+            name="nero-osc-diagnostics",
+            daemon=True,
+        )
+        self._osc_diagnostics_thread.start()
         # Establish one immutable startup snapshot before accepting HTTP
         # operator actions.  Action threads must never be the first caller
         # that waits on a just-powered controller.
@@ -664,7 +665,10 @@ class OperationalSpaceController:
 
     def close(self) -> dict[str, Any]:
         self._running.clear()
+        self._osc_diagnostics_stop.set()
         self._osc.close()
+        if self._osc_diagnostics_thread is not None and self._osc_diagnostics_thread is not threading.current_thread():
+            self._osc_diagnostics_thread.join(timeout=1.0)
         if self._status_monitor is not None and self._status_monitor is not threading.current_thread():
             self._status_monitor.join(timeout=1.0)
         if self._watchdog is not None and self._watchdog is not threading.current_thread():
@@ -842,6 +846,62 @@ class OperationalSpaceController:
                     })
             time.sleep(self._status_monitor_interval_s)
 
+    def _osc_diagnostics_loop(self) -> None:
+        """Persist low-cost OSC samples without touching the CAN transport.
+
+        The servo already keeps a bounded cycle trace in memory.  This thread
+        snapshots that state at a lower rate and writes only the fields needed
+        to diagnose real-hardware oscillation.  It must never call the SDK or
+        the full status path: doing so could contend with the CPV TX owner.
+        """
+        while not self._osc_diagnostics_stop.is_set():
+            try:
+                snapshot = self._osc.status()
+                session = dict(snapshot.get("session") or {})
+                if session.get("execution_mode") == "hardware":
+                    diagnostics = dict(snapshot.get("diagnostics") or {})
+                    timing = dict(diagnostics.get("timing") or {})
+                    execution = dict(snapshot.get("execution_sample") or {})
+                    last_output = dict(snapshot.get("last_output") or {})
+                    batches = list(diagnostics.get("recent_cpv_batches") or [])
+                    cycle_trace = dict(diagnostics.get("cycle_trace") or {})
+                    trace_tail = list(cycle_trace.get("recent_cycles") or [])
+                    self._log(
+                        "osc_realtime_diagnostic",
+                        monotonic_ns=time.monotonic_ns(),
+                        session={
+                            "state": session.get("state"),
+                            "session_id": session.get("session_id"),
+                            "execution_mode": session.get("execution_mode"),
+                            "sequence": session.get("sequence"),
+                            "motion_epoch": session.get("motion_epoch"),
+                            "last_input_age_s": session.get("last_input_age_s"),
+                        },
+                        trajectory_state=diagnostics.get("trajectory_state"),
+                        trajectory_brake_reason=diagnostics.get("trajectory_brake_reason"),
+                        timing=timing,
+                        last_result=dict(snapshot.get("last_result") or {}),
+                        last_output=last_output,
+                        execution={
+                            "sample_id": execution.get("sample_id"),
+                            "target_generation": execution.get("target_generation"),
+                            "joint_state_rad": execution.get("joint_state_rad"),
+                            "measured_joint_state_rad": execution.get("measured_joint_state_rad"),
+                            "joint_velocity_rad_s": execution.get("joint_velocity_rad_s"),
+                            "measured_joint_velocity_rad_s": execution.get("measured_joint_velocity_rad_s"),
+                            "position_error_m": execution.get("position_error_m"),
+                            "orientation_error_rad": execution.get("orientation_error_rad"),
+                        },
+                        latest_cpv_batch=batches[-1] if batches else None,
+                        cycle_trace_tail=trace_tail[-3:],
+                    )
+            except Exception as exc:
+                self._log(
+                    "osc_realtime_diagnostic_error",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            self._osc_diagnostics_stop.wait(self._osc_diagnostics_interval_s)
+
     def observation(self, include_motor_states: bool = False) -> dict[str, Any]:
         return self.telemetry.observation(include_motor_states)
 
@@ -1018,6 +1078,8 @@ class OperationalSpaceController:
             "arrival": servo.get("arrival"),
         }
         recent_batches = list(raw_diagnostics.get("recent_cpv_batches") or [])
+        tx_owner = self._transport_owner.diagnostics()
+        cpv_mailbox = dict(tx_owner.get("cpv_mailbox") or {})
         hardware_robot = snapshot.get("robot") or (snapshot.get("control") or {}).get("robot") or {}
         hardware_raw = hardware_robot.get("raw") if isinstance(hardware_robot, dict) else {}
         osc_rx = self._osc_cached_feedback()
@@ -1036,6 +1098,15 @@ class OperationalSpaceController:
             "rx_revision": osc_rx.get("revision"),
             "rx_error": osc_rx.get("last_error"),
         }
+        feedback_mailbox = {
+            "revision": osc_rx.get("revision"),
+            "sdk_timestamp": osc_rx.get("sdk_joint_timestamp"),
+            "received_monotonic_ns": osc_rx.get("received_at_monotonic_ns"),
+            "feedback_age_s": osc_rx.get("age_s"),
+            "joint_feedback_hz": osc_rx.get("joint_feedback_hz"),
+            "last_error": osc_rx.get("last_error"),
+        }
+        diagnostics["mailboxes"] = {"feedback": feedback_mailbox, "cpv": cpv_mailbox}
         observed_joints = execution_sample.get("joint_state_rad")
         if not isinstance(observed_joints, list):
             observed_joints = last_output.get("final_joint_target_rad") if shadow else (snapshot.get("robot") or {}).get("joint_angles_rad")
@@ -1085,11 +1156,14 @@ class OperationalSpaceController:
                 "reason": (snapshot.get("control") or {}).get("reason"),
                 "can_health": snapshot.get("feedback_ready"),
                 "hardware_feedback": hardware_feedback,
+                "feedback_mailbox": feedback_mailbox,
                 "participation": "shadow_simulated" if shadow else "active" if active_session else "not_participating",
-                "cpv_dispatch_count": raw_diagnostics.get("cpv_dispatch_count", 0),
-                "last_cpv_dispatch": None if shadow else (recent_batches[-1] if recent_batches else None),
+                "cpv_dispatch_count": raw_diagnostics.get("cpv_dispatch_count", 0) if shadow else cpv_mailbox.get("sent_count", 0),
+                "last_cpv_dispatch": None if shadow else (cpv_mailbox.get("last_success") or (recent_batches[-1] if recent_batches else None)),
                 "last_cpv_mode_entry": None if shadow else self._last_cpv_mode_entry,
-                "cpv_parameters": raw_diagnostics.get("cpv_parameters", {"status": "not_read"}),
+                "cpv_parameters": dict(self._cpv_profile_cache or raw_diagnostics.get("cpv_parameters", {"status": "not_read"})),
+                "hardware_tx_owner": tx_owner,
+                "cpv_mailbox": cpv_mailbox,
             },
             "solver": servo.get("solver"),
             "workspace": servo.get("workspace"),

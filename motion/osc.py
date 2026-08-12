@@ -28,7 +28,9 @@ class OscHardwarePort(Protocol):
     def grant_osc_tracking(self, session_id: str, epoch: int) -> bool: ...
     def mark_osc_stopping(self, session_id: str, epoch: int, reason: str) -> bool: ...
     def servo_can_write(self, session_id: str, epoch: int) -> bool: ...
-    def send_servo_position(self, joints: list[float], session_id: str, epoch: int) -> dict[str, Any]: ...
+    def publish_servo_position(self, command: dict[str, Any], session_id: str, epoch: int) -> dict[str, Any]: ...
+    def servo_transport_diagnostics(self) -> dict[str, Any]: ...
+    def wait_for_servo_result(self, mailbox_revision: int, timeout_s: float) -> dict[str, Any]: ...
     def latch_osc_hold(self, reason: str) -> dict[str, Any]: ...
     def trigger_safety_fault(self, reason: str) -> dict[str, Any]: ...
 
@@ -896,6 +898,7 @@ class _OperationalSpaceServo:
         self.ruckig = ruckig
         self.hardware, self.root, self.config = hardware, project_root, config
         self.limits, self.runtime = config.get("limits", {}), config.get("runtime", {})
+        self._validate_tuning_config()
         self.solver = KinematicsClient(project_root, config)
         self.authority = JointLimitAuthority(self.solver.urdf, config)
         self.supervisor = SafetySupervisor(config.get("safety_supervisor", {}))
@@ -955,6 +958,31 @@ class _OperationalSpaceServo:
         self._cycle_trace: deque[dict[str, Any]] = deque(maxlen=max(64, int(diagnostics.get("cycle_trace_capacity", 512))))
         self._cycle_period_s = 1.0 / max(1.0, float(self.runtime.get("control_hz", 50)))
         self._enable_high_resolution_timer()
+
+    def _validate_tuning_config(self) -> None:
+        solver = self.config.get("solver", {})
+        limits = self.limits
+        ranges = {
+            "frame_gain": (0.3, 0.8, solver.get("frame_gain", 0.5)),
+            "frame_lm_damping": (0.1, 5.0, solver.get("frame_lm_damping", 1.0)),
+            "damping_cost": (1e-4, 1e-1, solver.get("damping_cost", 0.01)),
+            "frame_position_cost": (2.0, 10.0, solver.get("frame_position_cost", 8.0)),
+            "frame_orientation_cost": (0.5, 5.0, solver.get("frame_orientation_cost", 1.0)),
+            "joint_center_cost": (0.0, 3e-3, solver.get("joint_center_cost", 3e-4)),
+            "joint_center_deadband": (0.6, 0.8, solver.get("joint_center_deadband", 0.7)),
+            "feedback_limit_tolerance_rad": (0.02, 0.05, solver.get("feedback_limit_tolerance_rad", 0.03)),
+            "feedback_soft_stale_s": (0.04, 0.08, limits.get("feedback_soft_stale_s", 0.06)),
+            "feedback_hard_stale_s": (0.1, 0.25, limits.get("feedback_hard_stale_s", 0.15)),
+            "solver_stale_s": (0.02, 0.04, limits.get("solver_stale_s", 0.04)),
+            "input_filter_alpha": (0.35, 1.0, limits.get("input_filter_alpha", 1.0)),
+        }
+        for name, (lower, upper, raw) in ranges.items():
+            try:
+                value = float(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"OSC tuning parameter {name} must be numeric") from exc
+            if not math.isfinite(value) or not lower <= value <= upper:
+                raise ValueError(f"OSC tuning parameter {name}={raw!r} outside [{lower}, {upper}]")
 
     @staticmethod
     def _percentile(values: list[float], level: float) -> float | None:
@@ -1404,7 +1432,13 @@ class _OperationalSpaceServo:
         return self._feedback_receiver.snapshot()
 
     def _estimate_hardware_state(self, feedback: dict[str, Any], actual_dt: float) -> tuple[list[float], list[float], float]:
-        """One continuous predictor/corrector; never threshold-reset Pink state."""
+        """Return the current hardware control state consumed by Pink.
+
+        The predictor/corrector remains available for later experiments, but
+        is explicitly disabled for the current real-hardware diagnosis. In
+        that mode Pink consumes the same seven-joint RX snapshot published as
+        measured feedback, eliminating a second potentially stale state.
+        """
         now_ns = time.monotonic_ns()
         conservative_ns = int(feedback.get("fresh_received_at_monotonic_ns") or feedback.get("monotonic_ns") or now_ns)
         feedback_age = max(0.0, (now_ns - conservative_ns) / 1e9)
@@ -1412,6 +1446,21 @@ class _OperationalSpaceServo:
         measured_qd = [float(value) for value in feedback.get("velocities") or []]
         if len(measured_q) != 7 or len(measured_qd) != 7:
             return measured_q, measured_qd, feedback_age
+        estimator_config = self.config.get("state_estimator", {})
+        if not bool(estimator_config.get("enabled", True)):
+            self._control_q_estimate = list(measured_q)
+            self._control_qd_estimate = list(measured_qd)
+            self._estimator_snapshot = {
+                "enabled": False,
+                "mode": "measured_feedback_direct",
+                "measured_joint_state_rad": list(measured_q),
+                "measured_joint_velocity_rad_s": list(measured_qd),
+                "estimated_joint_state_rad": list(measured_q),
+                "estimated_joint_velocity_rad_s": list(measured_qd),
+                "estimated_minus_measured_rad": [0.0] * 7,
+                "feedback_age_s": feedback_age,
+            }
+            return list(measured_q), list(measured_qd), feedback_age
         if self._control_q_estimate is None:
             self._control_q_estimate = list(measured_q)
         predicted = [
@@ -1428,6 +1477,8 @@ class _OperationalSpaceServo:
         self._control_q_estimate = [estimate + delta for estimate, delta in zip(predicted, correction)]
         self._control_qd_estimate = [float(value) + delta / max(0.001, actual_dt) for value, delta in zip(self.last_sent_velocity, correction)]
         self._estimator_snapshot = {
+            "enabled": True,
+            "mode": "predictor_corrector",
             "measured_joint_state_rad": list(measured_q),
             "measured_joint_velocity_rad_s": list(measured_qd),
             "estimated_joint_state_rad": list(self._control_q_estimate),
@@ -1689,7 +1740,8 @@ class _OperationalSpaceServo:
                 # OSC accepts an absolute TCP setpoint.  Never extrapolate a
                 # jittery, paused, or discontinuous adapter stream beyond
                 # that setpoint; Pink receives exactly what the adapter sent.
-                request = {"sequence": int((command or {}).get("sequence", session.get("sequence", 0))), "control_sample_id": sample_id, "target_generation": target_generation, "motion_epoch": epoch, "joint_angles_rad": q, "measured_joint_angles_rad": measured_q, "joint_state_monotonic_ns": now_ns, "target_position_m": target_pose["position_m"], "target_orientation_xyzw": target_pose["orientation_xyzw"], "command_target_position_m": target_pose["position_m"], "command_target_orientation_xyzw": target_pose["orientation_xyzw"], "last_sent_joint_velocity_rad_s": self.last_sent_velocity, "joint_speed_limit_rad_s": data["speed_rad_s"], "joint_acceleration_limit_rad_s2": data["acceleration_rad_s2"], "soft_lower_rad": data["soft_lower_rad"], "soft_upper_rad": data["soft_upper_rad"], "posture_reference_rad": self.posture_reference or q, "posture_cost": float(self.config.get("solver", {}).get("posture_cost", 0.005)), "damping_cost": float(self.config.get("solver", {}).get("damping_cost", 0.05)), "frame_position_cost": float(self.config.get("solver", {}).get("frame_position_cost", 10.0)), "frame_orientation_cost": float(self.config.get("solver", {}).get("frame_orientation_cost", 1.0)), "frame_gain": float(self.config.get("solver", {}).get("frame_gain", 0.5)), "frame_lm_damping": float(self.config.get("solver", {}).get("frame_lm_damping", 0.0)), "joint_center_cost": float(self.config.get("solver", {}).get("joint_center_cost", 0.0)), "joint_center_deadband": float(self.config.get("solver", {}).get("joint_center_deadband", 0.70)), "feedback_limit_tolerance_rad": float(self.config.get("solver", {}).get("feedback_limit_tolerance_rad", 0.05)), "dt_s": dispatch_dt}
+                solver_config = self.config.get("solver", {})
+                request = {"sequence": int((command or {}).get("sequence", session.get("sequence", 0))), "control_sample_id": sample_id, "target_generation": target_generation, "motion_epoch": epoch, "joint_angles_rad": q, "measured_joint_angles_rad": measured_q, "joint_state_monotonic_ns": now_ns, "target_position_m": target_pose["position_m"], "target_orientation_xyzw": target_pose["orientation_xyzw"], "command_target_position_m": target_pose["position_m"], "command_target_orientation_xyzw": target_pose["orientation_xyzw"], "last_sent_joint_velocity_rad_s": self.last_sent_velocity, "joint_speed_limit_rad_s": data["speed_rad_s"], "joint_acceleration_limit_rad_s2": data["acceleration_rad_s2"], "soft_lower_rad": data["soft_lower_rad"], "soft_upper_rad": data["soft_upper_rad"], "posture_reference_rad": self.posture_reference or q, "posture_cost": float(solver_config.get("posture_cost", 0.001)), "damping_cost": float(solver_config.get("damping_cost", 0.01)), "frame_position_cost": float(solver_config.get("frame_position_cost", 8.0)), "frame_orientation_cost": float(solver_config.get("frame_orientation_cost", 1.0)), "frame_gain": float(solver_config.get("frame_gain", 0.5)), "frame_lm_damping": float(solver_config.get("frame_lm_damping", 1.0)), "joint_center_cost": float(solver_config.get("joint_center_cost", 0.0003)), "joint_center_deadband": float(solver_config.get("joint_center_deadband", 0.70)), "feedback_limit_tolerance_rad": float(solver_config.get("feedback_limit_tolerance_rad", 0.03)), "dt_s": dispatch_dt}
                 solve_current = getattr(self.solver, "solve_current", None)
                 if callable(solve_current):
                     pink = solve_current(request, float(self.config.get("solver", {}).get("synchronous_response_budget_s", 0.008)))
@@ -1843,20 +1895,29 @@ class _OperationalSpaceServo:
                             (float(command) - float(previous)) / max(0.001, actual_dt)
                             for command, previous in zip(final_velocity, previous_velocity)
                         ]
-                    batch = self.hardware.send_servo_position(position_target, str(session.get("session_id")), epoch)
-                    dispatch_finished_ns = int((batch or {}).get("finished_monotonic_ns") or time.monotonic_ns())
+                    publication = self.hardware.publish_servo_position({
+                        "control_sample_id": sample_id,
+                        "target_generation": target_generation,
+                        "sequence": int((command or {}).get("sequence", session.get("sequence", 0))),
+                        "joint_target_rad": list(position_target),
+                        "joint_velocity_rad_s": list(final_velocity),
+                        "published_monotonic_ns": time.monotonic_ns(),
+                        "max_joint_speed_rad_s": float(self.limits.get("joint_speed_rad_s", 1.5)),
+                        "max_joint_acceleration_rad_s2": max(float(value) for value in data["acceleration_rad_s2"]),
+                        "gate_ok": gate_ok,
+                        "gate_limited": gate_limited,
+                    }, str(session.get("session_id")), epoch)
                     with self.lock:
-                        self.cpv_send_count += 1; self.output_count += 1; self._send_times.append(time.monotonic()); self._batch_history.append({"control_sample_id": sample_id, "motion_epoch": epoch, "joint_target_rad": list(position_target), "joint_velocity_rad_s": list(final_velocity), **batch})
+                        self.output_count += 1
                         self.last_output = {"status": "limited" if gate_limited else "accepted", "final_joint_target_rad": list(position_target), "final_joint_velocity_rad_s": list(final_velocity), "sequence": int((command or {}).get("sequence", session.get("sequence", 0))), "epoch": epoch}
-                        self._last_dispatch_monotonic_ns = dispatch_finished_ns
-                    result_reason = "CPV joint-position batch sent"
+                    result_reason = "CPV joint-position target published"
                     if soft_stale and not hard_stale:
                         result_reason = "CPV joint-position batch sent with soft-stale derating"
                     elif hard_stale:
                         result_reason = "CPV measured-position hold sent after hard stale feedback"
                     elif gate_limited:
                         result_reason = "CPV joint-position batch sent with final safety gate velocity limit"
-                    self._set_result(gate_ok, result_reason, robot_commands_sent=True, solver=pink if pink and pink.get("ok") else None, ruckig=ruckig_info, supervisor=supervisor_report, gate_reason=gate_reason, gate_limited=gate_limited, final_joint_target_rad=list(position_target), final_joint_velocity_rad_s=list(final_velocity))
+                    self._set_result(gate_ok, result_reason, robot_commands_sent=False, solver=pink if pink and pink.get("ok") else None, ruckig=ruckig_info, supervisor=supervisor_report, gate_reason=gate_reason, gate_limited=gate_limited, final_joint_target_rad=list(position_target), final_joint_velocity_rad_s=list(final_velocity), cpv_mailbox=publication)
                 self.last_sent_velocity = list(final_velocity)
                 with self.lock:
                     arrival_position = float(self.config.get("osc", {}).get("arrival_position_tolerance_m", 0.0005))
@@ -1894,7 +1955,31 @@ class _OperationalSpaceServo:
                         and self._arrival_reached
                     ):
                         self._invalidate_motion("OSC move_tcp target reached")
+                    transport = self.hardware.servo_transport_diagnostics() if not shadow else {}
+                    last_dispatched = transport.get("last_result") if isinstance(transport, dict) else None
+                    if isinstance(last_dispatched, dict) and last_dispatched.get("status") == "failed":
+                        raise RuntimeError(f"CPV mailbox send failed: {last_dispatched.get('error', 'unknown error')}")
+                    if isinstance(last_dispatched, dict) and last_dispatched.get("status") == "sent":
+                        sent_revision = int(last_dispatched.get("mailbox_revision", 0))
+                        with self.lock:
+                            known = {int(item.get("mailbox_revision", 0)) for item in self._batch_history}
+                            if sent_revision and sent_revision not in known:
+                                self.cpv_send_count += 1
+                                self._send_times.append(time.monotonic())
+                                self._batch_history.append(dict(last_dispatched))
+                                self._last_dispatch_monotonic_ns = int(last_dispatched.get("finished_monotonic_ns") or last_dispatched.get("transport_dispatch_finished_monotonic_ns") or time.monotonic_ns())
                     if self.trajectory_state == "BRAKING" and settled:
+                        # A normal tracking publication is asynchronous.  The
+                        # sole exception is the final braking sample: Follower
+                        # HOLD is not entered until that exact mailbox command
+                        # was actually accepted by the hardware sender.
+                        published = self.last_result.get("cpv_mailbox") if isinstance(self.last_result, dict) else None
+                        if not shadow and isinstance(published, dict):
+                            revision = published.get("mailbox_revision")
+                            if isinstance(revision, int):
+                                result = self.hardware.wait_for_servo_result(revision, 0.25)
+                                if result.get("status") != "sent":
+                                    raise RuntimeError(f"final CPV braking batch was not sent: {result}")
                         self.trajectory_state, self.trajectory_brake_reason, self.feedback_sync_pending = "HOLD_READY", None, True
                         self.needs_resync = True
                         if not shadow:
@@ -1916,7 +2001,8 @@ class _OperationalSpaceServo:
                     cycle_finished_ns = time.monotonic_ns()
                     cycle_finished_perf_ns = time.perf_counter_ns()
                     cycle_duration_ms = (cycle_finished_perf_ns - cycle_started_perf_ns) / 1e6
-                    self._timing = {"actual_dt_s": actual_dt, "dispatch_interval_s": dispatch_dt, "feedback_age_s": feedback_age, "estimated_feedback_delay_s": feedback_age, "feedback_read_duration_s": None if shadow else float((feedback or {}).get("read_duration_s", 0.0)), "feedback_requested_monotonic_ns": None if shadow else (feedback or {}).get("requested_monotonic_ns"), "feedback_received_monotonic_ns": None if shadow else (feedback or {}).get("received_monotonic_ns"), "feedback_sdk_timestamp": None if shadow else (feedback or {}).get("sdk_joint_timestamp"), "feedback_sdk_hz": None if shadow else (feedback or {}).get("joint_feedback_hz"), "feedback_soft_stale": soft_stale, "feedback_hard_stale": hard_stale, "solver_age_s": solver_age, "pink_requested_monotonic_ns": None if not pink else pink.get("osc_pink_requested_monotonic_ns"), "pink_written_monotonic_ns": None if not pink else pink.get("osc_pink_written_monotonic_ns"), "pink_started_monotonic_ns": None if not pink else pink.get("solver_monotonic_ns"), "pink_finished_monotonic_ns": None if not pink else pink.get("solver_finished_monotonic_ns"), "solver_latency_s": None if not pink else max(0.0, (int(pink.get("solver_finished_monotonic_ns") or cycle_finished_ns) - int(pink.get("joint_state_monotonic_ns") or cycle_finished_ns)) / 1e9), "batch_duration_ms": (batch or {}).get("batch_duration_ms"), "batch_skew_ms": (batch or {}).get("batch_skew_ms"), "queue_delay_ms": (batch or {}).get("queue_delay_ms"), "transport_duration_ms": (batch or {}).get("transport_duration_ms"), "joint_sent_monotonic_ns": (batch or {}).get("joint_sent_monotonic_ns"), "actuator_feedback_response": actuator_response, "delay_budget_s": delay_budget, "motion_epoch": epoch, "control_sample_id": sample_id, "target_generation": target_generation, "gate_ok": gate_ok, "gate_limited": gate_limited, "gate_reason": gate_reason, "cycle_duration_ms": cycle_duration_ms, "deadline_overrun_ms": max(0.0, cycle_duration_ms - period * 1000)}
+                    sent_batch = last_dispatched if not shadow else batch
+                    self._timing = {"actual_dt_s": actual_dt, "dispatch_interval_s": dispatch_dt, "feedback_age_s": feedback_age, "estimated_feedback_delay_s": feedback_age, "feedback_read_duration_s": None if shadow else float((feedback or {}).get("read_duration_s", 0.0)), "feedback_requested_monotonic_ns": None if shadow else (feedback or {}).get("requested_monotonic_ns"), "feedback_received_monotonic_ns": None if shadow else (feedback or {}).get("received_monotonic_ns"), "feedback_sdk_timestamp": None if shadow else (feedback or {}).get("sdk_joint_timestamp"), "feedback_sdk_hz": None if shadow else (feedback or {}).get("joint_feedback_hz"), "feedback_soft_stale": soft_stale, "feedback_hard_stale": hard_stale, "solver_age_s": solver_age, "pink_requested_monotonic_ns": None if not pink else pink.get("osc_pink_requested_monotonic_ns"), "pink_written_monotonic_ns": None if not pink else pink.get("osc_pink_written_monotonic_ns"), "pink_started_monotonic_ns": None if not pink else pink.get("solver_monotonic_ns"), "pink_finished_monotonic_ns": None if not pink else pink.get("solver_finished_monotonic_ns"), "solver_latency_s": None if not pink else max(0.0, (int(pink.get("solver_finished_monotonic_ns") or cycle_finished_ns) - int(pink.get("joint_state_monotonic_ns") or cycle_finished_ns)) / 1e9), "batch_duration_ms": (sent_batch or {}).get("batch_duration_ms"), "batch_skew_ms": (sent_batch or {}).get("batch_skew_ms"), "queue_delay_ms": (sent_batch or {}).get("queue_delay_ms"), "transport_duration_ms": (sent_batch or {}).get("transport_duration_ms"), "joint_sent_monotonic_ns": (sent_batch or {}).get("joint_sent_monotonic_ns"), "cpv_mailbox": transport, "actuator_feedback_response": actuator_response, "delay_budget_s": delay_budget, "motion_epoch": epoch, "control_sample_id": sample_id, "target_generation": target_generation, "gate_ok": gate_ok, "gate_limited": gate_limited, "gate_reason": gate_reason, "cycle_duration_ms": cycle_duration_ms, "deadline_overrun_ms": max(0.0, cycle_duration_ms - period * 1000)}
                     self._cycle_trace.append(dict(self._timing))
             except PermissionError as exc:
                 # Authority revocation is an expected ownership handoff, not a
@@ -1980,9 +2066,13 @@ class OscRuntime:
     def apply_hardware_calibration(self, calibration: dict[str, Any], feedback: dict[str, Any], cpv_parameters: dict[str, Any]) -> dict[str, Any]:
         shadow = self._servo.config.setdefault("shadow_transport", {})
         estimator = self._servo.config.setdefault("state_estimator", {})
+        # Preserve the operator-selected diagnostic mode when persisting
+        # read-only calibration values.
+        estimator_enabled = bool(estimator.get("enabled", True))
         shadow["feedback_delay_s"] = calibration["feedback_delay_s"]
         shadow["feedback_jitter_s"] = calibration["feedback_jitter_s"]
         estimator["max_prediction_s"] = max(0.02, min(0.15, calibration["feedback_delay_s"] + float(feedback["inter_request_p95_s"])))
+        estimator["enabled"] = estimator_enabled
         self._servo.config["hardware_readonly_calibration"] = {
             **calibration,
             "feedback_read_duration_p50_s": feedback["read_duration_p50_s"],

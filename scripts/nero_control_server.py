@@ -1002,18 +1002,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Local NERO shared-control service and safety console.")
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "runtime.json")
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--lan-host", default="")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
-    if args.host not in {"127.0.0.1", "localhost"}:
-        raise SystemExit("For safety, the first release only listens on 127.0.0.1.")
-
     url = f"http://127.0.0.1:{args.port}/"
     instance_lock = InstanceLock(PROJECT_ROOT / "runtime" / "nero_control_service.lock", "nero-control-service")
     try:
         instance_lock.acquire()
-        server = ExclusiveThreadingHTTPServer(("127.0.0.1", args.port), ControlRequestHandler)
-    except (OSError, RuntimeError) as exc:
+    except RuntimeError as exc:
         instance_lock.release()
         if control_page_is_healthy(url):
             print("NERO control service is already running; opening the active control page.")
@@ -1031,20 +1028,33 @@ def main() -> int:
     except (OSError, json.JSONDecodeError) as exc:
         runtime_config = {}
         print(f"PICO gateway configuration unavailable: {exc}", flush=True)
+    lan_host = str(args.lan_host or (runtime_config.get("pico_http") or {}).get("lan_host", "")).strip()
+    listen_hosts = [args.host]
+    if lan_host and lan_host not in listen_hosts:
+        listen_hosts.append(lan_host)
+    if any(host not in {"127.0.0.1", "localhost", lan_host} for host in listen_hosts):
+        raise SystemExit("Unsupported HTTP host for PICO pairing")
+    try:
+        servers = [ExclusiveThreadingHTTPServer((host, args.port), ControlRequestHandler) for host in listen_hosts]
+    except (OSError, RuntimeError) as exc:
+        instance_lock.release()
+        if control_page_is_healthy(url):
+            print("NERO control service is already running; opening the active control page.")
+            if not args.no_browser:
+                webbrowser.open(url)
+            return 0
+        print(f"NERO control service could not start: {exc}")
+        return 1
     pico_gateway = PicoGateway(runtime, dict(runtime_config.get("pico_gateway", {})))
     ControlRequestHandler.pico_gateway = pico_gateway
-    http_thread = threading.Thread(
-        target=server.serve_forever,
-        kwargs={"poll_interval": 0.1},
-        name="nero-control-http",
-        daemon=True,
-    )
+    http_threads = [threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, name=f"nero-control-http-{host}", daemon=True) for server, host in zip(servers, listen_hosts)]
     try:
         # Start accepting static-page, health, and reset-related requests before
         # importing the SDK, starting the PICO gateway, or attempting any
         # hardware operation.  A gateway bind/import must never make the local
         # control page unavailable.
-        http_thread.start()
+        for http_thread in http_threads:
+            http_thread.start()
         threading.Thread(target=pico_gateway.start, name="nero-pico-gateway-bootstrap", daemon=True).start()
         threading.Thread(target=ensure_reset_watchdog, name="nero-reset-watchdog-bootstrap", daemon=True).start()
         threading.Thread(
@@ -1056,14 +1066,16 @@ def main() -> int:
         print(f"NERO control page: {url}", flush=True)
         if not args.no_browser:
             webbrowser.open(url)
-        while http_thread.is_alive():
-            http_thread.join(timeout=0.5)
+        while any(http_thread.is_alive() for http_thread in http_threads):
+            for http_thread in http_threads:
+                http_thread.join(timeout=0.25)
     except KeyboardInterrupt:
         print("Stopping control service. The arm state is not automatically reset.")
     finally:
-        if http_thread.is_alive():
-            server.shutdown()
-        server.server_close()
+        for server, http_thread in zip(servers, http_threads):
+            if http_thread.is_alive():
+                server.shutdown()
+            server.server_close()
         pico_gateway.close()
         runtime.close()
         instance_lock.release()
