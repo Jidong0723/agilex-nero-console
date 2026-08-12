@@ -963,6 +963,7 @@ class _OperationalSpaceServo:
         solver = self.config.get("solver", {})
         limits = self.limits
         ranges = {
+            "posture_cost": (1e-4, 1e-2, solver.get("posture_cost", 0.001)),
             "frame_gain": (0.3, 0.8, solver.get("frame_gain", 0.5)),
             "frame_lm_damping": (0.1, 5.0, solver.get("frame_lm_damping", 1.0)),
             "damping_cost": (1e-4, 1e-1, solver.get("damping_cost", 0.01)),
