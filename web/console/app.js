@@ -148,7 +148,7 @@
     const picoControls = panel.querySelector(".pico-controls");
     if (picoControls) picoControls.innerHTML = "<strong>怎么控制</strong><p>按住右手 Grip：移动机械臂；右手 Trigger：开合夹爪；左手 Menu：立即停止。松开 Grip、追踪丢失或断开连接时，机械臂会自动停止。</p>";
     const picoPair = panel.querySelector(".pico-pair");
-    if (picoPair) picoPair.innerHTML = '<div id="pico-qr" class="pico-qr">WebSocket</div><div><strong>固定 WebSocket 接入</strong><p id="pico-url">先启动 PICO 接收器。</p><code id="pico-code">token: ------</code><small>外部 PICO APK 首包发送 auth 和 token。</small><small id="pico-diagnostic">网关诊断：等待启动</small></div>';
+    if (picoPair) picoPair.innerHTML = '<div id="pico-qr" class="pico-qr">等待配对</div><div><strong>一次性配对</strong><p id="pico-url">点击连接后生成二维码。</p><code id="pico-code">------</code><small>在 PICO APK 输入局域网地址和 6 位短码，APK 会解析专用 WebSocket 地址。</small><small id="pico-diagnostic">网关诊断：等待启动</small></div>';
     const picoResult = $("pico-result");
     if (picoResult) picoResult.textContent = "PICO APK 通过 WebSocket 发送数据；电脑端不依赖 PICO SDK。";
     $("pico-start").textContent = "启动 PICO 接收器";
@@ -303,11 +303,12 @@
     $("pico-tracking").textContent = pico.tracking_valid ? "有效" : "--";
     $("pico-anchor").textContent = pico.anchor_active ? "已定义" : "未定义";
     $("pico-gripper").textContent = Number.isFinite(Number(pico.gripper_position)) ? `${Math.round(Number(pico.gripper_position) * 100)}%` : "--";
-    $("pico-code").textContent = gatewayReady && gateway.auth_token ? `token: ${gateway.auth_token}` : "token: 不可用";
-    $("pico-url").textContent = gatewayReady && gateway.ws_url ? `APK 连接 ${gateway.ws_url}` : `WebSocket 未监听：${gatewayError}`;
+    $("pico-code").textContent = gatewayReady && gateway.pair_code ? gateway.pair_code : "------";
+    $("pico-url").textContent = gatewayReady && gateway.ws_url ? `APK 将连接 ${gateway.ws_url}` : `WebSocket 未监听：${gatewayError}`;
     $("pico-result").textContent = !gatewayReady
       ? `PICO 接收器未就绪：${gatewayError}。请检查控制台进程和端口 8768。`
-      : pico.last_error || gateway.error || (gateway.paired ? "APK 已连接；按住右手 Grip 开始定义 Anchor。" : "在外部 PICO APK 中填写 WebSocket 地址和 token。 ");
+      : pico.last_error || gateway.error || (gateway.paired ? "APK 已连接；按住右手 Grip 开始定义 Anchor。" : "在 PICO APK 输入电脑局域网地址和 6 位短码。 ");
+    const qr = $("pico-qr"); if (qr) qr.innerHTML = gatewayReady && gateway.pair_code ? `<img src="/api/adapters/pico/pair.svg?v=${encodeURIComponent(gateway.pair_code)}" alt="PICO 一次性配对二维码">` : gatewayReady ? "等待配对" : "未监听";
     const diagnostic = gatewayReady
       ? `连接尝试 ${gateway.connection_attempts || 0} 次 · ${gateway.connection_stage || "idle"}${gateway.last_client && gateway.last_client !== "unknown" ? ` · ${gateway.last_client}` : ""}${gateway.last_connection_error ? ` · ${gateway.last_connection_error}` : ""}`
       : `网关诊断：${gatewayError}`;
@@ -315,13 +316,12 @@
     if (diagnosticNode && gatewayReady && !gateway.paired) diagnosticNode.title = diagnostic;
     const diagnosticText = $("pico-diagnostic");
     if (diagnosticText) diagnosticText.textContent = diagnostic;
-    const qr = $("pico-qr"); if (qr) qr.textContent = gatewayReady ? "WebSocket" : "未监听";
     $("pico-start").disabled = gateway.paired || session().state === "ACTIVE" && selectedAdapter() !== "pico";
     $("pico-stop").disabled = !gateway.session_id && pico.state === "IDLE";
     $("pico-start").textContent = "启动 PICO 接收器";
     $("pico-stop").textContent = "停止 PICO 接收器";
     if (!gatewayReady && !gateway.error && gateway.enabled !== false) $("pico-result").textContent = "PICO 接收器正在启动，等待 8768 端口监听。";
-    if (gatewayReady && !pico.last_error && !gateway.error) $("pico-result").textContent = gateway.paired ? "APK 已连接。按住右手 Grip 后再移动手柄，即可控制机械臂。" : "在外部 PICO APK 中填写 WebSocket 地址和 token。";
+    if (gatewayReady && !pico.last_error && !gateway.error) $("pico-result").textContent = gateway.paired ? "APK 已连接。按住右手 Grip 后再移动手柄，即可控制机械臂。" : "在 PICO APK 输入电脑局域网地址和 6 位短码。";
   }
 
   async function startPico() {
@@ -332,13 +332,8 @@
         const started = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId }, 10000);
         state.osc = started.state; current = session();
       }
-      const gateway = await api("/api/adapters/pico/connect", "POST", { session_id: current.id, client_id: clientId }, 10000);
-      // /connect returns the gateway snapshot directly, while /state returns
-      // the adapter snapshot with a nested gateway. Normalize both shapes so
-      // the address/token are rendered immediately after starting the receiver.
-      state.pico = await api("/api/adapters/pico/state", "GET", undefined, 3000);
-      state.pico.gateway = gateway;
-      phase("PICO WebSocket 接收器已启动；请让外部 APK 连接。 "); render();
+      state.pico = await api("/api/adapters/pico/connect", "POST", { session_id: current.id, client_id: clientId }, 10000);
+      phase("PICO 配对已创建；在 APK 输入地址和 6 位短码。 "); render();
     } catch (error) { phase(`PICO 接入失败：${error.message}`, true); }
     finally { $("pico-start").disabled = false; }
   }

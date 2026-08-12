@@ -107,9 +107,12 @@ class AdapterRuntime:
     def pico_message(self, kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         if kind == "heartbeat":
             self.pico.heartbeat(); return None
+        if kind == "tracking": return self.pico.tracking(payload)
         if kind == "anchor_begin": return self.pico.anchor_begin(payload)
         if kind == "pose": return self.pico.pose(payload)
         if kind == "gripper": return self.pico.gripper(payload.get("value", 0.0))
         if kind in {"anchor_release", "hold"}:
             return self.pico.stop("PICO operator HOLD" if kind == "hold" else "PICO right Grip released")
+        if kind == "disconnect":
+            self.pico.disconnected("PICO client requested disconnect"); return None
         raise ValueError("unsupported PICO adapter message")

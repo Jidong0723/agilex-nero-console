@@ -134,6 +134,13 @@ class PicoInputAdapter:
                 self.osc.heartbeat(self._client_id, self._session_id)
                 self.state["updated_at"] = time.time()
 
+    def tracking(self, pose: dict[str, Any]) -> dict[str, Any]:
+        position = _vector(pose.get("position_m"), 3, "controller position")
+        orientation = _normalise(_vector(pose.get("orientation_xyzw"), 4, "controller orientation"))
+        with self.lock:
+            self.state.update({"tracking_valid": bool(pose.get("tracking_valid", True)), "updated_at": time.time(), "last_error": None})
+            return self.snapshot()
+
     def anchor_begin(self, pose: dict[str, Any]) -> dict[str, Any]:
         position, orientation = _vector(pose.get("position_m"), 3, "controller position"), _normalise(_vector(pose.get("orientation_xyzw"), 4, "controller orientation"))
         osc = self.osc.state()

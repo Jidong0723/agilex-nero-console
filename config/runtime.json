@@ -52,10 +52,10 @@
     "enabled": true,
     "host": "0.0.0.0",
     "port": 8768,
-    "auth_token": "4827",
-    "auth_poll_s": 0.25,
-    "auth_timeout_s": 30.0,
+    "pair_ttl_s": 120.0,
     "message_timeout_s": 2.0,
+    "idle_timeout_s": 30.0,
+    "stale_timeout_s": 1.0,
     "max_hz": 90,
     "max_message_bytes": 4096
   },
