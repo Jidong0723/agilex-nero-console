@@ -119,7 +119,7 @@ class LeaseManager:
         return min(120.0, max(5.0, float(ttl_s or self.default_ttl_s)))
 
 
-class _ControllerOscHardwarePort:
+class _ControllerOscCommandPort:
     """Private adapter that prevents the OSC servo from reaching the controller."""
 
     def __init__(self, controller: "OperationalSpaceController") -> None:
@@ -127,7 +127,6 @@ class _ControllerOscHardwarePort:
 
     def require_operational_control(self) -> None: self._controller._require_operational_control()
     def prepare_osc_hardware(self) -> dict[str, Any]: return self._controller.prepare_osc_hardware()
-    def read_osc_feedback(self) -> dict[str, Any]: return self._controller.read_osc_feedback()
     def osc_stream_active(self) -> bool: return self._controller.osc_stream_active()
     def grant_osc_tracking(self, session_id: str, epoch: int) -> bool: return self._controller.grant_osc_tracking(session_id, epoch)
     def mark_osc_stopping(self, session_id: str, epoch: int, reason: str) -> bool: return self._controller.mark_osc_stopping(session_id, epoch, reason)
@@ -135,6 +134,16 @@ class _ControllerOscHardwarePort:
     def send_servo_position(self, joints: list[float], session_id: str, epoch: int) -> dict[str, Any]: return self._controller.send_servo_position(joints, session_id, epoch)
     def latch_osc_hold(self, reason: str) -> dict[str, Any]: return self._controller.latch_osc_hold(reason)
     def trigger_safety_fault(self, reason: str) -> dict[str, Any]: return self._controller.trigger_safety_fault(reason)
+
+
+class _NeroOscRxPort:
+    """OSC-private receive cache reader; never reaches HardwareTxOwner."""
+
+    def __init__(self, backend: NeroRobot) -> None:
+        self._backend = backend
+
+    def read_cached_feedback(self) -> dict[str, Any]:
+        return self._backend.read_cached_osc_feedback()
 
 
 class OperationalSpaceController:
@@ -195,7 +204,10 @@ class OperationalSpaceController:
             "verified": True,
             "source": "runtime.sdk.task_tcp_offset_from_flange_m",
         }
-        self._osc = OscRuntime(_ControllerOscHardwarePort(self), Path(__file__).resolve().parents[1], osc_config)
+        self._osc = OscRuntime(
+            _ControllerOscCommandPort(self), _NeroOscRxPort(backend),
+            Path(__file__).resolve().parents[1], osc_config,
+        )
 
     # ---- Sole transport-owner entry points ---------------------------------
     # OSC and HTTP handlers deliberately use these methods rather than the
@@ -332,10 +344,22 @@ class OperationalSpaceController:
 
         threading.Thread(target=request_reset, name="transport-fault-reset", daemon=True).start()
 
-    def read_osc_feedback(self) -> dict[str, Any]:
-        # Feedback is advisory for the servo loop; P1 CPV output wins once
-        # both requests have reached the single transport owner.
-        return self.robot.call("p2", "read_osc_feedback", category="osc_feedback")
+    def _osc_cached_feedback(self) -> dict[str, Any]:
+        """Read only the OSC-owned RX snapshot; never enqueue a P2 call."""
+        sample = self._osc.rx_snapshot()
+        if not sample:
+            return {}
+        return {
+            "joint_angles_rad": list(sample.get("joints") or []),
+            "joint_velocity_rad_s": list(sample.get("velocities") or []),
+            "sdk_joint_timestamp": sample.get("sdk_joint_timestamp"),
+            "joint_feedback_hz": sample.get("joint_feedback_hz"),
+            "received_at_monotonic_ns": sample.get("received_monotonic_ns"),
+            "timestamp_monotonic_ns": sample.get("fresh_received_at_monotonic_ns"),
+            "revision": sample.get("revision"),
+            "age_s": sample.get("age_s"),
+            "last_error": sample.get("last_error"),
+        }
 
     def read_osc_cpv_parameters(self) -> dict[str, Any]:
         """Compatibility facade for the hardware-maintenance diagnostic API."""
@@ -354,9 +378,10 @@ class OperationalSpaceController:
             # A full status snapshot includes TCP, arm, and gripper reads.
             # On some NERO firmware revisions it can take several seconds,
             # although the lightweight joint-feedback read remains current.
-            # Do not weaken the freshness guard: validate that direct read
-            # through the same serialized CAN owner before changing profile.
-            feedback = self.read_osc_feedback()
+            # Do not weaken the freshness guard: validate against the
+            # OSC-owned receive snapshot before changing profile. This is a
+            # cache read and deliberately never contends with TX ownership.
+            feedback = self._osc_cached_feedback()
             joints = feedback.get("joint_angles_rad") if isinstance(feedback, dict) else None
             if not (
                 isinstance(joints, list)
@@ -385,12 +410,12 @@ class OperationalSpaceController:
         return float(ordered[index])
 
     def collect_readonly_hardware_telemetry(self, sample_count: int = 50) -> dict[str, Any]:
-        """Measure CAN read latency without changing robot control state.
+        """Measure OSC RX snapshot cadence without changing robot control state.
 
         This is deliberately unavailable while OSC tracking is active: a
-        telemetry probe must not contend with live CPV writes.  It measures
-        parameter-query and feedback-read transport timing, not actuator
-        response to a new position target.
+        telemetry probe reads the independent OSC RX cache. It measures
+        parameter-query timing and snapshot cadence, not actuator response
+        to a new position target.
         """
         count = max(10, min(200, int(sample_count)))
         if (self._osc.status().get("session") or {}).get("state") == "ACTIVE":
@@ -403,7 +428,7 @@ class OperationalSpaceController:
         previous_started_ns: int | None = None
         for _ in range(count):
             started_ns = time.perf_counter_ns()
-            feedback = self.read_osc_feedback()
+            feedback = self._osc_cached_feedback()
             finished_ns = time.perf_counter_ns()
             samples.append({
                 "requested_perf_counter_ns": started_ns,
@@ -413,8 +438,8 @@ class OperationalSpaceController:
                 "feedback_timestamp_monotonic_ns": feedback.get("timestamp_monotonic_ns"),
             })
             previous_started_ns = started_ns
-            # Avoid monopolising the single CAN owner. This does not infer a
-            # controller cycle; it merely samples a representative idle bus.
+            # This does not infer a controller cycle; it samples the
+            # independent RX snapshot while the arm is idle.
             time.sleep(0.02)
         durations = [float(row["read_duration_s"]) for row in samples]
         intervals = [float(row["inter_request_s"]) for row in samples if row["inter_request_s"] is not None]
@@ -593,6 +618,10 @@ class OperationalSpaceController:
         ):
             self._hardware_transport_available = False
         self._set_authority(ArmWriter.NONE, ServoMode.SUSPENDED, "startup HOLD; no ARM writer granted")
+        # The OSC-owned RX worker reads only SDK receive caches. Start it
+        # after connection has been attempted and before serving clients; it
+        # remains independent from the serial TX/P0/P1/P2 owner.
+        self._osc.start()
         self._running.set()
         # Establish one immutable startup snapshot before accepting HTTP
         # operator actions.  Action threads must never be the first caller
@@ -635,7 +664,7 @@ class OperationalSpaceController:
 
     def close(self) -> dict[str, Any]:
         self._running.clear()
-        self._osc.stop_session("control service shutdown")
+        self._osc.close()
         if self._status_monitor is not None and self._status_monitor is not threading.current_thread():
             self._status_monitor.join(timeout=1.0)
         if self._watchdog is not None and self._watchdog is not threading.current_thread():
@@ -991,17 +1020,21 @@ class OperationalSpaceController:
         recent_batches = list(raw_diagnostics.get("recent_cpv_batches") or [])
         hardware_robot = snapshot.get("robot") or (snapshot.get("control") or {}).get("robot") or {}
         hardware_raw = hardware_robot.get("raw") if isinstance(hardware_robot, dict) else {}
+        osc_rx = self._osc_cached_feedback()
         hardware_feedback = {
             # Canonical task TCP from the SDK's configured transform. It is
             # available at all times, including FREEDRIVE.
             "tcp_pose": absolute_pose_from_sdk_rpy(hardware_robot.get("tcp_pose")) if isinstance(hardware_robot, dict) else None,
             "tcp_source": hardware_raw.get("tcp_pose_source") if isinstance(hardware_raw, dict) else None,
-            "joint_angles_rad": hardware_robot.get("joint_angles_rad") if isinstance(hardware_robot, dict) else None,
+            "joint_angles_rad": osc_rx.get("joint_angles_rad") or (hardware_robot.get("joint_angles_rad") if isinstance(hardware_robot, dict) else None),
+            "joint_velocity_rad_s": osc_rx.get("joint_velocity_rad_s"),
             "arm_status": hardware_robot.get("arm_status") if isinstance(hardware_robot, dict) else None,
             "arm_status_feedback": (snapshot.get("control") or {}).get("arm_status_feedback"),
             "joint_feedback_source": (snapshot.get("control") or {}).get("joint_feedback_source"),
             "timestamp": hardware_robot.get("timestamp") if isinstance(hardware_robot, dict) else None,
-            "feedback_age_s": snapshot.get("status_age_s"),
+            "feedback_age_s": osc_rx.get("age_s", snapshot.get("status_age_s")),
+            "rx_revision": osc_rx.get("revision"),
+            "rx_error": osc_rx.get("last_error"),
         }
         observed_joints = execution_sample.get("joint_state_rad")
         if not isinstance(observed_joints, list):

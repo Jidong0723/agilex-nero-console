@@ -27,6 +27,6 @@
       "rotation_axis_sign": [-1, -1, 1]
     }
   },
-  "execution": {"period_s": 0.2, "replan_steps": 1, "max_chunk_steps": 128},
+  "execution": {"period_s": 0.2, "expected_chunk_steps": 10, "replan_steps": 5, "max_chunk_steps": 10, "osc_state_poll_s": 0.05, "startup_hold_s": 0.3},
   "gripper": {"switch_threshold": 0.5, "open_width_m": 0.085, "closed_width_m": 0.01, "force_n": 0.8}
 }

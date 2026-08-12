@@ -26,9 +26,9 @@ def main() -> int:
 
     pico = get_json(f"{args.http}/api/adapters/pico/state")
     gateway = pico.get("gateway") or {}
-    code, session_id = gateway.get("pair_code"), gateway.get("session_id")
-    if not code or not session_id:
-        raise RuntimeError("create a PICO pairing in Console before running the simulator")
+    token, session_id = gateway.get("auth_token"), gateway.get("session_id")
+    if not token or not session_id:
+        raise RuntimeError("start the PICO WebSocket receiver in Console before running the simulator")
 
     period = 1.0 / args.hz
     base = [0.0, 0.0, 0.0]
@@ -37,10 +37,10 @@ def main() -> int:
     started = time.monotonic()
     signal_started = started
     with connect(args.ws, compression=None, open_timeout=5, close_timeout=2) as socket:
-        socket.send(json.dumps({"type": "pair", "session_id": session_id, "code": code}))
-        paired = json.loads(socket.recv(timeout=5))
-        if not paired.get("ok"):
-            raise RuntimeError(f"pairing failed: {paired}")
+        socket.send(json.dumps({"type": "auth", "session_id": session_id, "token": token}))
+        authenticated = json.loads(socket.recv(timeout=5))
+        if not authenticated.get("ok"):
+            raise RuntimeError(f"authentication failed: {authenticated}")
 
         signal_started = time.monotonic()
         deadline = signal_started

@@ -24,7 +24,6 @@ class OscHardwarePort(Protocol):
 
     def require_operational_control(self) -> None: ...
     def prepare_osc_hardware(self) -> dict[str, Any]: ...
-    def read_osc_feedback(self) -> dict[str, Any]: ...
     def osc_stream_active(self) -> bool: ...
     def grant_osc_tracking(self, session_id: str, epoch: int) -> bool: ...
     def mark_osc_stopping(self, session_id: str, epoch: int, reason: str) -> bool: ...
@@ -32,6 +31,112 @@ class OscHardwarePort(Protocol):
     def send_servo_position(self, joints: list[float], session_id: str, epoch: int) -> dict[str, Any]: ...
     def latch_osc_hold(self, reason: str) -> dict[str, Any]: ...
     def trigger_safety_fault(self, reason: str) -> dict[str, Any]: ...
+
+
+class _OscRxPort(Protocol):
+    """Private, receive-only path to SDK CAN caches.
+
+    Implementations must not enqueue a TX transaction or issue a CAN request.
+    """
+
+    def read_cached_feedback(self) -> dict[str, Any]: ...
+
+
+class _OscFeedbackReceiver:
+    """Continuously sample the SDK RX cache without touching TX arbitration."""
+
+    def __init__(self, source: _OscRxPort, control_hz: float) -> None:
+        self._source = source
+        self._period_s = 1.0 / max(50.0, float(control_hz))
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._sample: dict[str, Any] | None = None
+        self._revision = 0
+        self._last_sdk_timestamp: Any = None
+        self._last_fresh_received_ns: int | None = None
+        self._last_error: str | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="nero-osc-rx", daemon=True)
+        self._thread.start()
+
+    def close(self) -> bool:
+        self._stop.set()
+        thread = self._thread
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        stopped = not thread or not thread.is_alive()
+        if stopped:
+            self._thread = None
+        return stopped
+
+    def snapshot(self) -> dict[str, Any] | None:
+        with self._lock:
+            if self._sample is None:
+                return None
+            sample = dict(self._sample)
+            sample["joints"] = list(sample["joints"])
+            sample["velocities"] = list(sample["velocities"])
+            sample["last_error"] = self._last_error
+            sample["running"] = bool(self._thread and self._thread.is_alive())
+            sample["age_s"] = max(0.0, (time.monotonic_ns() - int(sample["fresh_received_at_monotonic_ns"])) / 1e9)
+            return sample
+
+    def revision(self) -> int:
+        with self._lock:
+            return self._revision
+
+    def wait_for_revision_after(self, revision: int, timeout_s: float) -> dict[str, Any]:
+        deadline = time.monotonic() + max(0.001, float(timeout_s))
+        while time.monotonic() < deadline:
+            sample = self.snapshot()
+            if sample is not None and int(sample.get("revision", 0)) > int(revision):
+                return sample
+            time.sleep(0.005)
+        raise RuntimeError("timed out waiting for fresh OSC RX feedback")
+
+    def _run(self) -> None:
+        next_tick = time.monotonic()
+        while not self._stop.is_set():
+            try:
+                requested_ns = time.monotonic_ns()
+                row = self._source.read_cached_feedback()
+                received_ns = int(row.get("received_at_monotonic_ns") or time.monotonic_ns())
+                joints = list(row.get("joint_angles_rad") or [])
+                velocities = list(row.get("joint_velocity_rad_s") or [])
+                if len(joints) == 7 and len(velocities) == 7 and all(value is not None for value in velocities):
+                    sdk_timestamp = row.get("sdk_joint_timestamp")
+                    advanced = sdk_timestamp is not None and sdk_timestamp != self._last_sdk_timestamp
+                    if advanced:
+                        self._last_sdk_timestamp = sdk_timestamp
+                        self._last_fresh_received_ns = received_ns
+                    if self._last_fresh_received_ns is None:
+                        self._last_fresh_received_ns = received_ns
+                    with self._lock:
+                        self._revision += 1
+                        self._sample = {
+                            "revision": self._revision,
+                            "joints": [float(value) for value in joints],
+                            "velocities": [float(value) for value in velocities],
+                            "sdk_joint_timestamp": sdk_timestamp,
+                            "joint_feedback_hz": row.get("joint_feedback_hz"),
+                            "sdk_timestamp_advanced": advanced,
+                            "fresh_received_at_monotonic_ns": self._last_fresh_received_ns,
+                            "monotonic_ns": self._last_fresh_received_ns,
+                            "requested_monotonic_ns": requested_ns,
+                            "received_monotonic_ns": received_ns,
+                            "read_duration_s": max(0.0, (received_ns - requested_ns) / 1e9),
+                        }
+                        self._last_error = None
+            except Exception as exc:
+                with self._lock:
+                    self._last_error = f"{type(exc).__name__}: {exc}"
+            next_tick += self._period_s
+            self._stop.wait(max(0.0, next_tick - time.monotonic()))
 
 
 def _finite_vector(value: Any, length: int, name: str) -> list[float]:
@@ -783,7 +888,7 @@ class _OperationalSpaceServo:
     This is the sole Pink/Ruckig/CPV loop inside the OSC runtime.
     """
 
-    def __init__(self, hardware: OscHardwarePort, project_root: Path, config: dict[str, Any]) -> None:
+    def __init__(self, hardware: OscHardwarePort, project_root: Path, config: dict[str, Any], feedback_receiver: _OscFeedbackReceiver) -> None:
         try:
             import ruckig
         except ImportError as exc:
@@ -828,10 +933,7 @@ class _OperationalSpaceServo:
         self.trajectory_state, self.trajectory_brake_reason = "HOLD_READY", None
         self.feedback_sync_pending = True
         self.needs_resync = True
-        self._feedback: dict[str, Any] | None = None
-        self._feedback_lock = threading.RLock()
-        self._feedback_stop = threading.Event()
-        self._feedback_thread: threading.Thread | None = None
+        self._feedback_receiver = feedback_receiver
         self._control_q_estimate: list[float] | None = None
         self._control_qd_estimate: list[float] = [0.0] * 7
         self._estimator_snapshot: dict[str, Any] = {}
@@ -1006,26 +1108,20 @@ class _OperationalSpaceServo:
                 self.solver.close()
                 self.solver.start()
                 if execution_mode != "shadow":
+                    feedback_revision = self._feedback_receiver.revision()
                     hardware_authority = self.hardware.prepare_osc_hardware()
-                    # Start feedback first and wait for a sample produced by
-                    # this session. Do not initialize Ruckig from the
-                    # supervisor snapshot while the feedback worker is still
-                    # warming up.
-                    with self._feedback_lock:
-                        self._feedback = None
-                    self._start_feedback_worker()
-                    feedback = self._wait_for_feedback(float(self.config.get("feedback_start_timeout_s", 2.0)))
+                    # RX runs for the whole OSC runtime. Require a sample
+                    # published after hardware preparation before arming CPV.
+                    feedback = self._feedback_receiver.wait_for_revision_after(
+                        feedback_revision,
+                        float(self.config.get("feedback_start_timeout_s", 2.0)),
+                    )
                     joints = list(feedback["joints"])
                     self._cpv_parameters = {"status": "not_part_of_osc_runtime"}
                 else:
                     joints = _finite_vector(self.config.get("shadow_initial_joints_rad", [0.0] * 7), 7, "shadow_initial_joints_rad")
             except Exception as exc:
                 self.solver.close()
-                self._feedback_stop.set()
-                feedback_thread = self._feedback_thread
-                if feedback_thread and feedback_thread is not threading.current_thread():
-                    feedback_thread.join(timeout=1.0)
-                self._feedback_thread = None
                 with self.lock:
                     self.session = None
                     self.command = None
@@ -1037,11 +1133,6 @@ class _OperationalSpaceServo:
             period = 1.0 / float(self.runtime.get("control_hz", 50))
             if execution_mode != "shadow" and not self.hardware.grant_osc_tracking(session_id, int(hardware_authority["control_epoch"])):
                 self.solver.close()
-                self._feedback_stop.set()
-                feedback_thread = self._feedback_thread
-                if feedback_thread and feedback_thread is not threading.current_thread():
-                    feedback_thread.join(timeout=1.0)
-                self._feedback_thread = None
                 with self.lock:
                     self.session = None
                     self.command = None
@@ -1118,19 +1209,15 @@ class _OperationalSpaceServo:
                 self.session.update({"state": "STOPPING", "stopped_reason": reason})
             self._accepting_targets = False
             self._bump_state()
-            self.stop_event.set(); self._feedback_stop.set(); self.command = None
-        servo_thread, feedback_thread = self.thread, self._feedback_thread
+            self.stop_event.set(); self.command = None
+        servo_thread = self.thread
         if servo_thread and servo_thread is not threading.current_thread(): servo_thread.join(timeout=1.0)
-        if feedback_thread and feedback_thread is not threading.current_thread(): feedback_thread.join(timeout=1.0)
         servo_stopped = not servo_thread or not servo_thread.is_alive()
-        feedback_stopped = not feedback_thread or not feedback_thread.is_alive()
         if servo_stopped:
             self.thread = None
-        if feedback_stopped:
-            self._feedback_thread = None
         # The broker owns the terminal zero/hold transition.  Sending another
         # CPV sample here could reopen CPV after the mode handoff.
-        if servo_stopped and feedback_stopped:
+        if servo_stopped:
             self.solver.close()
         with self.lock:
             self.session = None
@@ -1142,7 +1229,8 @@ class _OperationalSpaceServo:
             "reason": reason,
             "active_session": active,
             "servo_stopped": servo_stopped,
-            "feedback_stopped": feedback_stopped,
+            "feedback_stopped": False,
+            "rx_running": bool(self._feedback_receiver.snapshot() and self._feedback_receiver.snapshot().get("running")),
             "zero_velocity_sent": cpv_stream_active,
         }
         return result
@@ -1184,21 +1272,15 @@ class _OperationalSpaceServo:
             self.trajectory_state = "HOLD_READY"
             self.trajectory_brake_reason = reason
             self.stop_event.set()
-            self._feedback_stop.set()
             self._bump_state()
-            servo_thread, feedback_thread = self.thread, self._feedback_thread
+            servo_thread = self.thread
 
         if servo_thread and servo_thread is not threading.current_thread():
             servo_thread.join(timeout=1.0)
-        if feedback_thread and feedback_thread is not threading.current_thread():
-            feedback_thread.join(timeout=1.0)
         servo_stopped = not servo_thread or not servo_thread.is_alive()
-        feedback_stopped = not feedback_thread or not feedback_thread.is_alive()
         if servo_stopped:
             self.thread = None
-        if feedback_stopped:
-            self._feedback_thread = None
-        if servo_stopped and feedback_stopped:
+        if servo_stopped:
             self.solver.close()
 
         with self.lock:
@@ -1210,8 +1292,9 @@ class _OperationalSpaceServo:
             "reason": reason,
             "active_session": active,
             "servo_stopped": servo_stopped,
-            "feedback_stopped": feedback_stopped,
-            "threads_stopped": servo_stopped and feedback_stopped,
+            "feedback_stopped": False,
+            "rx_running": bool(self._feedback_receiver.snapshot() and self._feedback_receiver.snapshot().get("running")),
+            "threads_stopped": servo_stopped,
             "braking_requested": False,
             "zero_velocity_sent": False,
         }
@@ -1317,52 +1400,8 @@ class _OperationalSpaceServo:
             timeout_s = float(self.config.get("session_timeout_s", 5.0))
             return (time.monotonic_ns() - self._heartbeat_monotonic_ns) / 1e9 > timeout_s
 
-    def _start_feedback_worker(self) -> None:
-        self._feedback_stop.clear()
-        def run() -> None:
-            last_sdk_timestamp: Any = None
-            last_fresh_received_ns: int | None = None
-            period = 1.0 / max(50.0, float(self.runtime.get("control_hz", 50)))
-            next_tick = time.monotonic()
-            while not self._feedback_stop.is_set():
-                try:
-                    requested_ns = time.monotonic_ns()
-                    row = self.hardware.read_osc_feedback()
-                    received_monotonic_ns = int(row.get("received_at_monotonic_ns") or time.monotonic_ns())
-                    q = list(row.get("joint_angles_rad") or [])
-                    qd = list(row.get("joint_velocity_rad_s") or [])
-                    if len(q) == 7 and len(qd) == 7 and all(item is not None for item in qd):
-                        sdk_timestamp = row.get("sdk_joint_timestamp")
-                        timestamp_advanced = sdk_timestamp is not None and sdk_timestamp != last_sdk_timestamp
-                        if timestamp_advanced:
-                            last_sdk_timestamp = sdk_timestamp
-                            last_fresh_received_ns = received_monotonic_ns
-                        # Older SDKs may not expose a timestamp.  Keep the
-                        # conservative local-receipt fallback rather than
-                        # falsely declaring every valid sample stale.
-                        if last_fresh_received_ns is None:
-                            last_fresh_received_ns = received_monotonic_ns
-                        with self._feedback_lock:
-                            self._feedback = {
-                                "joints": [float(x) for x in q],
-                                "velocities": [float(x) for x in qd],
-                                "sdk_joint_timestamp": sdk_timestamp,
-                                "joint_feedback_hz": row.get("joint_feedback_hz"),
-                                "sdk_timestamp_advanced": timestamp_advanced,
-                                "fresh_received_at_monotonic_ns": last_fresh_received_ns,
-                                "monotonic_ns": last_fresh_received_ns,
-                                "requested_monotonic_ns": requested_ns,
-                                "received_monotonic_ns": received_monotonic_ns,
-                                "read_duration_s": max(0.0, (received_monotonic_ns - requested_ns) / 1e9),
-                            }
-                except Exception:
-                    pass
-                next_tick += period
-                self._feedback_stop.wait(max(0.0, next_tick - time.monotonic()))
-        self._feedback_thread = threading.Thread(target=run, name="nero-osc-feedback", daemon=True); self._feedback_thread.start()
-
     def _feedback_snapshot(self) -> dict[str, Any] | None:
-        with self._feedback_lock: return dict(self._feedback) if self._feedback else None
+        return self._feedback_receiver.snapshot()
 
     def _estimate_hardware_state(self, feedback: dict[str, Any], actual_dt: float) -> tuple[list[float], list[float], float]:
         """One continuous predictor/corrector; never threshold-reset Pink state."""
@@ -1402,18 +1441,9 @@ class _OperationalSpaceServo:
         return list(self._control_q_estimate), list(self._control_qd_estimate), feedback_age
 
     def _wait_for_feedback(self, timeout_s: float = 2.0) -> dict[str, Any]:
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            row = self._feedback_snapshot()
-            if row:
-                joints = row.get("joints") or []
-                velocities = row.get("velocities") or []
-                if len(joints) == 7 and len(velocities) == 7 and all(
-                    math.isfinite(float(value)) for value in [*joints, *velocities]
-                ):
-                    return row
-            time.sleep(0.01)
-        raise RuntimeError("timed out waiting for first valid osc joint feedback")
+        return self._feedback_receiver.wait_for_revision_after(
+            self._feedback_receiver.revision() - 1, timeout_s
+        )
 
     def _set_result(self, ok: bool, reason: str, **extra: Any) -> None:
         with self.lock:
@@ -1913,8 +1943,20 @@ class _OperationalSpaceServo:
 class OscRuntime:
     """Internal OSC facade; the Servo implementation never escapes this type."""
 
-    def __init__(self, hardware: OscHardwarePort, project_root: Path, config: dict[str, Any]) -> None:
-        self._servo = _OperationalSpaceServo(hardware, project_root, config)
+    def __init__(self, hardware: OscHardwarePort, rx: _OscRxPort, project_root: Path, config: dict[str, Any]) -> None:
+        self._receiver = _OscFeedbackReceiver(rx, float((config.get("runtime") or {}).get("control_hz", 50)))
+        self._servo = _OperationalSpaceServo(hardware, project_root, config, self._receiver)
+
+    def start(self) -> None: self._receiver.start()
+
+    def close(self) -> bool:
+        self._servo.stop_session("OSC runtime shutdown")
+        return self._receiver.close()
+
+    def rx_snapshot(self) -> dict[str, Any] | None: return self._receiver.snapshot()
+
+    def wait_for_rx_after(self, revision: int, timeout_s: float) -> dict[str, Any]:
+        return self._receiver.wait_for_revision_after(revision, timeout_s)
 
     def status(self) -> dict[str, Any]: return self._servo.status()
     def target_pose(self) -> dict[str, list[float]] | None: return self._servo._public_target_pose()

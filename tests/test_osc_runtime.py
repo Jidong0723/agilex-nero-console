@@ -8,8 +8,23 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from motion.osc import JointConvention, JointLimitAuthority, _OperationalSpaceServo, SafetySupervisor, ShadowCpvPlant
-OscController = _OperationalSpaceServo
+from motion.osc import JointConvention, JointLimitAuthority, _OperationalSpaceServo, _OscFeedbackReceiver, SafetySupervisor, ShadowCpvPlant
+
+
+class _TestOscRxPort:
+    def __init__(self, broker: Any) -> None:
+        self._broker = broker
+
+    def read_cached_feedback(self) -> dict[str, Any]:
+        return self._broker.read_cached_feedback()
+
+
+def OscController(broker: Any, root: Path, config: dict[str, Any]) -> _OperationalSpaceServo:
+    receiver = _OscFeedbackReceiver(_TestOscRxPort(broker), float((config.get("runtime") or {}).get("control_hz", 50)))
+    receiver.start()
+    controller = _OperationalSpaceServo(broker, root, config, receiver)
+    controller._test_rx_receiver = receiver  # type: ignore[attr-defined]
+    return controller
 from supervisor.authority import (
     ArmWriter, CommandRevoked, ControlSupervisor, HardwareTxOwner, ServoMode,
     ServoWriteRevoked,
@@ -119,8 +134,9 @@ class FakeBroker:
     def read_osc_joint_limits(self) -> dict[str, Any]:
         return {"joints": [{"joint_index": index + 1, "angle_velocity": {"min_angle_limit": -2.0, "max_angle_limit": 2.0, "max_joint_spd": 0.45}, "acceleration": {"max_joint_acc": 2.0}} for index in range(7)]}
 
-    def read_osc_feedback(self) -> dict[str, Any]:
-        return {"joint_angles_rad": [0.0] * 7, "joint_velocity_rad_s": [0.0] * 7, "timestamp_monotonic_ns": time.monotonic_ns()}
+    def read_cached_feedback(self) -> dict[str, Any]:
+        now = time.monotonic_ns()
+        return {"joint_angles_rad": [0.0] * 7, "joint_velocity_rad_s": [0.0] * 7, "sdk_joint_timestamp": now, "received_at_monotonic_ns": now}
 
     def read_osc_cpv_parameters(self) -> dict[str, Any]:
         return {"status": "available", "values": {"acc": [2.0] * 7}}
@@ -344,9 +360,7 @@ class OscVelocityStreamTests(unittest.TestCase):
                 controller.stop_event.set()
                 if controller.thread:
                     controller.thread.join(timeout=1.0)
-                if controller._feedback_thread:
-                    controller._feedback_stop.set()
-                    controller._feedback_thread.join(timeout=1.0)
+                controller._test_rx_receiver.close()  # type: ignore[attr-defined]
                 controller.solver.close()
 
     def test_hardware_stream_uses_only_cpv_positions(self) -> None:
@@ -698,9 +712,7 @@ class OscVelocityStreamTests(unittest.TestCase):
             controller.stop_event.set()
             if controller.thread:
                 controller.thread.join(timeout=1.0)
-            if controller._feedback_thread:
-                controller._feedback_stop.set()
-                controller._feedback_thread.join(timeout=1.0)
+            controller._test_rx_receiver.close()  # type: ignore[attr-defined]
 
         self.assertEqual(broker.writer, "NONE")
         self.assertEqual(controller.trajectory_state, "HOLD_READY")
@@ -781,6 +793,86 @@ class TransportOwnerEpochTests(unittest.TestCase):
         finally:
             backend.release.set()
             owner.close()
+
+
+class OscRxParallelTests(unittest.TestCase):
+    def test_rx_progresses_while_p2_transaction_blocks(self) -> None:
+        class RxPort:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def read_cached_feedback(self) -> dict[str, Any]:
+                self.calls += 1
+                now = time.monotonic_ns()
+                return {
+                    "joint_angles_rad": [0.0] * 7,
+                    "joint_velocity_rad_s": [0.0] * 7,
+                    "sdk_joint_timestamp": self.calls,
+                    "received_at_monotonic_ns": now,
+                }
+
+        class TxBackend:
+            def __init__(self) -> None:
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def block(self) -> None:
+                self.entered.set()
+                self.release.wait(1.0)
+
+        rx = _OscFeedbackReceiver(RxPort(), 100.0)
+        backend = TxBackend()
+        owner = HardwareTxOwner(backend)
+        blocker = threading.Thread(target=lambda: owner.call("p2", "block"))
+        try:
+            rx.start()
+            self.assertIsNotNone(rx.wait_for_revision_after(0, 0.5))
+            baseline = rx.revision()
+            blocker.start()
+            self.assertTrue(backend.entered.wait(0.5))
+            self.assertEqual(owner.diagnostics()["active"]["priority"], "p2")
+            self.assertIsNotNone(rx.wait_for_revision_after(baseline, 0.5))
+            self.assertGreater(rx.revision(), baseline)
+            self.assertEqual(owner.diagnostics()["queued"], 0)
+        finally:
+            backend.release.set()
+            blocker.join(timeout=1.0)
+            self.assertTrue(rx.close())
+            owner.close()
+
+    def test_rx_retains_last_sample_and_reports_error(self) -> None:
+        class FlakyRxPort:
+            def __init__(self) -> None:
+                self.fail = False
+                self.sequence = 0
+
+            def read_cached_feedback(self) -> dict[str, Any]:
+                if self.fail:
+                    raise RuntimeError("RX cache unavailable")
+                self.sequence += 1
+                now = time.monotonic_ns()
+                return {
+                    "joint_angles_rad": [0.0] * 7,
+                    "joint_velocity_rad_s": [0.0] * 7,
+                    "sdk_joint_timestamp": self.sequence,
+                    "received_at_monotonic_ns": now,
+                }
+
+        source = FlakyRxPort()
+        rx = _OscFeedbackReceiver(source, 100.0)
+        try:
+            rx.start()
+            sample = rx.wait_for_revision_after(0, 0.5)
+            source.fail = True
+            deadline = time.monotonic() + 0.5
+            while not (rx.snapshot() or {}).get("last_error") and time.monotonic() < deadline:
+                time.sleep(0.01)
+            retained = rx.snapshot()
+            self.assertEqual(retained["revision"], sample["revision"])
+            self.assertIn("RX cache unavailable", retained["last_error"])
+            self.assertTrue(retained["running"])
+        finally:
+            self.assertTrue(rx.close())
 
 
 class JointLimitAuthorityTests(unittest.TestCase):

@@ -38,9 +38,15 @@ to absolute TCP targets before calling OSC.
 
 - π0.5: `GET /api/pi05/state`, `POST /api/pi05/config`, `POST /api/pi05/start`, and `POST /api/pi05/stop`.
 - Cameras: `GET /api/cameras/state`, `GET /api/cameras/list`, `POST /api/cameras/config`, `POST /api/cameras/activate`, and `POST /api/cameras/deactivate`.
-- PICO: `GET /api/adapters/pico/state`, `POST /api/adapters/pico/pair`, and `POST /api/adapters/pico/disconnect`.
+- PICO: `GET /api/adapters/pico/state`, `POST /api/adapters/pico/connect`, and `POST /api/adapters/pico/disconnect`. The external PICO client connects to the configured WebSocket URL and sends an initial `{"type":"auth","token":"..."}` message; `session_id` is optional because the server binds the socket to the active adapter session. The computer-side service has no PICO SDK dependency.
 
-PICO and π0.5 run in the HTTP process. They own pairing, device anchors,
+The PICO WebSocket auth handshake polls for the first message every 250 ms and
+waits up to 30 seconds. After authentication, the normal input idle timeout is
+controlled by `message_timeout_s`. The fixed token has no 120-second pairing
+expiry; stopping or disconnecting the receiver invalidates the active socket.
+
+PICO and π0.5 run in the HTTP process. PICO owns the authenticated WebSocket
+connection and device anchors,
 camera and policy lifecycle, and can only read OSC state, renew a session, or
 send absolute `track_tcp`, `hold`, and `gripper` commands.
 

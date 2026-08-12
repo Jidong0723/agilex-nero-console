@@ -63,10 +63,10 @@
     "velocity_error_fault_rad_s": 0.45,
     "velocity_error_fault_cycles": 10,
     "feedback_soft_stale_s": 0.06,
-    "feedback_hard_stale_s": 0.15,
+    "feedback_hard_stale_s": 0.75,
     "solver_stale_s": 0.1,
     "max_stale_velocity_repeats": 0,
-    "input_filter_alpha": 0.5,
+    "input_filter_alpha": 1.0,
     "workspace_min_m": [
       -0.6,
       -0.6,

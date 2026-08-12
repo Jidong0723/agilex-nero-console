@@ -537,6 +537,11 @@ class PicoGateway:
         self._pair: dict[str, Any] | None = None
         self._connection_active = False
         self._last_input_monotonic = 0.0
+        self._connection_attempts = 0
+        self._last_connection_attempt_at: float | None = None
+        self._last_client: str | None = None
+        self._last_connection_stage = "idle"
+        self._last_connection_error: str | None = None
         self.error: str | None = None
 
     def start(self) -> None:
@@ -571,16 +576,16 @@ class PicoGateway:
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=1.0)
 
-    def create_pairing(self, session_id: str, client_id: str) -> dict[str, Any]:
+    def connect(self, session_id: str, client_id: str) -> dict[str, Any]:
         if self._server is None:
             raise RuntimeError(self.error or "PICO WebSocket gateway is unavailable")
         self.runtime.require_adapters().pico_begin_pairing(session_id, client_id)
-        code = f"{secrets.randbelow(1_000_000):06d}"
-        expires = time.monotonic() + float(self.config.get("pair_ttl_s", 120.0))
         with self._lock:
-            self._pair = {"session_id": session_id, "client_id": client_id, "code": code, "expires_monotonic": expires, "paired": False}
+            self._pair = {"session_id": session_id, "client_id": client_id, "paired": False}
             self._connection_active = False
             self._last_input_monotonic = 0.0
+            self._last_connection_stage = "waiting_for_auth"
+            self._last_connection_error = None
         return self.status()
 
     def invalidate(self) -> None:
@@ -613,56 +618,74 @@ class PicoGateway:
                 "host": host, "port": int(self.config.get("port", 8768)),
                 "ws_url": f"ws://{advertised_host}:{int(self.config.get('port', 8768))}",
                 "session_id": pair.get("session_id") if pair else None,
-                "pair_code": pair.get("code") if pair and not pair.get("paired") else None,
+                "auth_token": str(self.config.get("auth_token", "")),
                 "paired": active, "connection_active": self._connection_active,
+                "connection_attempts": self._connection_attempts,
+                "last_connection_attempt_at": self._last_connection_attempt_at,
+                "last_client": self._last_client,
+                "connection_stage": self._last_connection_stage,
+                "last_connection_error": self._last_connection_error,
                 "last_input_age_s": None if not self._last_input_monotonic else max(0.0, time.monotonic() - self._last_input_monotonic),
                 "error": self.error,
             }
-            if pair and not pair.get("paired"):
-                # The companion app scans this opaque local-LAN payload; OSC
-                # never receives it and it expires with the pairing record.
-                result["pair_uri"] = f"nero-pico://pair?ws={result['ws_url']}&session={pair['session_id']}&code={pair['code']}"
             return result
 
     def _send(self, connection: Any, payload: dict[str, Any]) -> None:
         connection.send(json.dumps(payload, ensure_ascii=False))
 
-    def pair_svg(self) -> bytes | None:
-        status = self.status(); uri = status.get("pair_uri")
-        if not uri:
-            return None
-        import qrcode
-        import qrcode.image.svg
-        image = qrcode.make(uri, image_factory=qrcode.image.svg.SvgPathImage, border=1)
-        return image.to_string(encoding="utf-8")
-
     def _handle_connection(self, connection: Any) -> None:
         paired_session: str | None = None
         last_sequence = 0
+        client = getattr(connection, "remote_address", None)
+        client_label = str(client) if client is not None else "unknown"
+        with self._lock:
+            self._connection_attempts += 1
+            self._last_connection_attempt_at = time.time()
+            self._last_client = client_label
+            self._last_connection_stage = "waiting_for_auth"
+            self._last_connection_error = None
         try:
-            raw = connection.recv(timeout=10)
+            # Keep the auth handshake responsive while allowing the external
+            # PICO app time to open its socket and send the first packet. A
+            # timeout here is only a poll interval; the whole handshake has a
+            # bounded 30-second deadline.
+            auth_timeout = max(0.1, float(self.config.get("auth_timeout_s", 30.0)))
+            auth_poll = max(0.05, float(self.config.get("auth_poll_s", 0.25)))
+            auth_deadline = time.monotonic() + auth_timeout
+            raw = None
+            while raw is None:
+                remaining = auth_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"PICO authentication timed out after {auth_timeout:g}s")
+                try:
+                    raw = connection.recv(timeout=min(auth_poll, remaining))
+                except TimeoutError:
+                    continue
             message = json.loads(raw)
-            if not isinstance(message, dict) or message.get("type") != "pair":
-                raise PermissionError("first WebSocket message must be pair")
+            if not isinstance(message, dict) or message.get("type") != "auth":
+                raise PermissionError("first WebSocket message must be auth")
+            with self._lock:
+                self._last_connection_stage = "auth_received"
             with self._lock:
                 pair = dict(self._pair) if self._pair else None
                 supplied_session = str(message.get("session_id", "")).strip()
                 valid = bool(
                     pair
                     and not pair.get("paired")
-                    and time.monotonic() <= float(pair["expires_monotonic"])
-                    and secrets.compare_digest(str(message.get("code", "")), str(pair["code"]))
+                    and secrets.compare_digest(str(message.get("token", "")), str(self.config.get("auth_token", "")))
                     and (not supplied_session or supplied_session == str(pair["session_id"]))
                 )
                 if not valid:
-                    raise PermissionError("PICO pairing rejected: invalid or expired code")
+                    raise PermissionError("PICO authentication rejected: invalid token or session")
                 self._pair["paired"] = True
                 self._connection_active = True
                 paired_session = str(pair["session_id"])
             self.runtime.require_adapters().pico_paired()
-            self._send(connection, {"ok": True, "type": "paired", "session_id": paired_session})
+            with self._lock:
+                self._last_connection_stage = "authenticated"
+            self._send(connection, {"ok": True, "type": "authenticated", "session_id": paired_session})
             while True:
-                raw = connection.recv(timeout=float(self.config.get("message_timeout_s", 0.25)))
+                raw = connection.recv(timeout=float(self.config.get("message_timeout_s", 2.0)))
                 if len(raw.encode("utf-8")) > int(self.config.get("max_message_bytes", 4096)):
                     raise ValueError("PICO message is too large")
                 message = json.loads(raw)
@@ -681,8 +704,13 @@ class PicoGateway:
                     self._last_input_monotonic = time.monotonic()
                 self._send(connection, {"ok": True, "type": "ack", "sequence": sequence, "data": result})
         except TimeoutError:
-            pass
+            with self._lock:
+                self._last_connection_stage = "auth_timeout" if not paired_session else "input_timeout"
+                self._last_connection_error = "PICO connection timed out waiting for data"
         except Exception as exc:
+            with self._lock:
+                self._last_connection_stage = "rejected" if not paired_session else "runtime_error"
+                self._last_connection_error = f"{type(exc).__name__}: {exc}"
             try:
                 self._send(connection, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
             except Exception:
@@ -741,13 +769,6 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 if self.pico_gateway is not None:
                     result["gateway"] = self.pico_gateway.status()
                 return self._json_ok(result)
-            if parsed.path == "/api/adapters/pico/pair.svg":
-                if self.pico_gateway is None:
-                    return self.send_error(HTTPStatus.NOT_FOUND, "PICO gateway is unavailable")
-                payload = self.pico_gateway.pair_svg()
-                if payload is None:
-                    return self.send_error(HTTPStatus.NOT_FOUND, "PICO pairing QR is not available")
-                return self._send_bytes(payload, "image/svg+xml")
             if parsed.path in {"/api/cameras/list", "/api/pi05/cameras/list"}:
                 return self._json_ok({"cameras": self.runtime.require_adapters().camera_devices()})
             if parsed.path in {"/api/cameras/frame/external.jpg", "/api/cameras/frame/wrist.jpg", "/api/pi05/frame/external.jpg", "/api/pi05/frame/wrist.jpg"}:
@@ -800,10 +821,10 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 ))
             if self.path == "/api/pi05/stop":
                 return self._json_ok(self.runtime.require_adapters().pi05_stop(str(body.get("reason", "pi05 adapter stopped"))))
-            if self.path == "/api/adapters/pico/pair":
+            if self.path in {"/api/adapters/pico/connect", "/api/adapters/pico/pair"}:
                 if self.pico_gateway is None:
                     raise RuntimeError("PICO WebSocket gateway is unavailable")
-                return self._json_ok(self.pico_gateway.create_pairing(
+                return self._json_ok(self.pico_gateway.connect(
                     str(body.get("session_id", "")), str(body.get("client_id", "anonymous"))))
             if self.path == "/api/adapters/pico/disconnect":
                 if self.pico_gateway is not None:

@@ -605,7 +605,7 @@ class NeroRobot:
             raw=raw,
         )
 
-    def read_osc_feedback(self) -> dict[str, Any]:
+    def read_cached_osc_feedback(self) -> dict[str, Any]:
         """Return the minimal cached feedback set required by the OSC CPV servo.
 
         This intentionally avoids pose/driver status reads.  The SDK

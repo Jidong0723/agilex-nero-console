@@ -9,8 +9,10 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 from pathlib import Path
 import socket
+import subprocess
 import threading
 import time
 from typing import Any
@@ -90,7 +92,21 @@ class OpenPIClient:
         return msgpack.unpackb(reply, object_hook=_unpack_array)
 
     def close(self) -> None:
-        self.socket.close()
+        try:
+            self.socket.close()
+        except Exception:
+            pass
+
+    def is_alive(self) -> bool:
+        """Return whether the WebSocket is still open, with a real ping."""
+        state = str(getattr(self.socket, "state", "")).upper()
+        if state and state not in {"OPEN", "1"}:
+            return False
+        try:
+            pong = self.socket.ping()
+            return bool(pong.wait(timeout=1.0))
+        except Exception:
+            return False
 
 
 class _LegacyCameraPair:
@@ -138,21 +154,33 @@ class Pi05InputAdapter:
         self.config = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.lock = threading.RLock(); self.stop_event = threading.Event(); self.worker: threading.Thread | None = None
         self._connection_stop = threading.Event(); self._policy: OpenPIClient | None = None
+        self._connection_wakeup = threading.Event()
+        self._policy_create_lock = threading.Lock()
+        self._policy_generation = 0
+        self._policy_retry_at = 0.0
         self._connection_thread = threading.Thread(target=self._connection_loop, name="nero-pi05-websocket", daemon=True)
+        self._osc_state_stop = threading.Event()
+        self._osc_state_thread = threading.Thread(target=self._osc_state_loop, name="nero-pi05-osc-state", daemon=True)
         self.camera_resource = camera_resource
         # Compatibility seam for direct adapter tests; production always uses
         # the HTTP-process shared camera resource.
         self.cameras: Any | None = None if camera_resource else None
         self._last_connection_probe = 0.0
         self._connections: dict[str, Any] = {}
+        self._osc_snapshot: dict[str, Any] = {}
+        self._last_gripper_target: str | None = None
         self.state: dict[str, Any] = self._new_state()
         self._connection_thread.start()
+        self._osc_state_thread.start()
 
     def _new_state(self) -> dict[str, Any]:
         return {"adapter": "pi05", "state": "IDLE", "camera_state": "IDLE", "model_state": "UNKNOWN",
                 "session_id": None, "client_id": None, "execution_mode": None, "prompt": self.config["model"]["prompt"],
-                "last_error": None, "inference_ms": None, "action_chunk": None, "action_chunk_length": 0, "chunk_sequence": 0,
-                "executed_steps": 0, "sequence": 0, "execution_enabled": False, "updated_at": time.time()}
+                "last_error": None, "websocket_error": None, "inference_ms": None, "action_chunk": None, "absolute_tcp_chunk": None,
+                "inference_base_tcp": None, "action_chunk_length": 0, "chunk_sequence": 0,
+                "executed_steps": 0, "sequence": 0, "execution_enabled": False,
+                "osc_error": None,
+                "priming": False, "updated_at": time.time()}
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -179,50 +207,127 @@ class Pi05InputAdapter:
                 return
 
     @staticmethod
-    def _port_open(host: str, port: int) -> bool:
+    def _local_forward_listening(port: int) -> bool:
+        """Check only for a local SSH listener, without touching the tunnel.
+
+        A TCP connect probe would reach OpenPI through the tunnel and close
+        before sending a WebSocket Upgrade request, which the server reports
+        as an invalid handshake.  Process-local listener inspection keeps the
+        SSH card independent from WebSocket state and is side-effect free.
+        """
         try:
-            with socket.create_connection((host, port), timeout=.25): return True
-        except OSError: return False
+            if os.name == "nt":
+                result = subprocess.run(
+                    ["netstat.exe", "-ano", "-p", "tcp"],
+                    capture_output=True, text=True, timeout=.75,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                for line in result.stdout.splitlines():
+                    fields = line.split()
+                    if len(fields) >= 4 and fields[0].upper() == "TCP" and fields[3].upper() == "LISTENING":
+                        if fields[1].rsplit(":", 1)[-1] == str(port):
+                            return True
+                return False
+            result = subprocess.run(["ss", "-ltn"], capture_output=True, text=True, timeout=.75)
+            return any(line.rsplit(":", 1)[-1].split()[0] == str(port) for line in result.stdout.splitlines()[1:] if ":" in line)
+        except (OSError, subprocess.SubprocessError):
+            return False
 
     def _connection_loop(self) -> None:
         """Keep a lightweight policy WebSocket handshake independent of inference."""
         while not self._connection_stop.is_set():
             with self.lock:
-                connected = self._policy is not None
+                policy = self._policy
                 model = dict(self.config["model"])
-            if not connected:
-                try:
-                    policy = OpenPIClient(str(model["host"]), int(model["port"]), float(model["request_timeout_s"]))
+                worker_active = self.worker is not None and self.worker.is_alive()
+                retry_at = self._policy_retry_at
+            # The synchronous WebSocket client serializes send/recv/ping.
+            # Never issue a health ping concurrently with inference on the
+            # same socket; inference failures are the active-session liveness
+            # signal.  Idle sessions may still use ping to publish status.
+            connected = policy is not None and (worker_active or policy.is_alive())
+            if policy is not None and not connected:
+                self._invalidate_policy(policy, "OpenPI WebSocket disconnected")
+            if not connected and time.monotonic() >= retry_at:
+                with self._policy_create_lock:
                     with self.lock:
-                        if self._connection_stop.is_set():
-                            policy.close()
+                        if self._policy is not None:
+                            policy = self._policy
+                            continue_connect = False
                         else:
-                            self._policy = policy
-                            self.state.update({"model_state": "CONNECTED", "last_error": None, "updated_at": time.time()})
-                            if self.camera_resource and self.camera_resource.snapshot().get("ready"):
-                                self._ensure_worker()
-                except Exception as exc:
-                    with self.lock:
-                        self.state.update({"model_state": "CONNECTING", "last_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
-            self._connection_stop.wait(1.0)
+                            continue_connect = True
+                    if continue_connect:
+                        try:
+                            policy = OpenPIClient(str(model["host"]), int(model["port"]), float(model["request_timeout_s"]))
+                            with self.lock:
+                                if self._connection_stop.is_set():
+                                    policy.close()
+                                else:
+                                    self._policy = policy
+                                    self._policy_generation += 1
+                                    self.state.update({"model_state": "CONNECTED", "websocket_error": None, "updated_at": time.time()})
+                                    if self.camera_resource and self.camera_resource.snapshot().get("ready"):
+                                        self._ensure_worker()
+                        except Exception as exc:
+                            with self.lock:
+                                self.state.update({"model_state": "DISCONNECTED", "websocket_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
+            self._connection_wakeup.wait(1.0)
+            self._connection_wakeup.clear()
+
+    def _invalidate_policy(self, policy: OpenPIClient | None, reason: str) -> None:
+        with self.lock:
+            if policy is not None and self._policy is not policy:
+                return
+            self._policy = None
+            self._policy_retry_at = time.monotonic() + 2.0
+            self.state.update({"model_state": "DISCONNECTED", "websocket_error": reason, "updated_at": time.time()})
+        if policy is not None:
+            policy.close()
+
+    def _osc_state_loop(self) -> None:
+        """Refresh OSC feedback independently from inference and UI state reads."""
+        period_s = max(0.02, float((self.config.get("execution") or {}).get("osc_state_poll_s", 0.05)))
+        while not self._osc_state_stop.is_set():
+            try:
+                snapshot = self.osc.state()
+                with self.lock:
+                    self._osc_snapshot = copy.deepcopy(snapshot)
+                    self.state.update({"osc_error": None, "updated_at": time.time()})
+            except Exception as exc:
+                with self.lock:
+                    self.state.update({"osc_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
+            self._osc_state_stop.wait(period_s)
 
     def _policy_client(self) -> OpenPIClient:
+        """Wait for the single connection-owner thread to publish a client.
+
+        Connection creation must stay in ``_connection_loop``.  Creating a
+        fallback client here races that loop and produces multiple OpenPI
+        sockets, which appear on the server as clients that vanish during
+        handshake.
+        """
         deadline = time.monotonic() + float(self.config["model"]["request_timeout_s"])
         while time.monotonic() < deadline and not self.stop_event.is_set():
             with self.lock:
-                if self._policy is not None:
-                    return self._policy
-            # The synchronous fallback also keeps direct adapter users and
-            # tests deterministic when the background connector has not run.
-            try:
-                model = self.config["model"]
-                policy = OpenPIClient(str(model["host"]), int(model["port"]), float(model["request_timeout_s"]))
-                with self.lock:
-                    self._policy = policy
-                    self.state.update({"model_state": "CONNECTED", "last_error": None, "updated_at": time.time()})
+                policy = self._policy
+            if policy is not None:
                 return policy
-            except Exception:
-                pass
+            with self._policy_create_lock:
+                with self.lock:
+                    policy = self._policy
+                if policy is not None:
+                    return policy
+                try:
+                    model = self.config["model"]
+                    policy = OpenPIClient(str(model["host"]), int(model["port"]), float(model["request_timeout_s"]))
+                    with self.lock:
+                        self._policy = policy
+                        self._policy_generation += 1
+                        self.state.update({"model_state": "CONNECTED", "websocket_error": None, "updated_at": time.time()})
+                    return policy
+                except Exception as exc:
+                    with self.lock:
+                        self.state.update({"model_state": "DISCONNECTED", "websocket_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
             time.sleep(.05)
         raise RuntimeError("π0.5 WebSocket is not connected")
 
@@ -245,12 +350,21 @@ class Pi05InputAdapter:
         connection = self.config.get("connection") or {}
         host = str(connection.get("policy_host", self.config["model"]["host"]))
         port = int(connection.get("policy_port", self.config["model"]["port"]))
-        port_ok = self._port_open(host, port)
-        osc = self.osc.state(); transport = osc.get("transport") or {}
+        # Do not probe a WebSocket endpoint with a raw TCP connect.  That
+        # opens a socket and closes it without sending an HTTP Upgrade request,
+        # which OpenPI correctly logs as an invalid handshake (EOF while
+        # reading the request line).  The real WebSocket worker is the source
+        # of truth for policy connectivity.
+        local_forward_listening = self._local_forward_listening(port)
+        policy_connected = self.state.get("model_state") == "CONNECTED"
+        # Do not synchronously query OSC while serving pi05 state. A stalled
+        # control backend must not block inference telemetry or Action Chunks.
+        transport = (self._osc_snapshot.get("transport") or {}) if self._osc_snapshot else {}
+        osc_error = self.state.get("osc_error")
         self._connections = {
-            "control": {"state": "ok" if transport.get("connected") else "warn", "label": "NERO 控制服务", "endpoint": "127.0.0.1:8765", "message": "OSC 状态可读"},
-            "ssh_forward": {"state": "ok" if port_ok else "bad", "label": "SSH 本地转发", "endpoint": f"{host}:{port}", "message": "端口已连通" if port_ok else "未连接"},
-            "policy": {"state": "ok" if self.state.get("model_state") == "CONNECTED" else ("warn" if port_ok else "bad"), "label": "π0.5 WebSocket", "endpoint": "OpenPI policy server", "message": "OpenPI 已连接" if self.state.get("model_state") == "CONNECTED" else ("等待推理握手" if port_ok else "OpenPI WebSocket 不可达")},
+            "control": {"state": "bad" if osc_error else ("ok" if transport.get("connected") else "warn"), "label": "NERO control service", "endpoint": "127.0.0.1:8765", "message": str(osc_error) if osc_error else "OSC control channel available"},
+            "ssh_forward": {"state": "ok" if local_forward_listening else "bad", "label": "SSH 本地转发", "endpoint": f"127.0.0.1:{port}", "message": "本地转发端口已监听" if local_forward_listening else "本地转发端口未监听"},
+            "policy": {"state": "ok" if policy_connected else "bad", "label": "π0.5 WebSocket", "endpoint": "OpenPI policy server", "message": "OpenPI WebSocket 已连接" if policy_connected else (str(self.state.get("websocket_error")) if self.state.get("websocket_error") else "OpenPI WebSocket 未连接")},
         }
 
     def camera_devices(self) -> list[dict[str, Any]]:
@@ -318,22 +432,84 @@ class Pi05InputAdapter:
     def start(self, session_id: str, client_id: str) -> dict[str, Any]:
         with self.lock:
             if (self.camera_resource is not None and not self.camera_resource.snapshot()["ready"]) or (self.camera_resource is None and self.cameras is None): raise RuntimeError("activate the external and wrist cameras first")
-            osc = self.osc.state(); session = osc.get("session") or {}
+            try:
+                osc = self.osc.state()
+            except Exception as exc:
+                self.state["osc_error"] = f"{type(exc).__name__}: {exc}"
+                self.state["updated_at"] = time.time()
+                raise
+            self._osc_snapshot = copy.deepcopy(osc)
+            session = osc.get("session") or {}
             if session.get("state") != "ACTIVE" or session.get("id") != session_id or session.get("client_id") != client_id:
                 raise PermissionError("π0.5 requires the caller's active OSC session")
-            self.state.update({"state": "RUNNING", "execution_enabled": True, "session_id": session_id, "client_id": client_id,
+            self._last_gripper_target = None
+            needs_priming = session.get("execution_mode") == "hardware"
+            self.state.update({"state": "PRIMING" if needs_priming else "RUNNING",
+                               "execution_enabled": not needs_priming, "priming": needs_priming,
+                               "session_id": session_id, "client_id": client_id,
                                "execution_mode": session.get("execution_mode"), "last_error": None, "updated_at": time.time()})
+            self.state["osc_error"] = None
             self._ensure_worker()
+            self._connection_wakeup.set()
+            if needs_priming:
+                threading.Thread(target=self._prime_control_worker, args=(session_id, client_id), name="nero-pi05-osc-prime", daemon=True).start()
             return self.snapshot()
+
+    def _prime_control_worker(self, session_id: str, client_id: str) -> None:
+        """Run hardware priming independently from policy inference."""
+        try:
+            self._prime_startup_hold(session_id, client_id)
+        except Exception as exc:
+            with self.lock:
+                self.state.update({"osc_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
 
     def stop(self, reason: str = "π0.5 adapter stopped") -> dict[str, Any]:
         with self.lock:
-            self.state.update({"execution_enabled": False, "updated_at": time.time()})
+            self.state.update({"state": "RUNNING" if self.state.get("state") == "PRIMING" else self.state.get("state"),
+                               "execution_enabled": False, "priming": False, "updated_at": time.time()})
             return self.snapshot()
+
+    def _prime_startup_hold(self, session_id: str, client_id: str) -> bool:
+        """Send one zero-motion target before releasing π0.5 actions."""
+        osc = self.osc.state()
+        execution = osc.get("execution") or {}
+        command = osc.get("command") or {}
+        target = execution.get("measured_tcp_pose") or command.get("target_tcp")
+        if not isinstance(target, dict):
+            raise RuntimeError("π0.5 startup hold requires a current measured TCP pose")
+        position = target.get("position_m")
+        orientation = target.get("orientation_xyzw")
+        if not isinstance(position, list) or not isinstance(orientation, list):
+            raise RuntimeError("π0.5 startup hold received an invalid TCP pose")
+        with self.lock:
+            self.state["sequence"] += 1
+            sequence = max(self.state["sequence"], int(time.time() * 1000))
+        result = self.osc.track_tcp(session_id, client_id, sequence, {
+            "position_m": list(position), "orientation_xyzw": list(orientation),
+        })
+        if not result.get("ok"):
+            raise RuntimeError(f"π0.5 startup hold rejected: {result}")
+        hold_s = max(0.0, float(self.config["execution"].get("startup_hold_s", 0.3)))
+        if self.stop_event.wait(hold_s):
+            return False
+        with self.lock:
+            if not self.state.get("priming"):
+                return False
+            self.state.update({"state": "RUNNING", "execution_enabled": True,
+                               "priming": False, "updated_at": time.time()})
+        return True
+
+    @staticmethod
+    def _feedback_pose(osc: dict[str, Any]) -> dict[str, Any] | None:
+        """Pose represented by the state frame captured for one inference."""
+        pose = (osc.get("execution") or {}).get("measured_tcp_pose")
+        if not isinstance(pose, dict):
+            pose = (osc.get("command") or {}).get("target_tcp")
+        return copy.deepcopy(pose) if isinstance(pose, dict) else None
 
     def _observation(self, osc: dict[str, Any], external: Any, wrist: Any) -> dict[str, Any]:
         import numpy as np
-        pose = (osc.get("execution") or {}).get("measured_tcp_pose") or (osc.get("command") or {}).get("target_tcp")
+        pose = self._feedback_pose(osc)
         # Before an OSC session is opened there may be no published target
         # pose yet. Inference is still useful in preview mode; execution will
         # only be enabled after a session has supplied a real measured pose.
@@ -365,44 +541,123 @@ class Pi05InputAdapter:
         norm = math.sqrt(sum(value * value for value in orientation)); orientation = [value / norm for value in orientation]
         return {"position_m": position, "orientation_xyzw": orientation}, values[6]
 
+    def _send_gripper_if_needed(self, session_id: str, client_id: str, action_value: float) -> None:
+        """Send a gripper edge only when feedback says a transition is needed."""
+        threshold = float(self.config["gripper"]["switch_threshold"])
+        if abs(float(action_value)) < threshold:
+            return
+        desired = "open" if float(action_value) <= -threshold else "closed"
+        with self.lock:
+            current = (self._osc_snapshot.get("gripper") or {}).copy()
+        width = current.get("width_m")
+        openness = None
+        if isinstance(width, (int, float)):
+            openness = max(0.0, min(1.0, float(width) / 0.095))
+        # Match the reference adapter's 80%/20% hysteresis. Once a target has
+        # been sent, suppress duplicate SDK transactions until the opposite
+        # gripper edge is requested.
+        if desired == "open" and openness is not None and openness >= 0.8:
+            self._last_gripper_target = desired
+            return
+        if desired == "closed" and openness is not None and openness <= 0.2:
+            self._last_gripper_target = desired
+            return
+        if self._last_gripper_target == desired:
+            return
+        with self.lock:
+            self.state["sequence"] += 1
+            sequence = max(self.state["sequence"], int(time.time() * 1000))
+        result = self.osc.gripper(session_id, client_id, sequence, {
+            "mode": "open" if desired == "open" else "position",
+            "width_m": self.config["gripper"]["open_width_m"] if desired == "open" else self.config["gripper"]["closed_width_m"],
+            "force_n": self.config["gripper"]["force_n"],
+        })
+        if not result.get("ok"):
+            raise RuntimeError(f"π0.5 gripper command rejected: {result}")
+        self._last_gripper_target = desired
+
     def _run(self) -> None:
         policy = None
         try:
-            policy = self._policy_client()
             while not self.stop_event.is_set():
-                started = time.monotonic(); osc = self.osc.state(); session = osc.get("session") or {}
-                with self.lock: session_id, client_id = self.state["session_id"], self.state["client_id"]
-                with self.lock: execution_enabled = bool(self.state.get("execution_enabled"))
+                if policy is None:
+                    try:
+                        policy = self._policy_client()
+                    except Exception as exc:
+                        # Keep the worker alive while the independent
+                        # connection loop retries.  A transient WebSocket
+                        # outage must not permanently stop Action Chunk
+                        # publication.
+                        with self.lock:
+                            self.state.update({"state": "RUNNING", "websocket_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
+                        self.stop_event.wait(.1)
+                        continue
+                started = time.monotonic()
+                with self.lock:
+                    osc = copy.deepcopy(self._osc_snapshot)
+                    session = dict(osc.get("session") or {})
+                    session_id, client_id = self.state["session_id"], self.state["client_id"]
+                    execution_enabled = bool(self.state.get("execution_enabled"))
                 active_session = session.get("state") == "ACTIVE" and session.get("id") == session_id and session.get("client_id") == client_id
-                if active_session: self.osc.heartbeat(str(client_id), str(session_id))
+                if active_session:
+                    try:
+                        self.osc.heartbeat(str(client_id), str(session_id))
+                    except Exception as exc:
+                        with self.lock: self.state.update({"osc_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
                 external, wrist = self.camera_resource.read() if self.camera_resource else (self.cameras.read() if self.cameras else (_ for _ in ()).throw(RuntimeError("cameras are unavailable")))
-                response = policy.infer(self._observation(osc, external, wrist)); actions = response.get("actions") if isinstance(response, dict) else None
+                try:
+                    response = policy.infer(self._observation(osc, external, wrist))
+                except Exception as exc:
+                    self._invalidate_policy(policy, f"OpenPI WebSocket inference failed: {type(exc).__name__}: {exc}")
+                    policy = None
+                    self.stop_event.wait(.05)
+                    continue
+                actions = response.get("actions") if isinstance(response, dict) else None
                 if actions is None: raise RuntimeError("OpenPI response does not contain actions")
                 rows = actions.tolist() if hasattr(actions, "tolist") else actions
                 if not isinstance(rows, list) or not rows: raise RuntimeError("OpenPI Action Chunk is empty")
+                expected_steps = int(self.config["execution"].get("expected_chunk_steps", 10))
+                if len(rows) != expected_steps:
+                    raise RuntimeError(f"OpenPI Action Chunk must contain exactly {expected_steps} steps, got {len(rows)}")
                 limit = min(len(rows), int(self.config["execution"]["replan_steps"]), int(self.config["execution"]["max_chunk_steps"]))
+                base = self._feedback_pose(osc)
+                absolute_chunk = [self._target_from_action(action, base)[0] for action in rows] if base is not None else None
                 with self.lock:
-                    self.state.update({"action_chunk": rows, "action_chunk_length": len(rows), "chunk_sequence": int(self.state.get("chunk_sequence", 0)) + 1, "inference_ms": (time.monotonic()-started)*1000., "updated_at": time.time()})
-                base = (osc.get("command") or {}).get("target_tcp") or (osc.get("execution") or {}).get("measured_tcp_pose")
+                    self.state.update({"action_chunk": rows, "absolute_tcp_chunk": absolute_chunk,
+                                       "inference_base_tcp": copy.deepcopy(base), "action_chunk_length": len(rows),
+                                       "chunk_sequence": int(self.state.get("chunk_sequence", 0)) + 1,
+                                       "inference_ms": (time.monotonic()-started)*1000., "updated_at": time.time()})
+                with self.lock:
+                    priming = bool(self.state.get("priming"))
+                if priming and active_session and session.get("execution_mode") == "hardware":
+                    # Priming is a control concern. Keep inference and Action
+                    # Chunk publication alive while the separate control path
+                    # is unavailable or waiting for a hardware handoff.
+                    self.stop_event.wait(float(self.config["execution"]["period_s"]))
+                    continue
                 if not execution_enabled or not active_session:
+                    self.stop_event.wait(float(self.config["execution"]["period_s"]))
+                    continue
+                if base is None or absolute_chunk is None:
+                    with self.lock:
+                        self.state.update({"osc_error": "OSC measured TCP feedback is unavailable for this Action Chunk", "updated_at": time.time()})
                     self.stop_event.wait(float(self.config["execution"]["period_s"]))
                     continue
                 period_s = float(self.config["execution"]["period_s"])
                 next_step_at = started + period_s
-                for index, action in enumerate(rows[:limit]):
+                for index, (action, target) in enumerate(zip(rows[:limit], absolute_chunk[:limit])):
                     if self.stop_event.is_set(): break
-                    target, gripper = self._target_from_action(action, base)
+                    gripper = _finite(action, 7, "π0.5 action")[6]
                     with self.lock: self.state["sequence"] += 1; sequence = max(self.state["sequence"], int(time.time()*1000))
-                    result = self.osc.track_tcp(session_id, client_id, sequence, target)
-                    if not result.get("ok"): raise RuntimeError(f"OSC rejected π0.5 target: {result}")
-                    base = target
-                    if abs(gripper) >= float(self.config["gripper"]["switch_threshold"]):
-                        # LIBERO/Panda uses -1=open and +1=closed.  The NERO
-                        # width convention is the inverse, exactly as in the
-                        # migrated π0.5 bridge.
-                        opening = gripper <= -float(self.config["gripper"]["switch_threshold"])
-                        self.state["sequence"] += 1
-                        self.osc.gripper(session_id, client_id, max(self.state["sequence"], int(time.time()*1000)+1), {"mode": "open" if opening else "position", "width_m": self.config["gripper"]["open_width_m"] if opening else self.config["gripper"]["closed_width_m"], "force_n": self.config["gripper"]["force_n"]})
+                    try:
+                        result = self.osc.track_tcp(session_id, client_id, sequence, target)
+                        if not result.get("ok"): raise RuntimeError(f"OSC target rejected: {result}")
+                    except Exception as exc:
+                        with self.lock: self.state.update({"osc_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
+                    try:
+                        self._send_gripper_if_needed(session_id, client_id, gripper)
+                    except Exception as exc:
+                        with self.lock: self.state.update({"osc_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
                     with self.lock: self.state["executed_steps"] += 1; self.state["updated_at"] = time.time()
                     # period_s is the complete observation-to-command cadence;
                     # policy inference time must not be added on top of it.
@@ -425,9 +680,19 @@ class Pi05InputAdapter:
     def close(self) -> None:
         self.stop("service closing")
         self._connection_stop.set()
+        self._osc_state_stop.set()
+        if self._connection_thread is not threading.current_thread():
+            self._connection_thread.join(timeout=1.0)
+        if self._osc_state_thread is not threading.current_thread():
+            self._osc_state_thread.join(timeout=1.0)
+        with self.lock:
+            worker = self.worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=2.0)
         with self.lock:
             policy = self._policy
             self._policy = None
+            self.state.update({"model_state": "DISCONNECTED", "websocket_error": "service closing", "updated_at": time.time()})
         if policy:
             try: policy.close()
             except Exception: pass

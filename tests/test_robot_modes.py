@@ -388,7 +388,7 @@ class RobotModeTests(unittest.TestCase):
     def test_osc_feedback_uses_only_joint_and_motor_cache(self) -> None:
         robot, sdk = self.make_robot()
         robot._control_mode = "HOLD"
-        feedback = robot.read_osc_feedback()
+        feedback = robot.read_cached_osc_feedback()
         self.assertEqual(feedback["joint_angles_rad"], sdk.follower_values)
         self.assertEqual(feedback["joint_velocity_rad_s"], sdk.motor_velocity)
         self.assertIsInstance(feedback["received_at_monotonic_ns"], int)
