@@ -1,4 +1,4 @@
-.venv/
+.venv*/
 .conda/
 runtime/
 .mamba/

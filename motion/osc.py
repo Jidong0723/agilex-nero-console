@@ -1175,6 +1175,10 @@ class _OperationalSpaceServo:
                 self.posture_reference = [float(x) for x in joints]
                 self.shadow_joints = list(self.posture_reference)
                 shadow_config = dict(self.config.get("shadow_transport") or {})
+                # Shadow feedback follows the same controller limits as OSC;
+                # it must not introduce a second configurable limit.
+                shadow_config["max_joint_speed_rad_s"] = float(self.limits.get("joint_speed_rad_s", 1.5))
+                shadow_config["max_joint_acceleration_rad_s2"] = float(self.config.get("solver", {}).get("ruckig_max_acceleration", 5.0))
                 self.shadow_plant = (
                     ShadowCpvPlant(shadow_config, self.posture_reference)
                     if execution_mode == "shadow" and bool(shadow_config.get("enabled", True)) else None
@@ -2086,8 +2090,6 @@ class OscRuntime:
             "shadow_transport": {
                 "feedback_delay_s": shadow["feedback_delay_s"],
                 "feedback_jitter_s": shadow["feedback_jitter_s"],
-                "max_joint_speed_rad_s": shadow.get("max_joint_speed_rad_s"),
-                "max_joint_acceleration_rad_s2": shadow.get("max_joint_acceleration_rad_s2"),
             },
             "state_estimator": {"max_prediction_s": estimator["max_prediction_s"]},
         }

@@ -21,6 +21,13 @@
     }
   }
   ensureSelectionControls();
+  $("reanchor")?.remove();
+  document.querySelector(".keyboard-map small")?.replaceChildren("连接时会以机械臂当前位置作为起点，摇杆输入直接显示为绝对 TCP 目标。");
+  const sensitivity = $("scale");
+  if (sensitivity) {
+    sensitivity.value = "0.2";
+    $("scale-value")?.replaceChildren("20%");
+  }
   document.querySelector(".diagnostics-panel h2")?.replaceChildren("运动诊断");
   const gripperLabel = document.querySelector(".gripper-card .section-label");
   if (gripperLabel) gripperLabel.textContent = "DISCRETE ACTION";
@@ -79,7 +86,7 @@
     panel.querySelector(".pi05-cameras")?.insertAdjacentHTML("afterend", `<div class="camera-power"><span id="camera-power-pi05">相机状态：检查中</span><button id="camera-open-pi05" class="button" type="button">打开相机</button><button id="camera-close-pi05" class="button quiet" type="button">关闭相机</button></div>`);
     panel.insertAdjacentHTML("afterbegin", `<section class="pi05-connection"><div class="pi05-connection-title"><span>02 · 连接状态</span><small id="pi05-connection-message">正在检测 SSH 与 OpenPI 连接</small></div><div class="pi05-connection-nodes"><article id="pi05-connection-ssh"></article><i>→</i><article id="pi05-connection-policy"></article></div><details class="pi05-help"><summary>连接帮助 <small>启动顺序与可复制命令</small></summary><div></div></details></section>`);
     const help = panel.querySelector(".pi05-help");
-    help.innerHTML = `<summary><span>连接帮助</span><small>启动顺序与可复制命令</small></summary><div class="help-content"><article class="help-step"><div class="help-title"><b>1</b><strong>启动 NERO 控制服务</strong></div><p>确认 NERO 已通电、CANDO USB-CAN 已连接，且没有其他程序占用设备。</p><div class="command"><code>..\\neroAgilex-control-console\\run_console.cmd</code><button type="button" data-copy="..\\neroAgilex-control-console\\run_console.cmd">复制</button></div><p>打开 <a href="http://127.0.0.1:8765/" target="_blank" rel="noopener">127.0.0.1:8765</a>，确认持续显示最新 7 轴反馈。若显示 HTTP 502，通常是未通电、USB-CAN/驱动未连接、设备被占用或控制服务环境异常；先恢复有效反馈，第一个绿灯才会亮起。</p></article><article class="help-step"><div class="help-title"><b>2</b><strong>建立 SSH 本地转发</strong></div><p>在新的 PowerShell 窗口执行。输入 AutoDL 密码后保留该窗口；连接完成后仍可直接在远程终端输入命令。</p><div class="command"><code>ssh -t \`\n  -o LogLevel=QUIET \`\n  -o ServerAliveInterval=15 \`\n  -o ServerAliveCountMax=3 \`\n  -L 8000:127.0.0.1:8000 \`\n  -p 38341 \`\n  root@connect.bjb1.seetacloud.com</code><button type="button" data-copy="ssh -t \`\n  -o LogLevel=QUIET \`\n  -o ServerAliveInterval=15 \`\n  -o ServerAliveCountMax=3 \`\n  -L 8000:127.0.0.1:8000 \`\n  -p 38341 \`\n  root@connect.bjb1.seetacloud.com">复制</button></div><p>实例地址、端口或密码变更时，请使用 AutoDL 当前提供的信息。本机验证：<code>Test-NetConnection 127.0.0.1 -Port 8000</code>；看到 <code>TcpTestSucceeded : True</code> 即隧道已建立。</p></article><article class="help-step"><div class="help-title"><b>3</b><strong>启动 AutoDL π0.5 policy server</strong></div><p>在第 2 步登录后的 AutoDL 终端执行，并保持终端运行：</p><div class="command"><code>cd /root/autodl-tmp/libero_openpi_loop/openpi\nexport PATH=&quot;$HOME/.local/bin:$PATH&quot;\nexport BOTO_CONFIG=&quot;$HOME/.boto&quot;\nuv run --frozen --no-sync scripts/serve_policy.py --env LIBERO</code><button type="button" data-copy="cd /root/autodl-tmp/libero_openpi_loop/openpi\nexport PATH=&quot;$HOME/.local/bin:$PATH&quot;\nexport BOTO_CONFIG=&quot;$HOME/.boto&quot;\nuv run --frozen --no-sync scripts/serve_policy.py --env LIBERO">复制</button></div><p>SSH 仅转发端口，不会自动启动 policy server。</p></article><div class="help-ready"><strong>4. 刷新面板</strong><span>保持控制服务、SSH 隧道和 policy server 都在运行，刷新 <a href="http://127.0.0.1:8765/" target="_blank" rel="noopener">127.0.0.1:8765</a>。正常顺序：NERO 控制服务 → SSH 本地转发 → π0.5 WebSocket，三个状态均为绿色。</span></div></div>`;
+    help.innerHTML = `<summary><span>连接帮助</span><small>启动顺序与可复制命令</small></summary><div class="help-content"><article class="help-step"><div class="help-title"><b>1</b><strong>启动 NERO 控制服务</strong></div><p>确认 NERO 已通电、CANDO USB-CAN 已连接，且没有其他程序占用设备。</p><div class="command"><code>..\\neroAgilex-control-console\\run_console.cmd</code><button type="button" data-copy="..\\neroAgilex-control-console\\run_console.cmd">复制</button></div><p>打开 <a href="http://127.0.0.1:8765/" target="_blank" rel="noopener">127.0.0.1:8765</a>，确认持续显示最新 7 轴反馈。若显示 HTTP 502，通常是未通电、USB-CAN/驱动未连接、设备被占用或控制服务环境异常；先恢复有效反馈，第一个绿灯才会亮起。</p></article><article class="help-step"><div class="help-title"><b>2</b><strong>建立 SSH 本地转发</strong></div><p>在新的 PowerShell 窗口执行，将下方占位符替换为云平台提供的 SSH 信息：</p><div class="command"><code>ssh -t \`\n  -o LogLevel=QUIET \`\n  -o ServerAliveInterval=15 \`\n  -o ServerAliveCountMax=3 \`\n  -L 8000:127.0.0.1:8000 \`\n  -p &lt;ssh-port&gt; \`\n  &lt;user&gt;@&lt;remote-host&gt;</code></div><p>实例地址、端口或密码请使用你当前云平台提供的信息。本机验证：<code>Test-NetConnection 127.0.0.1 -Port 8000</code>；看到 <code>TcpTestSucceeded : True</code> 即隧道已建立。</p></article><article class="help-step"><div class="help-title"><b>3</b><strong>启动 π0.5 policy server</strong></div><p>在远程终端进入你的 policy server 目录并保持终端运行：</p><div class="command"><code>cd &lt;policy-server-directory&gt;\nexport PATH=&quot;$HOME/.local/bin:$PATH&quot;\nexport BOTO_CONFIG=&quot;$HOME/.boto&quot;\nuv run --frozen --no-sync scripts/serve_policy.py --env LIBERO</code></div><p>SSH 仅转发端口，不会自动启动 policy server。</p></article><div class="help-ready"><strong>4. 刷新面板</strong><span>保持控制服务、SSH 隧道和 policy server 都在运行，刷新 <a href="http://127.0.0.1:8765/" target="_blank" rel="noopener">127.0.0.1:8765</a>。正常顺序：NERO 控制服务 → SSH 本地转发 → π0.5 WebSocket，三个状态均为绿色。</span></div></div>`;
     // The control service is already running when this card is shown. Keep
     // this help focused on the two remote-connection steps only.
     help.querySelector(".help-step")?.remove();
@@ -89,7 +96,7 @@
       if (number) number.textContent = String(index + 1);
     });
     const policyStep = help.querySelectorAll(".help-step")[1];
-    policyStep?.querySelector("p")?.replaceChildren("在第 1 步登录后的 AutoDL 终端执行，并保持终端运行：");
+    policyStep?.querySelector("p")?.replaceChildren("在第 1 步登录后的远程终端执行，并保持终端运行：");
     help.querySelectorAll("[data-copy]").forEach((button) => button.addEventListener("click", async () => { await navigator.clipboard.writeText(button.dataset.copy || ""); const original = button.textContent; button.textContent = "已复制"; setTimeout(() => { button.textContent = original; }, 1200); }));
     panel.querySelector(".pi05-inference")?.insertAdjacentHTML("beforeend", `<div class="pi05-chunk"><span>Action Chunk（首步）</span><code id="pi05-action-first">等待推理结果</code></div>`);
     const actionControls = panel.querySelector(".pi05-actions");
@@ -454,12 +461,11 @@
     if (!state.webAdapterActive) return;
     const axes = velocity(); const scale = Number($("scale")?.value || 1);
     const p = state.relativePose.position_m;
-    for (let i=0; i<3; i+=1) p[i] += axes[i] * 0.06 * dt;
-    const increment = quatFromEuler(axes[3]*0.45*dt, axes[4]*0.45*dt, axes[5]*0.45*dt);
+    for (let i=0; i<3; i+=1) p[i] += axes[i] * 0.30 * scale * dt;
+    const increment = quatFromEuler(axes[3]*2.25*scale*dt, axes[4]*2.25*scale*dt, axes[5]*2.25*scale*dt);
     state.relativePose.orientation_xyzw = quatMultiply(state.relativePose.orientation_xyzw, increment);
     const norm=Math.hypot(...state.relativePose.orientation_xyzw);
     state.relativePose.orientation_xyzw = state.relativePose.orientation_xyzw.map((value)=>value/norm);
-    void scale;
   }
 
   function resetInput(sendZero = false) {
@@ -478,9 +484,12 @@
   function updateInputView() {
     const names = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"];
     const intentLabel = document.querySelector(".intent-readout > span");
-    if (intentLabel) intentLabel.textContent = "WebAdapter 相对输入 ΔPose";
+    if (intentLabel) intentLabel.textContent = "当前绝对 TCP 目标";
     const output = $("input-readout");
-    const values = [...state.relativePose.position_m, ...eulerFromQuat(state.relativePose.orientation_xyzw)];
+    const anchor = state.oscAnchor || state.osc?.command?.target_tcp;
+    const position = anchor?.position_m?.map((value, index) => value + state.relativePose.position_m[index]) || [0, 0, 0];
+    const orientation = anchor?.orientation_xyzw ? quatMultiply(anchor.orientation_xyzw, state.relativePose.orientation_xyzw) : state.relativePose.orientation_xyzw;
+    const values = [...position, ...eulerFromQuat(orientation)];
     if (output) output.textContent = values.map((value, index) => `${names[index]} ${value.toFixed(3)}`).join(" · ");
   }
 
@@ -1173,7 +1182,6 @@
   window.addEventListener("pagehide", () => stopWebAdapterForPageExit("WebAdapter page unload"));
   $("start").onclick = connectWebAdapter;
   $("stop").onclick = disconnectWebAdapter;
-  $("reanchor")?.addEventListener("click", () => reanchorWebAdapter().catch((error) => phase(`WebAdapter 重锚定失败：${error.message}`, true)));
   $("pi05-cameras")?.addEventListener("click", activateSharedCameras);
   $("pi05-prompt")?.addEventListener("change", () => { void commitPi05Prompt(); });
   $("pi05-prompt")?.addEventListener("input", () => {

@@ -52,7 +52,7 @@
   "pico_gateway": {
     "enabled": true,
     "host": "0.0.0.0",
-    "advertise_host": "192.168.3.7",
+    "advertise_host": "",
     "port": 8768,
     "pair_ttl_s": 120.0,
     "message_timeout_s": 2.0,
@@ -62,7 +62,7 @@
     "max_message_bytes": 4096
   },
   "pico_http": {
-    "lan_host": "192.168.3.7"
+    "lan_host": ""
   },
   "pico_adapter": {
     "mapping_verified": true,

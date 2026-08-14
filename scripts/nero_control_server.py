@@ -41,6 +41,19 @@ if TYPE_CHECKING:
 
 WEB_ROOT = PROJECT_ROOT / "web" / "console"
 CONTROL_PYTHON = control_python(PROJECT_ROOT)
+
+
+def _local_ipv4_address() -> str:
+    """Return the IPv4 address selected by the local routing table."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("192.0.2.1", 9))
+            address = str(probe.getsockname()[0])
+            if address and not address.startswith("127."):
+                return address
+    except OSError:
+        pass
+    return ""
 _RESET_LOCK = threading.Lock()
 _RESET_PENDING = False
 
@@ -1029,14 +1042,28 @@ def main() -> int:
         runtime_config = {}
         print(f"PICO gateway configuration unavailable: {exc}", flush=True)
     lan_host = str(args.lan_host or (runtime_config.get("pico_http") or {}).get("lan_host", "")).strip()
+    if not lan_host:
+        lan_host = _local_ipv4_address()
     listen_hosts = [args.host]
     if lan_host and lan_host not in listen_hosts:
         listen_hosts.append(lan_host)
     if any(host not in {"127.0.0.1", "localhost", lan_host} for host in listen_hosts):
         raise SystemExit("Unsupported HTTP host for PICO pairing")
+    servers = []
+    bound_hosts = []
     try:
-        servers = [ExclusiveThreadingHTTPServer((host, args.port), ControlRequestHandler) for host in listen_hosts]
+        for host in listen_hosts:
+            try:
+                servers.append(ExclusiveThreadingHTTPServer((host, args.port), ControlRequestHandler))
+                bound_hosts.append(host)
+            except OSError as exc:
+                if host in {"127.0.0.1", "localhost"}:
+                    raise
+                print(f"NERO optional LAN host {host} unavailable; using localhost only: {exc}", flush=True)
+        listen_hosts = bound_hosts
     except (OSError, RuntimeError) as exc:
+        for server in servers:
+            server.server_close()
         instance_lock.release()
         if control_page_is_healthy(url):
             print("NERO control service is already running; opening the active control page.")

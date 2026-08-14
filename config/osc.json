@@ -8,7 +8,7 @@
     "dt_s": 0.02,
     "direct_pink_cpv_position": true,
     "ruckig_target_horizon_s": 0.1,
-    "ruckig_max_acceleration": 5.0,
+    "ruckig_max_acceleration": 20.0,
     "ruckig_max_jerk": 20.0,
     "posture_cost": 0.0001,
     "damping_cost": 0.03,
@@ -43,9 +43,7 @@
     "dispatch_jitter_s": 0.002,
     "feedback_delay_s": 0.010628799999999999,
     "feedback_jitter_s": 2.8e-05,
-    "position_time_constant_s": 0.06,
-    "max_joint_speed_rad_s": 1.5,
-    "max_joint_acceleration_rad_s2": 5.0
+    "position_time_constant_s": 0.06
   },
   "shadow_initial_joints_rad": [
     -0.02,
@@ -58,7 +56,7 @@
   ],
   "limits": {
     "angular_speed_rad_s": 0.45,
-    "joint_speed_rad_s": 1.5,
+    "joint_speed_rad_s": 5.0,
     "velocity_error_warning_rad_s": 0.1,
     "velocity_error_brake_rad_s": 0.25,
     "velocity_error_fault_rad_s": 0.45,
