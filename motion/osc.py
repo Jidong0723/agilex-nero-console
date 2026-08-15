@@ -1466,32 +1466,21 @@ class _OperationalSpaceServo:
                 "feedback_age_s": feedback_age,
             }
             return list(measured_q), list(measured_qd), feedback_age
-        if self._control_q_estimate is None:
-            self._control_q_estimate = list(measured_q)
-        predicted = [
+        # First-order feedback prediction shared by hardware and shadow:
+        # q_Pink = q_feedback + qd_estimated * Delta t.
+        self._control_q_estimate = [
             float(position) + float(velocity) * actual_dt
-            for position, velocity in zip(self._control_q_estimate, self.last_sent_velocity)
+            for position, velocity in zip(measured_q, measured_qd)
         ]
-        horizon = min(feedback_age, float(self.config.get("state_estimator", {}).get("max_prediction_s", 0.15)))
-        compensated = [position + velocity * horizon for position, velocity in zip(measured_q, measured_qd)]
-        tau = max(0.02, float(self.config.get("state_estimator", {}).get("correction_time_constant_s", 0.20)))
-        alpha = 1.0 - math.exp(-actual_dt / tau)
-        max_rate = max(0.01, float(self.config.get("state_estimator", {}).get("max_correction_rad_s", 0.50)))
-        max_step = max_rate * actual_dt
-        correction = [max(-max_step, min(max_step, alpha * (measurement - estimate))) for measurement, estimate in zip(compensated, predicted)]
-        self._control_q_estimate = [estimate + delta for estimate, delta in zip(predicted, correction)]
-        self._control_qd_estimate = [float(value) + delta / max(0.001, actual_dt) for value, delta in zip(self.last_sent_velocity, correction)]
+        self._control_qd_estimate = list(measured_qd)
         self._estimator_snapshot = {
             "enabled": True,
-            "mode": "predictor_corrector",
+            "mode": "first_order_feedback_prediction",
             "measured_joint_state_rad": list(measured_q),
             "measured_joint_velocity_rad_s": list(measured_qd),
             "estimated_joint_state_rad": list(self._control_q_estimate),
             "estimated_joint_velocity_rad_s": list(self._control_qd_estimate),
-            "measurement_error_rad": [measurement - estimate for measurement, estimate in zip(compensated, predicted)],
-            "correction_rad": list(correction),
-            "correction_time_constant_s": tau,
-            "max_correction_rad_s": max_rate,
+            "prediction_dt_s": actual_dt,
             "feedback_age_s": feedback_age,
         }
         return list(self._control_q_estimate), list(self._control_qd_estimate), feedback_age
@@ -1634,9 +1623,23 @@ class _OperationalSpaceServo:
                 if not session or session.get("state") != "ACTIVE": continue
                 shadow = session.get("execution_mode") == "shadow"
                 feedback = None if shadow else self._feedback_snapshot()
+                shadow_feedback_q: list[float] | None = None
                 if shadow:
                     if self.shadow_plant is not None:
                         q, qd, feedback_age = self.shadow_plant.advance(actual_dt, time.monotonic())
+                        shadow_feedback_q = list(q)
+                        if bool(self.config.get("state_estimator", {}).get("enabled", True)) and len(q) == 7 and len(qd) == 7:
+                            q = [position + velocity * actual_dt for position, velocity in zip(q, qd)]
+                            self._estimator_snapshot = {
+                                "enabled": True,
+                                "mode": "first_order_feedback_prediction",
+                                "measured_joint_state_rad": shadow_feedback_q,
+                                "measured_joint_velocity_rad_s": list(qd),
+                                "estimated_joint_state_rad": list(q),
+                                "estimated_joint_velocity_rad_s": list(qd),
+                                "prediction_dt_s": actual_dt,
+                                "feedback_age_s": feedback_age,
+                            }
                     else:
                         q = list(self.shadow_joints or (self.trajectory or {}).get("position_rad") or [])
                         qd = list((self.trajectory or {}).get("velocity_rad_s") or [0.0] * 7)

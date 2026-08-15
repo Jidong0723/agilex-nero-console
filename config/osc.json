@@ -32,10 +32,7 @@
     "arrival_timeout_s": 10.0
   },
   "state_estimator": {
-    "enabled": false,
-    "max_prediction_s": 0.031802199999999996,
-    "correction_time_constant_s": 0.2,
-    "max_correction_rad_s": 0.5
+    "enabled": true
   },
   "shadow_transport": {
     "enabled": true,

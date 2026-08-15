@@ -866,6 +866,14 @@ class OperationalSpaceController:
                     batches = list(diagnostics.get("recent_cpv_batches") or [])
                     cycle_trace = dict(diagnostics.get("cycle_trace") or {})
                     trace_tail = list(cycle_trace.get("recent_cycles") or [])
+                    last_result = dict(snapshot.get("last_result") or {})
+                    latest_batch = batches[-1] if batches else {}
+                    gate = {
+                        "triggered": bool(last_result.get("gate_limited") or latest_batch.get("final_gate_limited")),
+                        "limited": bool(last_result.get("gate_limited")),
+                        "reason": last_result.get("gate_reason"),
+                        "final_gate_limited": bool(latest_batch.get("final_gate_limited")),
+                    }
                     self._log(
                         "osc_realtime_diagnostic",
                         monotonic_ns=time.monotonic_ns(),
@@ -880,7 +888,8 @@ class OperationalSpaceController:
                         trajectory_state=diagnostics.get("trajectory_state"),
                         trajectory_brake_reason=diagnostics.get("trajectory_brake_reason"),
                         timing=timing,
-                        last_result=dict(snapshot.get("last_result") or {}),
+                        last_result=last_result,
+                        gate=gate,
                         last_output=last_output,
                         execution={
                             "sample_id": execution.get("sample_id"),
