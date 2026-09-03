@@ -8,10 +8,13 @@ from __future__ import annotations
 import copy
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any, Protocol
 
 from supervisor.camera_resource import SharedCameraResource
+from supervisor.dataset_recorder import DatasetRecorder
+from supervisor.logging import AsyncJsonlTraceLogger
 from supervisor.pi05_adapter import Pi05InputAdapter
 from supervisor.pico_adapter import PicoInputAdapter
 
@@ -20,9 +23,11 @@ class OscClientPort(Protocol):
     """The complete robot-facing surface available to input adapters."""
 
     def state(self) -> dict[str, Any]: ...
+    def start_session(self, client_id: str, execution_mode: str) -> dict[str, Any]: ...
     def heartbeat(self, client_id: str, session_id: str) -> dict[str, Any]: ...
     def track_tcp(self, session_id: str, client_id: str, sequence: int, target_pose: dict[str, Any]) -> dict[str, Any]: ...
     def hold(self, session_id: str, client_id: str, sequence: int, reason: str) -> dict[str, Any]: ...
+    def osc_input_hold(self, reason: str) -> dict[str, Any]: ...
     def gripper(self, session_id: str, client_id: str, sequence: int, payload: dict[str, Any]) -> dict[str, Any]: ...
 
 
@@ -34,6 +39,9 @@ class OscClient:
 
     def state(self) -> dict[str, Any]:
         return self._broker.osc_state()
+
+    def start_session(self, client_id: str, execution_mode: str) -> dict[str, Any]:
+        return self._broker.osc_start(client_id, execution_mode)
 
     def heartbeat(self, client_id: str, session_id: str) -> dict[str, Any]:
         return self._broker.osc_heartbeat(client_id, session_id)
@@ -54,6 +62,9 @@ class OscClient:
     def hold(self, session_id: str, client_id: str, sequence: int, reason: str) -> dict[str, Any]:
         return self._command(session_id, client_id, sequence, "hold", {"reason": reason})
 
+    def osc_input_hold(self, reason: str) -> dict[str, Any]:
+        return self._broker.osc_input_hold(reason)
+
     def gripper(self, session_id: str, client_id: str, sequence: int, payload: dict[str, Any]) -> dict[str, Any]:
         return self._command(session_id, client_id, sequence, "gripper", payload)
 
@@ -63,17 +74,27 @@ class AdapterRuntime:
 
     def __init__(self, broker: Any, project_root: Path, runtime_config: dict[str, Any]) -> None:
         self._lock = threading.RLock()
+        self._runtime_config_path = project_root / "config" / "runtime.json"
+        self._runtime_config = runtime_config
         self.osc: OscClientPort = OscClient(broker)
         pi05_path = project_root / "config" / "pi05.json"
         pi05_config = json.loads(pi05_path.read_text(encoding="utf-8"))
         self.cameras = SharedCameraResource(pi05_config["cameras"])
         self.pi05 = Pi05InputAdapter(self.osc, pi05_path, self.cameras)
-        self.pico = PicoInputAdapter(self.osc, dict(runtime_config.get("pico_adapter") or {}))
+        trace_dir = project_root / "runtime" / "logs" / "pico"
+        self.pico_trace_logger = AsyncJsonlTraceLogger(
+            trace_dir / f"pico-adapter-{time.strftime('%Y%m%dT%H%M%S')}.jsonl",
+            {"component": "pico_adapter"},
+        )
+        self.pico = PicoInputAdapter(self.osc, dict(runtime_config.get("pico_adapter") or {}), self.pico_trace_logger)
+        self.dataset = DatasetRecorder(self.osc, self.cameras, self.pico, project_root.parent / "dataset")
 
     def close(self) -> None:
         with self._lock:
             self.pi05.close()
+            self.dataset.close()
             self.pico.disconnected("adapter runtime shutdown")
+            self.pico_trace_logger.close()
             self.cameras.close()
 
     def health(self) -> dict[str, Any]:
@@ -81,7 +102,10 @@ class AdapterRuntime:
             pi05 = self.pi05.snapshot()
         except Exception as exc:
             pi05 = {"state": "UNKNOWN", "error": f"{type(exc).__name__}: {exc}"}
-        return {"adapters": {"pi05": pi05, "pico": self.pico.snapshot(), "cameras": self.cameras.snapshot()}}
+        return {
+            "adapters": {"pi05": pi05, "pico": self.pico.snapshot(), "cameras": self.cameras.snapshot()},
+            "pico_trace_logging": {"enabled": True, "path": str(self.pico_trace_logger.path.resolve()), "schema": "pico-trace.v1"},
+        }
 
     def pi05_state(self) -> dict[str, Any]: return self.pi05.snapshot()
     def pi05_update_config(self, body: dict[str, Any]) -> dict[str, Any]: return self.pi05.update_config(body)
@@ -99,20 +123,37 @@ class AdapterRuntime:
         return self.cameras.deactivate()
     def camera_devices(self) -> list[dict[str, Any]]: return self.cameras.devices()
     def camera_frame_jpeg(self, source: str) -> bytes | None: return self.cameras.frame_jpeg(source)
+    def dataset_state(self) -> dict[str, Any]: return self.dataset.state()
+    def dataset_episodes(self) -> dict[str, Any]: return self.dataset.episodes()
+    def dataset_start(self, body: dict[str, Any]) -> dict[str, Any]: return self.dataset.start(body)
+    def dataset_stop(self, body: dict[str, Any]) -> dict[str, Any]:
+        return self.dataset.stop(str(body.get("status", "completed")), str(body.get("reason", "")))
     def pico_state(self) -> dict[str, Any]: return self.pico.snapshot()
+    def pico_reset_anchor(self, body: dict[str, Any]) -> dict[str, Any]:
+        return self.pico.reset_anchor(str(body.get("session_id", "")), str(body.get("client_id", "")))
     def pico_begin_pairing(self, session_id: str, client_id: str) -> None: self.pico.begin_pairing(session_id, client_id)
     def pico_paired(self) -> None: self.pico.paired()
     def pico_disconnected(self, reason: str) -> None: self.pico.disconnected(reason)
+    def pico_update_sensitivity(self, body: dict[str, Any]) -> dict[str, Any]:
+        return self.pico.update_sensitivity(str(body.get("session_id", "")), str(body.get("client_id", "")),
+                                            body.get("translation_gain", 1.0), body.get("rotation_gain", 1.0),
+                                            bool(body.get("hardware_high_gain_confirmed", False)))
+    def pico_update_mapping(self, body: dict[str, Any]) -> dict[str, Any]:
+        result = self.pico.update_mapping(str(body.get("session_id", "")), str(body.get("client_id", "")),
+                                          body.get("position_axis_map"), body.get("orientation_axis_map"),
+                                          bool(body.get("mapping_verified", False)))
+        if result.get("accepted"):
+            with self._lock:
+                pico_config = self._runtime_config.setdefault("pico_adapter", {})
+                pico_config["position_axis_map"] = result["position_axis_map"]
+                pico_config["orientation_axis_map"] = result["orientation_axis_map"]
+                pico_config["mapping_verified"] = bool(result.get("mapping_verified", False))
+                temporary = self._runtime_config_path.with_suffix(".json.tmp")
+                temporary.write_text(json.dumps(self._runtime_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8-sig")
+                temporary.replace(self._runtime_config_path)
+        return result
 
     def pico_message(self, kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-        if kind == "heartbeat":
-            self.pico.heartbeat(); return None
-        if kind == "tracking": return self.pico.tracking(payload)
-        if kind == "anchor_begin": return self.pico.anchor_begin(payload)
-        if kind == "pose": return self.pico.pose(payload)
-        if kind == "gripper": return self.pico.gripper(payload.get("value", 0.0))
-        if kind in {"anchor_release", "hold"}:
-            return self.pico.stop("PICO operator HOLD" if kind == "hold" else "PICO right Grip released")
-        if kind == "disconnect":
-            self.pico.disconnected("PICO client requested disconnect"); return None
-        raise ValueError("unsupported PICO adapter message")
+        if kind == "input_frame":
+            return self.pico.input_frame(payload)
+        raise ValueError("unsupported PICO message; input_frame is required")

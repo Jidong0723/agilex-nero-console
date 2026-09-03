@@ -150,6 +150,7 @@ class HardwareTxOwner:
         self._cpv_last_target: list[float] | None = None
         self._cpv_last_velocity: list[float] | None = None
         self._cpv_last_finished_ns: int | None = None
+        self._cpv_generation_barrier: dict[int, int] = {}
         self._cpv_result_changed = threading.Condition(self._cpv_lock)
         self._wake = threading.Condition()
         self._last_work_was_cpv = False
@@ -217,6 +218,32 @@ class HardwareTxOwner:
                     return {"status": "timeout", "mailbox_revision": int(mailbox_revision)}
                 self._cpv_result_changed.wait(remaining)
 
+    def revoke_cpv_before_generation(self, epoch: int, target_generation: int, reason: str) -> dict[str, Any]:
+        """Prevent pending CPV targets from an older OSC target generation."""
+        epoch = int(epoch)
+        target_generation = int(target_generation)
+        revoked_revision = None
+        with self._cpv_result_changed:
+            self._cpv_generation_barrier[epoch] = max(
+                target_generation, self._cpv_generation_barrier.get(epoch, -1)
+            )
+            pending = self._cpv_mailbox
+            if (pending is not None and int(pending.get("epoch", -1)) == epoch
+                    and int(pending.get("target_generation", -1)) < target_generation):
+                revoked_revision = int(pending["mailbox_revision"])
+                self._cpv_mailbox = None
+                self._cpv_revoked_count += 1
+                self._cpv_results[revoked_revision] = {
+                    "status": "revoked", "mailbox_revision": revoked_revision,
+                    "control_sample_id": pending.get("control_sample_id"),
+                    "revoked_monotonic_ns": time.monotonic_ns(), "reason": reason,
+                }
+            self._cpv_result_changed.notify_all()
+        with self._wake:
+            self._wake.notify()
+        return {"ok": True, "revoked": revoked_revision is not None,
+                "mailbox_revision": revoked_revision, "reason": reason}
+
     def cpv_diagnostics(self) -> dict[str, Any]:
         with self._cpv_lock:
             pending = dict(self._cpv_mailbox) if self._cpv_mailbox else None
@@ -233,6 +260,7 @@ class HardwareTxOwner:
                 "failed_count": self._cpv_failed_count,
                 "last_result": dict(self._cpv_last_result) if self._cpv_last_result else None,
                 "last_success": dict(self._cpv_last_success) if self._cpv_last_success else None,
+                "generation_barriers": dict(self._cpv_generation_barrier),
             }
 
     def _trim_cpv_results(self) -> None:
@@ -430,8 +458,10 @@ class HardwareTxOwner:
         try:
             with self._epoch_lock:
                 valid_epoch = int(entry["epoch"]) == self._epoch and self._exclusive_category is None
+                generation_barrier = self._cpv_generation_barrier.get(int(entry["epoch"]), -1)
             guard = entry.get("execute_guard")
-            if not valid_epoch or (callable(guard) and not guard()):
+            if (not valid_epoch or int(entry.get("target_generation", -1)) < generation_barrier
+                    or (callable(guard) and not guard())):
                 raise ServoWriteRevoked("CPV mailbox command revoked before SDK dispatch")
             values = [float(value) for value in entry["joint_target_rad"]]
             if not all(math.isfinite(value) for value in values):

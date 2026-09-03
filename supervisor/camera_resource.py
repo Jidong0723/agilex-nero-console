@@ -7,6 +7,10 @@ capture device themselves.
 from __future__ import annotations
 
 import copy
+import json
+import os
+import shutil
+import subprocess
 import threading
 import time
 from typing import Any
@@ -58,6 +62,52 @@ class SharedCameraResource:
             return {"ready": self.cameras is not None, "state": "READY" if self.cameras else ("ERROR" if self.last_error else "IDLE"),
                     "config": copy.deepcopy(self.config), "frame_version": self.frame_version, "last_error": self.last_error}
 
+    @staticmethod
+    def _windows_camera_devices() -> list[dict[str, Any]]:
+        """List present Windows camera devices when OpenCV is unavailable.
+
+        OpenCV is still required to open a capture stream, but this fallback
+        keeps the selector useful and makes a missing runtime dependency
+        diagnosable instead of presenting an empty device list.
+        """
+        if os.name != "nt":
+            return []
+        command = (
+            "Get-PnpDevice -PresentOnly -Class Camera | "
+            "Select-Object FriendlyName,InstanceId | ConvertTo-Json -Compress"
+        )
+        try:
+            shell = shutil.which("pwsh") or shutil.which("powershell")
+            if not shell:
+                return []
+            result = subprocess.run(
+                [shell, "-NoProfile", "-NonInteractive", "-Command", command],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=8,
+                check=False,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return []
+            rows = json.loads(result.stdout)
+            if isinstance(rows, dict):
+                rows = [rows]
+            if not isinstance(rows, list):
+                return []
+            return [
+                {
+                    "index": index,
+                    "name": str(row.get("FriendlyName") or f"Windows camera {index}"),
+                    "backend": "windows-pnp",
+                    "instance_id": str(row.get("InstanceId") or ""),
+                }
+                for index, row in enumerate(rows)
+                if isinstance(row, dict)
+            ]
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+            return []
+
     def devices(self) -> list[dict[str, Any]]:
         with self.lock:
             if self._devices is not None and time.monotonic() - self._devices_at < 2.0:
@@ -83,7 +133,12 @@ class SharedCameraResource:
                     if opened:
                         devices[index] = {"index": index, "name": f"OpenCV camera {index}", "backend": int(backend)}
             devices = [devices[index] for index in sorted(devices)]
-        except Exception as exc: raise RuntimeError(f"camera enumeration failed: {exc}") from exc
+        except ImportError:
+            devices = self._windows_camera_devices()
+            if not devices:
+                raise RuntimeError("camera enumeration requires OpenCV; no Windows camera devices were found")
+        except Exception as exc:
+            raise RuntimeError(f"camera enumeration failed: {exc}") from exc
         with self.lock:
             self._devices = devices; self._devices_at = time.monotonic()
             return copy.deepcopy(devices)

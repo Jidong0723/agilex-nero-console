@@ -31,6 +31,7 @@ class OscHardwarePort(Protocol):
     def publish_servo_position(self, command: dict[str, Any], session_id: str, epoch: int) -> dict[str, Any]: ...
     def servo_transport_diagnostics(self) -> dict[str, Any]: ...
     def wait_for_servo_result(self, mailbox_revision: int, timeout_s: float) -> dict[str, Any]: ...
+    def revoke_servo_targets(self, target_generation: int, reason: str) -> int: ...
     def latch_osc_hold(self, reason: str) -> dict[str, Any]: ...
     def trigger_safety_fault(self, reason: str) -> dict[str, Any]: ...
 
@@ -899,6 +900,11 @@ class _OperationalSpaceServo:
         self.hardware, self.root, self.config = hardware, project_root, config
         self.limits, self.runtime = config.get("limits", {}), config.get("runtime", {})
         self._validate_tuning_config()
+        # Import lazily: supervisor.control imports this module, while the
+        # trace writer itself lives in supervisor.logging.
+        from supervisor.logging import AsyncJsonlTraceLogger
+        trace_path = project_root / "runtime" / "logs" / "pico" / f"pico-osc-{time.strftime('%Y%m%d-%H%M%S')}-{id(self):x}.jsonl"
+        self.pico_trace_logger = AsyncJsonlTraceLogger(trace_path, {"component": "osc_control_loop"})
         self.solver = KinematicsClient(project_root, config)
         self.authority = JointLimitAuthority(self.solver.urdf, config)
         self.supervisor = SafetySupervisor(config.get("safety_supervisor", {}))
@@ -1186,7 +1192,6 @@ class _OperationalSpaceServo:
                 self.last_solver_result = None
                 self._solver_reuse_count = 0
                 self.control_sample_id = 0
-                self.execution_sample = None
                 self._target_changed_monotonic_ns = time.monotonic_ns()
                 self._arrival_since_monotonic_ns = 0
                 self._arrival_reached = False
@@ -1201,6 +1206,34 @@ class _OperationalSpaceServo:
                 self.command = None
                 self.target_generation += 1
                 self._target_pose = self._current_tcp_pose([float(x) for x in joints])
+                # ``joints`` is obtained from the fresh RX sample required by
+                # hardware start_session.  Publish that measured TCP pose at
+                # once, before the first Pink cycle.  Input adapters need an
+                # absolute anchor to turn their very first dead-man press into
+                # a target; leaving execution_sample empty made them wait for
+                # a later controller cycle and discard early Grip presses.
+                initial_sample_ns = time.monotonic_ns()
+                self.execution_sample = {
+                    "sample_id": 0,
+                    "target_generation": self.target_generation,
+                    "sample_monotonic_ns": initial_sample_ns,
+                    "solver_finished_monotonic_ns": initial_sample_ns,
+                    "joint_state_rad": list(joints),
+                    "joint_velocity_rad_s": [0.0] * 7,
+                    "measured_joint_state_rad": list(joints),
+                    "measured_joint_velocity_rad_s": [0.0] * 7,
+                    "estimated_joint_state_rad": list(joints),
+                    "estimated_joint_velocity_rad_s": [0.0] * 7,
+                    "estimated_tcp_pose": dict(self._target_pose),
+                    "measured_tcp_pose": dict(self._target_pose),
+                    "target_tcp": dict(self._target_pose),
+                    "position_error_m": 0.0,
+                    "orientation_error_rad": 0.0,
+                    "feedback_age_s": 0.0,
+                    "estimated_feedback_delay_s": 0.0,
+                    "solver_latency_s": 0.0,
+                    "dispatch_interval_s": period,
+                }
                 self._accepting_targets = True
                 self._heartbeat_monotonic_ns = time.monotonic_ns()
                 self.trajectory_state, self.trajectory_brake_reason, self.feedback_sync_pending = "HOLD_READY", None, True
@@ -1280,6 +1313,25 @@ class _OperationalSpaceServo:
             if not self._session_active() or execution_mode != "shadow":
                 raise RuntimeError("shadow HOLD requires an active shadow OSC session")
             self._invalidate_motion(reason)
+            self._set_result(True, reason, robot_commands_sent=False)
+            self._bump_state()
+            return {"ok": True, "accepted": True, "reason": reason,
+                    "robot_commands_sent": False, "session_id": session.get("session_id")}
+
+    def request_hardware_hold(self, reason: str = "OSC hardware input HOLD requested") -> dict[str, Any]:
+        """Brake for a PICO deadman release without ending its OSC session."""
+        with self.lock:
+            session = dict(self.session or {})
+            if not self._session_active() or session.get("execution_mode") != "hardware":
+                raise RuntimeError("hardware input HOLD requires an active hardware OSC session")
+            self.command = None
+            self.target_generation += 1
+            self._target_pose = None
+            revoke = getattr(self.hardware, "revoke_servo_targets", None)
+            if callable(revoke):
+                revoke(self.motion_epoch, self.target_generation, reason)
+            self.trajectory_state = "BRAKING"
+            self.trajectory_brake_reason = reason
             self._set_result(True, reason, robot_commands_sent=False)
             self._bump_state()
             return {"ok": True, "accepted": True, "reason": reason,
@@ -1404,6 +1456,7 @@ class _OperationalSpaceServo:
                 "target_pose": dict(reference),
                 "osc_mode": mode,
             }
+            self.pico_trace_logger.append({"record_type": "osc_target", "monotonic_ns": now_ns, "sequence": sequence, "target_generation": self.target_generation, "mode": mode})
             self._bump_state()
             return {
                 "accepted": True,
@@ -1742,6 +1795,7 @@ class _OperationalSpaceServo:
                 self.control_sample_id += 1
                 sample_id = self.control_sample_id
                 now_ns = time.monotonic_ns()
+                self.pico_trace_logger.append({"record_type": "osc_sample", "monotonic_ns": now_ns, "control_sample_id": sample_id, "motion_epoch": epoch, "target_generation": target_generation})
                 dispatch_dt = actual_dt
                 if not shadow and self._last_dispatch_monotonic_ns:
                     dispatch_dt = max(0.001, min(0.2, (now_ns - self._last_dispatch_monotonic_ns) / 1e9))
@@ -1915,6 +1969,7 @@ class _OperationalSpaceServo:
                         "gate_ok": gate_ok,
                         "gate_limited": gate_limited,
                     }, str(session.get("session_id")), epoch)
+                    self.pico_trace_logger.append({"record_type": "osc_cpv_published", "monotonic_ns": time.monotonic_ns(), "control_sample_id": sample_id, "motion_epoch": epoch, "target_generation": target_generation, "gate_ok": gate_ok, "gate_limited": gate_limited, "gate_reason": gate_reason, "mailbox_revision": publication.get("mailbox_revision") if isinstance(publication, dict) else None})
                     with self.lock:
                         self.output_count += 1
                         self.last_output = {"status": "limited" if gate_limited else "accepted", "final_joint_target_rad": list(position_target), "final_joint_velocity_rad_s": list(final_velocity), "sequence": int((command or {}).get("sequence", session.get("sequence", 0))), "epoch": epoch}
@@ -1986,6 +2041,21 @@ class _OperationalSpaceServo:
                             revision = published.get("mailbox_revision")
                             if isinstance(revision, int):
                                 result = self.hardware.wait_for_servo_result(revision, 0.25)
+                                if result.get("status") == "revoked":
+                                    # A newer deadman/HOLD generation may
+                                    # revoke this already-queued final brake
+                                    # sample.  That is an intentional safety
+                                    # barrier, not a transport failure.  Keep
+                                    # BRAKING so the next loop publishes the
+                                    # final zero-velocity sample for the new
+                                    # generation instead of escalating the
+                                    # expected race to a hardware FAULT.
+                                    self._set_result(
+                                        True,
+                                        "final CPV braking batch superseded by newer safety generation",
+                                        robot_commands_sent=False,
+                                    )
+                                    continue
                                 if result.get("status") != "sent":
                                     raise RuntimeError(f"final CPV braking batch was not sent: {result}")
                         self.trajectory_state, self.trajectory_brake_reason, self.feedback_sync_pending = "HOLD_READY", None, True
@@ -2045,6 +2115,7 @@ class OscRuntime:
 
     def close(self) -> bool:
         self._servo.stop_session("OSC runtime shutdown")
+        self._servo.pico_trace_logger.close()
         return self._receiver.close()
 
     def rx_snapshot(self) -> dict[str, Any] | None: return self._receiver.snapshot()
@@ -2062,6 +2133,7 @@ class OscRuntime:
     def heartbeat_expired(self) -> bool: return self._servo.heartbeat_expired()
     def submit_absolute_target(self, body: dict[str, Any], *, mode: str) -> dict[str, Any]: return self._servo.submit_absolute_target(body, mode=mode)
     def request_shadow_hold(self, reason: str) -> dict[str, Any]: return self._servo.request_shadow_hold(reason)
+    def request_hardware_hold(self, reason: str) -> dict[str, Any]: return self._servo.request_hardware_hold(reason)
     def freeze_for_authority_change(self, epoch: int, reason: str) -> None: self._servo.freeze_for_authority_change(epoch, reason)
     def abandon_session_without_braking(self, epoch: int, reason: str) -> dict[str, Any]: return self._servo.abandon_session_without_braking(epoch, reason)
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
+import math
 import mimetypes
 import multiprocessing
 import os
@@ -34,6 +36,7 @@ if str(VENDOR_ROOT) not in sys.path:
 from supervisor.instance_lock import InstanceLock  # noqa: E402
 from nero_console.runtime import assert_control_interpreter, control_python  # noqa: E402
 from nero_console.application.adapter_runtime import AdapterRuntime  # noqa: E402
+from supervisor.logging import AsyncJsonlTraceLogger  # noqa: E402
 
 if TYPE_CHECKING:
     from supervisor.control import OperationalSpaceController
@@ -82,6 +85,11 @@ def _backend_worker_main(connection: Any, config: str) -> None:
         for import_root in (
             worker_root,
             worker_root / "vendor",
+            # This backend is distributed as a nested vendored package rather
+            # than directly below ``vendor``.  The Windows multiprocessing
+            # child can use the base Python image, so it does not inherit the
+            # .venv's editable-package path automatically.
+            worker_root / "vendor" / "python-can-agx-cando",
             worker_root / "vendor" / "pyAgxArm",
             worker_root / ".venv" / "Lib" / "site-packages",
         ):
@@ -539,6 +547,94 @@ class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
         super().server_bind()
 
 
+class PicoIngressDispatcher:
+    """Dispatch one latest PICO input frame to the robot-facing adapter."""
+
+    def __init__(self, process: Any, observe: Any, complete: Any | None = None) -> None:
+        self._process, self._observe, self._complete = process, observe, complete
+        self._condition = threading.Condition(threading.RLock())
+        self._latest_frame: tuple[str, dict[str, Any], int] | None = None
+        # Grip is a dead-man control edge, not a droppable telemetry sample.
+        # Keep edge frames separately so a burst of pose samples cannot
+        # overwrite the press before the worker handles it.
+        self._control_frames: deque[tuple[str, dict[str, Any], int]] = deque(maxlen=8)
+        self._last_grip: bool | None = None
+        self._stop = False
+        self._closed = False
+        self._overwritten_frames = 0
+        self._max_depth = 0
+        self._thread = threading.Thread(target=self._run, name="nero-pico-osc-dispatch", daemon=True)
+        self._thread.start()
+
+    def submit(self, kind: str, payload: dict[str, Any], sequence: int) -> dict[str, Any]:
+        with self._condition:
+            if kind == "input_frame" and "grip" in payload:
+                grip = bool(payload.get("grip"))
+                if self._last_grip is None or grip != self._last_grip:
+                    self._control_frames.append((kind, payload, sequence))
+                self._last_grip = grip
+            if self._latest_frame is not None:
+                self._overwritten_frames += 1
+            self._latest_frame = (kind, payload, sequence)
+            depth = int(self._latest_frame is not None)
+            self._max_depth = max(self._max_depth, depth)
+            self._condition.notify()
+            return {"accepted": True, "queued": True,
+                    "pending": True,
+                    "queue_depth": depth,
+                    "overwritten_input_frames": self._overwritten_frames}
+
+    def _take(self) -> tuple[str, dict[str, Any], int] | None:
+        with self._condition:
+            while not self._stop and self._latest_frame is None and not self._control_frames:
+                self._condition.wait(timeout=0.25)
+            if self._stop:
+                return None
+            if self._control_frames:
+                item = self._control_frames.popleft()
+            else:
+                item, self._latest_frame = self._latest_frame, None
+            return item
+
+    def _run(self) -> None:
+        while True:
+            item = self._take()
+            if item is None:
+                return
+            kind, payload, sequence = item
+            started = time.monotonic_ns()
+            self._observe("dispatch_started", kind, sequence, started, self.depth())
+            try:
+                result = self._process(kind, payload)
+                self._observe("dispatch_finished", kind, sequence, time.monotonic_ns(), self.depth(), result=result)
+                result_dict = result if isinstance(result, dict) else {}
+                if self._complete is not None and result_dict.get("event"):
+                    self._complete(str(result_dict["event"]), sequence, result_dict, None)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                self._observe("dispatch_error", kind, sequence, time.monotonic_ns(), self.depth(), error=error)
+                if self._complete is not None:
+                    self._complete(kind, sequence, None, error)
+
+    def depth(self) -> int:
+        with self._condition:
+            return int(self._latest_frame is not None) + len(self._control_frames)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._condition:
+            return {"queue_depth": self.depth(), "max_queue_depth": self._max_depth,
+                    "overwritten_input_frames": self._overwritten_frames,
+                    "worker_alive": self._thread.is_alive()}
+
+    def close(self) -> None:
+        with self._condition:
+            self._stop = True
+            self._control_frames.clear()
+            self._condition.notify_all()
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=2.0)
+
+
 class PicoGateway:
     """Small, paired LAN ingress which never exposes the HTTP control API."""
 
@@ -546,6 +642,7 @@ class PicoGateway:
         self.runtime, self.config = runtime, dict(config)
         self.server_instance_id = secrets.token_hex(8)
         self._lock = threading.RLock()
+        self._send_lock = threading.RLock()
         self._server: Any | None = None
         self._thread: threading.Thread | None = None
         self._pair: dict[str, Any] | None = None
@@ -556,19 +653,39 @@ class PicoGateway:
         self._last_client: str | None = None
         self._last_connection_stage = "idle"
         self._last_connection_error: str | None = None
+        self._last_message_type: str | None = None
+        self._last_message_sequence: int | None = None
+        self._received_count = 0
+        self._sequence_gap_count = 0
+        self._last_receive_gap_ms: float | None = None
+        self._last_receive_monotonic_ns: int | None = None
+        self._input_frame_receive_times_ns: list[int] = []
+        self._input_frame_rx_hz: float | None = None
+        self._last_input_frame_grip = False
+        self._last_input_frame_trigger = 0.0
+        self._last_input_frame_tracking = False
+        self._last_input_frame_position = [0.0, 0.0, 0.0]
+        self._last_input_frame_orientation = [0.0, 0.0, 0.0, 1.0]
+        self._input_frame_overwrites = 0
+        self._last_ack_processing_ms: float | None = None
+        self._last_dispatch_type: str | None = None
+        self._last_dispatch_sequence: int | None = None
+        self._last_dispatch_duration_ms: float | None = None
+        self._last_dispatch_error: str | None = None
+        self._dispatch_started_ns: int | None = None
+        self._dispatch: PicoIngressDispatcher | None = None
         self.error: str | None = None
+        trace_dir = PROJECT_ROOT / "runtime" / "logs" / "pico"
+        self.trace_logger = AsyncJsonlTraceLogger(
+            trace_dir / f"pico-gateway-{time.strftime('%Y%m%dT%H%M%S')}.jsonl",
+            {"component": "pico_gateway", "server_instance_id": self.server_instance_id},
+        )
 
     def _advertised_host(self) -> str:
         host = str(self.config.get("host", "0.0.0.0"))
         advertised = str(self.config.get("advertise_host", "")).strip()
-        if not advertised and host == "0.0.0.0":
-            try:
-                probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                probe.connect(("192.0.2.1", 9))
-                advertised = str(probe.getsockname()[0])
-                probe.close()
-            except OSError:
-                advertised = "<PC-LAN-IP>"
+        if not advertised and host in {"0.0.0.0", "", "localhost", "127.0.0.1"}:
+            advertised = (_local_ipv4_address() or "<PC-LAN-IP>")
         return advertised or host
 
     @staticmethod
@@ -612,12 +729,17 @@ class PicoGateway:
         print(json.dumps({"pico_gateway_ready": True, "host": host, "port": port}), flush=True)
 
     def close(self) -> None:
+        dispatcher = self._dispatch
+        self._dispatch = None
+        if dispatcher is not None:
+            dispatcher.close()
         server = self._server
         self._server = None
         if server is not None:
             server.shutdown()
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=1.0)
+        self.trace_logger.close()
 
     def create_pairing(self, session_id: str, client_id: str) -> dict[str, Any]:
         if self._server is None:
@@ -631,6 +753,12 @@ class PicoGateway:
                           "ws_url": ws_url, "expires_monotonic": time.monotonic() + ttl, "expires_at": time.time() + ttl, "paired": False}
             self._connection_active = False
             self._last_input_monotonic = 0.0
+            self._input_frame_receive_times_ns = []
+            self._input_frame_rx_hz = None
+            self._last_input_frame_grip = False
+            self._last_input_frame_trigger = 0.0
+            self._last_input_frame_tracking = False
+            self._input_frame_overwrites = 0
             self._last_connection_stage = "waiting_for_auth"
             self._last_connection_error = None
         result = self.runtime.require_adapters().pico_state()
@@ -642,8 +770,8 @@ class PicoGateway:
             pair = dict(self._pair) if self._pair else None
             expected = urlparse(str(pair.get("ws_url", ""))) if pair else None
             requested = urlparse(str(base_url).strip())
-            if not pair or pair.get("paired") or time.monotonic() > float(pair["expires_monotonic"]):
-                raise PermissionError("PICO pairing is missing, already used, or expired")
+            if not pair or time.monotonic() > float(pair["expires_monotonic"]):
+                raise PermissionError("PICO pairing is missing or expired")
             if not secrets.compare_digest(str(code).strip(), str(pair["code"])):
                 raise PermissionError("PICO pairing code is incorrect")
             if not expected or requested.scheme != expected.scheme or requested.netloc.lower() != expected.netloc.lower() or requested.path not in {"", "/"} or requested.query or requested.fragment:
@@ -651,6 +779,10 @@ class PicoGateway:
             return {"ws_url": pair["ws_url"], "pairing_id": pair["pairing_id"], "expires_at": pair["expires_at"]}
 
     def invalidate(self) -> None:
+        dispatcher = self._dispatch
+        self._dispatch = None
+        if dispatcher is not None:
+            dispatcher.close()
         with self._lock:
             self._pair = None
             self._connection_active = False
@@ -663,6 +795,7 @@ class PicoGateway:
         with self._lock:
             pair = dict(self._pair) if self._pair else None
             active = bool(pair and pair.get("paired"))
+            dispatcher_snapshot = self._dispatch.snapshot() if self._dispatch is not None else {"worker_alive": False, "queue_depth": 0, "overwritten_input_frames": 0}
             host = str(self.config.get("host", "0.0.0.0"))
             advertised_host = self._advertised_host()
             result = {
@@ -679,6 +812,32 @@ class PicoGateway:
                 "last_client": self._last_client,
                 "connection_stage": self._last_connection_stage,
                 "last_connection_error": self._last_connection_error,
+                "last_message_type": self._last_message_type,
+                "last_message_sequence": self._last_message_sequence,
+                "received_count": self._received_count,
+                "sequence_gap_count": self._sequence_gap_count,
+                "last_receive_gap_ms": self._last_receive_gap_ms,
+                "pose_rx_hz": self._input_frame_rx_hz,
+                "input_frame_rx_hz": self._input_frame_rx_hz,
+                "input_frame_grip": self._last_input_frame_grip,
+                "input_frame_trigger_value": self._last_input_frame_trigger,
+                "input_frame_tracking_valid": self._last_input_frame_tracking,
+                "input_frame_position_m": list(self._last_input_frame_position),
+                "input_frame_orientation_xyzw": list(self._last_input_frame_orientation),
+                "input_frame_overwrites": dispatcher_snapshot.get("overwritten_input_frames", self._input_frame_overwrites),
+                "last_ack_processing_ms": self._last_ack_processing_ms,
+                "last_signal_age_ms": None if self._last_receive_monotonic_ns is None else max(0.0, (time.monotonic_ns() - self._last_receive_monotonic_ns) / 1e6),
+                "last_dispatch_type": self._last_dispatch_type,
+                "last_dispatch_sequence": self._last_dispatch_sequence,
+                "last_dispatch_duration_ms": self._last_dispatch_duration_ms,
+                "last_dispatch_error": self._last_dispatch_error,
+                "dispatcher": dispatcher_snapshot,
+                "trace_logging": {"enabled": True, "path": str(self.trace_logger.path.resolve()), "schema": "pico-trace.v1"},
+                "connection_state": (
+                    "CONNECTED_CONTROL_UNAVAILABLE"
+                    if active and self._last_connection_stage == "control_unavailable"
+                    else "CONNECTED" if active else "DISCONNECTED"
+                ),
                 "last_input_age_s": None if not self._last_input_monotonic else max(0.0, time.monotonic() - self._last_input_monotonic),
                 "error": self.error,
             }
@@ -694,10 +853,47 @@ class PicoGateway:
         return qrcode.make(uri, image_factory=qrcode.image.svg.SvgPathImage, border=1).to_string(encoding="utf-8")
 
     def _send(self, connection: Any, payload: dict[str, Any]) -> None:
-        connection.send(json.dumps(payload, ensure_ascii=False))
+        with self._send_lock:
+            connection.send(json.dumps(payload, ensure_ascii=False))
+
+    def _send_control_result(self, connection: Any, kind: str, sequence: int, result: Any, error: str | None) -> None:
+        data = dict(result) if isinstance(result, dict) else {}
+        if error:
+            data.update({"accepted": False, "recoverable": True, "reason": "control_unavailable", "message": error})
+        else:
+            data.setdefault("accepted", bool(data.get("ok", False)))
+        try:
+            self._send(connection, {"ok": not bool(error) and bool(data.get("accepted", False)),
+                                    "type": "control_result", "event": kind, "sequence": sequence, "data": data})
+        except Exception:
+            # The socket may have closed while the robot-facing worker was
+            # finishing a control edge. The connection cleanup owns that case.
+            pass
+
+    def _observe_dispatch(self, event: str, kind: str, sequence: int, monotonic_ns: int, depth: int, *, result: Any = None, error: str | None = None) -> None:
+        with self._lock:
+            if event == "dispatch_started":
+                self._dispatch_started_ns = monotonic_ns
+            elif event == "dispatch_finished":
+                self._last_dispatch_type = kind
+                self._last_dispatch_sequence = sequence
+                self._last_dispatch_error = None
+                self._last_dispatch_duration_ms = max(0.0, (monotonic_ns - (self._dispatch_started_ns or monotonic_ns)) / 1e6)
+            elif event == "dispatch_error":
+                self._last_dispatch_type = kind
+                self._last_dispatch_sequence = sequence
+                self._last_dispatch_error = error
+                self._last_dispatch_duration_ms = max(0.0, (monotonic_ns - (self._dispatch_started_ns or monotonic_ns)) / 1e6)
+                self._last_connection_stage = "control_unavailable"
+                self._last_connection_error = error
+        self.trace_logger.append({"record_type": "sample", "event": f"gateway_{event}",
+                                  "monotonic_ns": monotonic_ns, "pico_sequence": sequence,
+                                  "message_type": kind, "queue_depth": depth, "error": error,
+                                  "result": result if event == "dispatch_finished" else None})
 
     def _handle_connection(self, connection: Any) -> None:
         paired_session: str | None = None
+        paired_pairing_id: str | None = None
         last_sequence = 0
         client = getattr(connection, "remote_address", None)
         client_label = str(client) if client is not None else "unknown"
@@ -710,6 +906,8 @@ class PicoGateway:
         try:
             raw = connection.recv(timeout=10)
             message = json.loads(raw)
+            self.trace_logger.append({"record_type": "event", "event": "gateway_pair_received",
+                                      "monotonic_ns": time.monotonic_ns(), "remote": client_label})
             if not isinstance(message, dict) or message.get("type") != "pair":
                 raise PermissionError("first WebSocket message must be pair")
             with self._lock:
@@ -736,12 +934,24 @@ class PicoGateway:
                 self._pair["paired"] = True
                 self._connection_active = True
                 paired_session = str(pair["session_id"])
+                paired_pairing_id = str(pair["pairing_id"])
+            self.trace_logger.append({"record_type": "event", "event": "gateway_pair_accepted",
+                                      "monotonic_ns": time.monotonic_ns(), "session_id": paired_session,
+                                      "pairing_id": paired_pairing_id})
             self.runtime.require_adapters().pico_paired()
             with self._lock:
                 self._last_connection_stage = "paired"
+            dispatcher = PicoIngressDispatcher(
+                lambda kind, payload: self.runtime.require_adapters().pico_message(kind, payload),
+                self._observe_dispatch,
+                lambda kind, sequence, result, error: self._send_control_result(connection, kind, sequence, result, error),
+            )
+            self._dispatch = dispatcher
             self._send(connection, {"ok": True, "type": "paired", "session_id": paired_session,
                                     "server_instance_id": self.server_instance_id,
-                                    "capabilities": ["tracking", "anchor", "pose", "gripper", "disconnect"]})
+                                    "capabilities": ["input_frame", "disconnect"],
+                                    "recommended_input_hz": 100,
+                                    "control_period_ms": 20})
             idle_since = time.monotonic()
             while True:
                 try:
@@ -753,22 +963,72 @@ class PicoGateway:
                 if len(raw.encode("utf-8")) > int(self.config.get("max_message_bytes", 4096)):
                     raise ValueError("PICO message is too large")
                 message = json.loads(raw)
-                if not isinstance(message, dict) or str(message.get("session_id", paired_session)) != paired_session:
-                    raise PermissionError("PICO session id mismatch")
+                if not isinstance(message, dict):
+                    raise PermissionError("PICO message must be an object")
                 sequence = int(message.get("sequence", -1))
                 if sequence <= last_sequence:
                     raise PermissionError("PICO sequence is not monotonic")
+                if last_sequence and sequence > last_sequence + 1:
+                    with self._lock:
+                        self._sequence_gap_count += sequence - last_sequence - 1
                 kind = str(message.get("type", ""))
-                if kind not in {"heartbeat", "tracking", "anchor_begin", "pose", "anchor_release", "gripper", "hold", "disconnect"}:
-                    raise ValueError("unsupported PICO adapter message type")
-                pico_pose = message.get("pico_pose") if isinstance(message.get("pico_pose"), dict) else {}
-                payload: dict[str, Any] = {"position_m": message.get("position_m") or pico_pose.get("position_m"), "orientation_xyzw": message.get("orientation_xyzw") or pico_pose.get("orientation_xyzw"), "tracking_valid": bool(message.get("tracking_valid", True)), "clutch": bool(message.get("clutch", False)), "value": message.get("value", 0.0)}
-                result = self.runtime.require_adapters().pico_message(kind, payload)
+                with self._lock:
+                    self._last_message_type = kind
+                    self._last_message_sequence = sequence
+                if kind not in {"input_frame", "disconnect"}:
+                    raise ValueError("unsupported PICO message type; input_frame is required")
+                if kind == "disconnect":
+                    last_sequence = sequence
+                    self._send(connection, {"ok": True, "type": "ack", "sequence": sequence})
+                    break
+                position = message.get("position_m")
+                orientation = message.get("orientation_xyzw")
+                grip = bool(message.get("grip", False))
+                trigger_value = float(message.get("trigger_value", 0.0))
+                if not isinstance(position, list) or len(position) != 3:
+                    raise ValueError("input_frame.position_m must contain 3 values")
+                if not isinstance(orientation, list) or len(orientation) != 4:
+                    raise ValueError("input_frame.orientation_xyzw must contain 4 values")
+                if not math.isfinite(trigger_value) or trigger_value < 0.0 or trigger_value > 1.0:
+                    raise ValueError("input_frame.trigger_value must be between 0 and 1")
+                gateway_received_ns = time.monotonic_ns()
+                with self._lock:
+                    self._received_count += 1
+                    self._last_receive_gap_ms = None if self._last_receive_monotonic_ns is None else max(0.0, (gateway_received_ns - self._last_receive_monotonic_ns) / 1e6)
+                    self._last_receive_monotonic_ns = gateway_received_ns
+                    self._input_frame_receive_times_ns.append(gateway_received_ns)
+                    if len(self._input_frame_receive_times_ns) > 32:
+                        del self._input_frame_receive_times_ns[:-32]
+                    if len(self._input_frame_receive_times_ns) >= 2:
+                        elapsed_ns = self._input_frame_receive_times_ns[-1] - self._input_frame_receive_times_ns[0]
+                        self._input_frame_rx_hz = ((len(self._input_frame_receive_times_ns) - 1) * 1e9 / elapsed_ns) if elapsed_ns > 0 else None
+                    self._last_input_frame_grip = grip
+                    self._last_input_frame_trigger = trigger_value
+                    self._last_input_frame_tracking = bool(message.get("tracking_valid", True))
+                    self._last_input_frame_position = list(position)
+                    self._last_input_frame_orientation = list(orientation)
+                self.trace_logger.append({"record_type": "sample", "event": "gateway_message_received",
+                                          "monotonic_ns": gateway_received_ns, "pico_sequence": sequence,
+                                          "message_type": kind, "session_id": paired_session})
+                payload: dict[str, Any] = {"position_m": position, "orientation_xyzw": orientation,
+                                            "tracking_valid": bool(message.get("tracking_valid", True)),
+                                            "grip": grip, "trigger_value": trigger_value,
+                                            "_pico_sequence": sequence,
+                                            "_gateway_received_monotonic_ns": gateway_received_ns}
+                result = dispatcher.submit(kind, payload, sequence)
+                with self._lock:
+                    self._last_connection_stage = "paired"
+                    self._last_connection_error = None
                 last_sequence = sequence
                 idle_since = time.monotonic()
                 with self._lock:
                     self._last_input_monotonic = time.monotonic()
-                self._send(connection, {"ok": True, "type": "ack", "sequence": sequence, "data": result})
+                with self._lock:
+                    self._last_ack_processing_ms = max(0.0, (time.monotonic_ns() - gateway_received_ns) / 1e6)
+                self.trace_logger.append({"record_type": "sample", "event": "gateway_frame_accepted",
+                                          "monotonic_ns": time.monotonic_ns(), "pico_sequence": sequence,
+                                          "message_type": kind, "processing_ms": max(0.0, (time.monotonic_ns() - gateway_received_ns) / 1e6),
+                                          "input_frame_overwrites": result.get("overwritten_input_frames", 0) if isinstance(result, dict) else 0})
         except TimeoutError:
             with self._lock:
                 self._last_connection_stage = "auth_timeout" if not paired_session else "input_timeout"
@@ -782,18 +1042,25 @@ class PicoGateway:
             except Exception:
                 pass
         finally:
+            owns_current_pair = False
             with self._lock:
                 # An obsolete or rejected socket must never tear down a newer
                 # successfully paired socket.  Only the connection that owns
-                # the current paired session may clear its gateway state.
-                if paired_session and self._pair and str(self._pair.get("session_id")) == paired_session:
+                # the current pairing record may clear gateway and adapter
+                # state. Session IDs can be reused, so compare pairing IDs.
+                if paired_pairing_id and self._pair and str(self._pair.get("pairing_id")) == paired_pairing_id:
+                    owns_current_pair = True
                     self._connection_active = False
-                    self._pair["paired"] = False
-            if paired_session:
-                try:
-                    self.runtime.require_adapters().pico_disconnected("PICO WebSocket disconnected")
-                except Exception:
-                    pass
+                    # Socket loss is a transport reconnect, not receiver stop.
+                    # The explicit console Stop button is the only invalidator.
+                    self._pair["paired"] = True
+            if owns_current_pair:
+                dispatcher = self._dispatch
+                self._dispatch = None
+                if dispatcher is not None:
+                    dispatcher.close()
+                # Keep PicoInputAdapter READY so the next socket can resume
+                # the same receiver pairing without a new code.
 
 
 class ControlRequestHandler(BaseHTTPRequestHandler):
@@ -830,6 +1097,10 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 return self._json_ok(self.runtime.require_adapters().pi05_state())
             if parsed.path == "/api/cameras/state":
                 return self._json_ok(self.runtime.require_adapters().camera_state())
+            if parsed.path == "/api/dataset/state":
+                return self._json_ok(self.runtime.require_adapters().dataset_state())
+            if parsed.path == "/api/dataset/episodes":
+                return self._json_ok(self.runtime.require_adapters().dataset_episodes())
             if parsed.path == "/api/adapters/pico/state":
                 result = self.runtime.require_adapters().pico_state()
                 if self.pico_gateway is not None:
@@ -894,6 +1165,10 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 return self._json_ok(self.runtime.require_adapters().camera_activate())
             if self.path in {"/api/cameras/deactivate", "/api/pi05/cameras/deactivate"}:
                 return self._json_ok(self.runtime.require_adapters().camera_deactivate())
+            if self.path == "/api/dataset/start":
+                return self._json_ok(self.runtime.require_adapters().dataset_start(body))
+            if self.path == "/api/dataset/stop":
+                return self._json_ok(self.runtime.require_adapters().dataset_stop(body))
             if self.path == "/api/pi05/start":
                 return self._json_ok(self.runtime.require_adapters().pi05_start(
                     str(body.get("session_id", "")), str(body.get("client_id", "anonymous"))
@@ -905,6 +1180,12 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     raise RuntimeError("PICO WebSocket gateway is unavailable")
                 return self._json_ok(self.pico_gateway.create_pairing(
                     str(body.get("session_id", "")), str(body.get("client_id", "anonymous"))))
+            if self.path == "/api/adapters/pico/sensitivity":
+                return self._json_ok(self.runtime.require_adapters().pico_update_sensitivity(body))
+            if self.path == "/api/adapters/pico/mapping":
+                return self._json_ok(self.runtime.require_adapters().pico_update_mapping(body))
+            if self.path == "/api/adapters/pico/rebase":
+                return self._json_ok(self.runtime.require_adapters().pico_reset_anchor(body))
             if self.path == "/api/adapters/pico/disconnect":
                 if self.pico_gateway is not None:
                     self.pico_gateway.invalidate()

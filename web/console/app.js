@@ -61,6 +61,10 @@
     right: [0, 0],
     rightMode: "zy",
     webAdapterActive: false,
+    picoMappingDraft: null,
+    picoMappingOverride: null,
+    picoMappingBusy: false,
+    picoMappingStatus: "",
     oscAnchor: null,
     relativePose: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
     lastPoseTick: performance.now(),
@@ -70,6 +74,7 @@
     pi05: null,
     pi05Cameras: [],
     pico: null,
+    dataset: null,
   };
 
   function buildPi05Card() {
@@ -145,22 +150,18 @@
     if ($("pico-panel")) return;
     const panel = document.createElement("section");
     panel.id = "pico-panel"; panel.className = "pico-panel hidden";
-    panel.innerHTML = `<div class="pico-head"><span class="pi05-index">P</span><div><strong>PICO 4 Ultra</strong><small>6D 遥操输入适配器</small></div><span id="pico-state" class="badge neutral">IDLE</span></div><section class="pico-camera-resource"><strong>公共相机观测</strong><div class="pi05-cameras"><label>外部 RGB<select id="pico-external-index" aria-label="外部 RGB 相机"></select></label><label>腕部 RGB<select id="pico-wrist-index" aria-label="腕部 RGB 相机"></select></label></div><div class="pi05-views"><div class="pi05-view"><span>外部视角</span><img id="pico-external-frame" alt="外部 RGB 实时画面"><b>等待画面</b></div><div class="pi05-view"><span>腕部视角</span><img id="pico-wrist-frame" alt="腕部 RGB 实时画面"><b>等待画面</b></div></div></section><div class="pico-pair"><div id="pico-qr" class="pico-qr"><span>等待配对</span></div><div><strong>一次性配对</strong><p id="pico-url">先接入 PICO Adapter 以生成二维码。</p><code id="pico-code">------</code><small>二维码或短码有效期内仅允许一个头显接入。</small></div></div><div class="pico-status"><span>连接 <b id="pico-connected">未连接</b></span><span>追踪 <b id="pico-tracking">--</b></span><span>Anchor <b id="pico-anchor">--</b></span><span>夹爪 <b id="pico-gripper">--</b></span></div><div class="pico-controls"><strong>手柄映射</strong><p>右手 Grip 按住：定义 Anchor 并控制 TCP；右手 Trigger：夹爪开度；左手 Menu：安全 HOLD。松开 Grip、追踪丢失或断连都会进入 HOLD。</p></div><div class="pico-actions"><button id="pico-start" class="button primary" type="button">接入 PICO Adapter</button><button id="pico-stop" class="button quiet" type="button">断开 PICO Adapter</button></div><p id="pico-result" class="result">PICO 只向 OSC 提交绝对 TCP 与标准夹爪/HOLD 指令。</p>`;
+    panel.innerHTML = `<div class="pico-head"><span class="pi05-index">P</span><div><strong>PICO 4 Ultra</strong><small>用 PICO 手柄控制机械臂</small></div><span id="pico-state" class="badge neutral">IDLE</span></div><section class="pico-camera-resource"><strong>公共相机观测</strong><div class="pi05-cameras"><label>外部 RGB<select id="pico-external-index"></select></label><label>腕部 RGB<select id="pico-wrist-index"></select></label></div><div class="pi05-views"><div class="pi05-view"><span>外部视角</span><img id="pico-external-frame"><b>等待画面</b></div><div class="pi05-view"><span>腕部视角</span><img id="pico-wrist-frame"><b>等待画面</b></div></div></section><div class="pico-pair"><div id="pico-qr" class="pico-qr">等待配对</div><div><strong>一次性配对</strong><p id="pico-url">点击连接后生成二维码。</p><code id="pico-code">------</code><small>在 PICO APK 输入局域网地址和 6 位短码。</small><small id="pico-diagnostic">网关诊断：等待启动</small></div></div><div class="pico-status"><span>连接 <b id="pico-connected">未连接</b></span><span>追踪 <b id="pico-tracking">--</b></span><span>控制起点 <b id="pico-anchor">--</b></span><span>夹爪 <b id="pico-gripper">--</b></span></div><div class="pico-received-pose"><strong>接收到的 PICO 信号</strong><div class="pico-received-grid"><span>Grip<b id="pico-clutch-signal">--</b></span><span>输入序号<b id="pico-input-sequence">--</b></span><span>Pose 接收<b id="pico-pose-rate">--</b></span><span>位姿年龄<b id="pico-pose-age">--</b></span><span>原始 Trigger<b id="pico-raw-trigger">--</b></span><span>网关覆盖<b id="pico-frame-overwrites">--</b></span></div><code id="pico-pose-position">XYZ --</code><code id="pico-pose-quaternion">Q --</code><code id="pico-pose-mapped-quaternion">映射后 Q --</code></div><div class="pico-target-pose"><strong>最后传输到机械臂的目标 TCP</strong><div class="pico-received-grid"><span>发送状态<b id="pico-target-status">--</b></span><span>OSC序号<b id="pico-target-sequence">--</b></span><span>目标年龄<b id="pico-target-age">--</b></span><span>目标来源<b id="pico-target-mode">--</b></span></div><code id="pico-target-position">XYZ --</code><code id="pico-target-quaternion">Q --</code><code id="pico-preview-quaternion">实时预览 Q --</code></div><div class="pico-controls"><strong>怎么控制</strong><p>按住右手 Grip：移动机械臂；右手 Trigger：开合夹爪；左手 Menu：立即停止。松开 Grip、追踪丢失或断开连接时自动 HOLD。</p><div class="pico-sensitivity"><strong>PICO 灵敏度</strong><label>平移 <output id="pico-translation-gain-value">100%</output><input id="pico-translation-gain" type="range" min="0.25" max="2" step="0.05" value="1"></label><label>旋转 <output>绝对姿态 1:1</output><input id="pico-rotation-gain" type="range" value="1" disabled></label><label id="pico-hardware-confirm-wrap" class="hidden"><input id="pico-hardware-gain-confirm" type="checkbox"> 确认真机使用 100% 以上增益</label><small id="pico-sensitivity-status">只改变位姿映射，不改变安全限速。</small></div><div class="pico-frame-mapping"><strong>空间坐标/旋转校正矩阵</strong><div class="pico-axis-map-grid"><div><strong>位置映射</strong><label>X ← <select id="pico-position-axis-x"></select></label><label>Y ← <select id="pico-position-axis-y"></select></label><label>Z ← <select id="pico-position-axis-z"></select></label></div><div><strong>旋转映射</strong><label>X ← <select id="pico-orientation-axis-x"></select></label><label>Y ← <select id="pico-orientation-axis-y"></select></label><label>Z ← <select id="pico-orientation-axis-z"></select></label></div></div><button id="pico-mapping-default" class="button quiet" type="button">恢复推荐矩阵</button><button id="pico-mapping-apply" class="button" type="button">应用并保存矩阵</button><small id="pico-mapping-status">等待 PICO 状态</small></div><div class="pico-signal-diagnostics"><strong>实时信号链路</strong><div class="pico-received-grid"><span>最后消息<b id="pico-last-message">--</b></span><span>信号年龄<b id="pico-signal-age">--</b></span><span>执行队列<b id="pico-dispatch-queue">--</b></span><span>丢弃位姿<b id="pico-dropped-pose">--</b></span></div><small id="pico-signal-status">等待 PICO 信号</small></div></div><div class="pico-actions"><button id="pico-start" class="button primary" type="button">启动 PICO 接收器</button><button id="pico-stop" class="button quiet" type="button">停止 PICO 接收器</button><button id="pico-rebase" class="button quiet" type="button">重置初始位置</button></div><p id="pico-result" class="result">PICO APK 通过 WebSocket 发送数据；电脑端不依赖 PICO SDK。</p>`;
     document.querySelector(".osc-panel")?.append(panel);
     panel.querySelector(".pico-camera-resource .pi05-cameras")?.insertAdjacentHTML("afterend", `<div class="camera-power"><span id="camera-power-pico">相机状态：检查中</span><button id="camera-open-pico" class="button" type="button">打开相机</button><button id="camera-close-pico" class="button quiet" type="button">关闭相机</button></div>`);
-    const picoSubtitle = panel.querySelector(".pico-head small");
-    if (picoSubtitle) picoSubtitle.textContent = "用 PICO 手柄控制机械臂";
-    const picoAnchor = $("pico-anchor")?.parentElement;
-    if (picoAnchor) picoAnchor.firstChild.textContent = "控制起点 ";
-    const picoControls = panel.querySelector(".pico-controls");
-    if (picoControls) picoControls.innerHTML = "<strong>怎么控制</strong><p>按住右手 Grip：移动机械臂；右手 Trigger：开合夹爪；左手 Menu：立即停止。松开 Grip、追踪丢失或断开连接时，机械臂会自动停止。</p>";
-    const picoPair = panel.querySelector(".pico-pair");
-    if (picoPair) picoPair.innerHTML = '<div id="pico-qr" class="pico-qr">等待配对</div><div><strong>一次性配对</strong><p id="pico-url">点击连接后生成二维码。</p><code id="pico-code">------</code><small>在 PICO APK 输入局域网地址和 6 位短码，APK 会解析专用 WebSocket 地址。</small><small id="pico-diagnostic">网关诊断：等待启动</small></div>';
-    const picoResult = $("pico-result");
-    if (picoResult) picoResult.textContent = "PICO APK 通过 WebSocket 发送数据；电脑端不依赖 PICO SDK。";
-    $("pico-start").textContent = "启动 PICO 接收器";
-    $("pico-stop").textContent = "停止 PICO 接收器";
     [".sticks", ".intent-readout", ".keyboard-map", ".session-actions", "#pico-connection"].forEach((selector) => document.querySelector(selector)?.setAttribute("data-web-adapter", ""));
+  }
+
+  function buildDatasetCard() {
+    if ($("dataset-panel")) return;
+    const panel = document.createElement("section");
+    panel.id = "dataset-panel"; panel.className = "dataset-panel";
+    panel.innerHTML = `<div class="pico-head"><span class="pi05-index">D</span><div><strong>示范数据采集</strong><small>20 Hz 双相机 Episode</small></div><span id="dataset-state" class="badge neutral">未采集</span></div><div class="dataset-fields"><label>任务名称<input id="dataset-task" value="red_cube_to_tray" maxlength="120"></label><label>任务描述<input id="dataset-description" value="pick up the red cube and place it in the tray" maxlength="500"></label></div><div class="pico-actions"><button id="dataset-start" class="button primary" type="button">开始采集 Episode</button><button id="dataset-stop" class="button quiet" type="button">结束并保存</button><button id="dataset-failed" class="button quiet" type="button">失败并删除</button></div><div class="dataset-readout"><span>当前帧数<b id="dataset-frames">0</b></span><span>丢帧<b id="dataset-dropped">0</b></span><span>保存位置<b id="dataset-path">--</b></span></div><p id="dataset-result" class="result">先打开两台相机，再开始采集。</p>`;
+    document.querySelector(".osc-panel")?.append(panel);
   }
 
   const canvas = $("workspace");
@@ -323,6 +324,7 @@
     if (diagnosticNode && gatewayReady && !gateway.paired) diagnosticNode.title = diagnostic;
     const diagnosticText = $("pico-diagnostic");
     if (diagnosticText) diagnosticText.textContent = diagnostic;
+    renderPicoDetails(pico, gateway);
     $("pico-start").disabled = gateway.paired || session().state === "ACTIVE" && selectedAdapter() !== "pico";
     $("pico-stop").disabled = !gateway.session_id && pico.state === "IDLE";
     $("pico-start").textContent = "启动 PICO 接收器";
@@ -330,6 +332,88 @@
     if (!gatewayReady && !gateway.error && gateway.enabled !== false) $("pico-result").textContent = "PICO 接收器正在启动，等待 8768 端口监听。";
     if (gatewayReady && !pico.last_error && !gateway.error) $("pico-result").textContent = gateway.paired ? "APK 已连接。按住右手 Grip 后再移动手柄，即可控制机械臂。" : "在 PICO APK 输入电脑局域网地址和 6 位短码。";
   }
+
+  const PICO_AXIS_OPTIONS = ["x", "-x", "y", "-y", "z", "-z"];
+  // Verified on the physical arm. Keep this in sync with the default stored
+  // in runtime.json so "恢复推荐矩阵" restores the validated calibration.
+  const PICO_RECOMMENDED_MAPPING = { position_axis_map: [[0, 0, 1], [-1, 0, 0], [0, 1, 0]], orientation_axis_map: [[0, 0, -1], [0, 1, 0], [1, 0, 0]] };
+  function picoText(id, value) { const node = $(id); if (node) node.textContent = value; }
+  function axisChoice(row) { const i = row.findIndex((value) => Number(value) !== 0); return i < 0 ? "x" : `${Number(row[i]) < 0 ? "-" : ""}${["x", "y", "z"][i]}`; }
+  function choiceRow(choice) { const sign = choice.startsWith("-") ? -1 : 1; const axis = choice.replace("-", ""); return ["x", "y", "z"].map((value) => value === axis ? sign : 0); }
+  function mappingChoices(kind) { return ["x", "y", "z"].map((axis) => $("pico-" + kind + "-axis-" + axis)?.value || ""); }
+  function validMappingChoices(choices) { return choices.every((choice) => PICO_AXIS_OPTIONS.includes(choice)) && new Set(choices.map((choice) => choice.replace("-", ""))).size === 3; }
+  function mappingFromChoices(kind) {
+    const choices = mappingChoices(kind);
+    if (!validMappingChoices(choices)) throw new Error(`${kind === "position" ? "位置" : "旋转"}映射必须各使用一次 X、Y、Z 轴`);
+    return choices.map(choiceRow);
+  }
+  function renderPicoDetails(pico, gateway) {
+    const mapping = pico.mapping || {}; const fmt = (values, n = 3) => Array.isArray(values) ? values.map((v) => fixed(v, n)).join(", ") : "--";
+    const rawPosition = gateway.input_frame_position_m || pico.input_position_m;
+    const rawOrientation = gateway.input_frame_orientation_xyzw || pico.input_orientation_xyzw;
+    picoText("pico-clutch-signal", (gateway.input_frame_grip ?? pico.input_grip) ? "ON · 已接合" : "OFF · 已释放");
+    picoText("pico-input-sequence", gateway.last_message_sequence ?? pico.input_sequence ?? "--");
+    picoText("pico-pose-rate", Number.isFinite(Number(gateway.input_frame_rx_hz ?? pico.pose_rx_hz)) ? `${Number(gateway.input_frame_rx_hz ?? pico.pose_rx_hz).toFixed(1)} Hz` : "--");
+    picoText("pico-pose-age", Number.isFinite(Number(gateway.last_signal_age_ms ?? pico.input_pose_age_ms)) ? `${Number(gateway.last_signal_age_ms ?? pico.input_pose_age_ms).toFixed(0)} ms` : "--");
+    picoText("pico-raw-trigger", Number.isFinite(Number(gateway.input_frame_trigger_value)) ? `${(Number(gateway.input_frame_trigger_value) * 100).toFixed(0)}%` : "--");
+    picoText("pico-frame-overwrites", gateway.input_frame_overwrites ?? 0);
+    picoText("pico-pose-position", `XYZ ${fmt(rawPosition)} m`); picoText("pico-pose-quaternion", `Q ${fmt(rawOrientation)}`); picoText("pico-pose-mapped-quaternion", `映射后 Q ${fmt(pico.mapped_input_orientation_xyzw)}`);
+    const target = pico.last_target_pose || {};
+    picoText("pico-target-status", pico.last_target_status || "NONE"); picoText("pico-target-sequence", pico.last_target_osc_sequence ?? "--"); picoText("pico-target-age", Number.isFinite(Number(pico.last_target_age_ms)) ? `${Number(pico.last_target_age_ms).toFixed(0)} ms` : "--"); picoText("pico-target-mode", pico.target_pose_mode || "--");
+    picoText("pico-target-position", `XYZ ${fmt(target.position_m)} m`); picoText("pico-target-quaternion", `Q ${fmt(target.orientation_xyzw)}`); picoText("pico-preview-quaternion", `实时预览 Q ${fmt(pico.absolute_orientation_preview_xyzw)}`);
+    const translation = Number(mapping.translation_gain ?? 1); const input = $("pico-translation-gain");
+    if (input && document.activeElement !== input) input.value = String(translation);
+    picoText("pico-translation-gain-value", `${Math.round(Number(input?.value ?? translation) * 100)}% · 手柄 10 cm → TCP ${Math.round(Number(input?.value ?? translation) * 10)} cm`);
+    const hardware = (session().execution_mode || session().mode) === "hardware";
+    $("pico-hardware-confirm-wrap")?.classList.toggle("hidden", !hardware || Number(input?.value ?? translation) <= 1);
+    if (input) input.disabled = pico.anchor_active === true;
+    const serverMaps = {
+      position: mapping.position_axis_map || PICO_RECOMMENDED_MAPPING.position_axis_map,
+      orientation: mapping.orientation_axis_map || PICO_RECOMMENDED_MAPPING.orientation_axis_map,
+    };
+    const override = state.picoMappingOverride;
+    if (override && JSON.stringify(override) === JSON.stringify(serverMaps)) state.picoMappingOverride = null;
+    const draft = state.picoMappingDraft;
+    const displayedMaps = state.picoMappingOverride || serverMaps;
+    const displayedChoices = {
+      position: draft?.positionChoices || displayedMaps.position.map(axisChoice),
+      orientation: draft?.orientationChoices || displayedMaps.orientation.map(axisChoice),
+    };
+    [["position", displayedChoices.position], ["orientation", displayedChoices.orientation]].forEach(([kind, choices]) => ["x", "y", "z"].forEach((axis, index) => {
+      const select = $(`pico-${kind}-axis-${axis}`); if (!select) return;
+      if (!select.options.length) select.innerHTML = PICO_AXIS_OPTIONS.map((value) => `<option value="${value}">${value.toUpperCase()}</option>`).join("");
+      if (document.activeElement !== select) select.value = choices[index];
+      select.disabled = state.picoMappingBusy;
+    }));
+    picoText("pico-mapping-status", state.picoMappingStatus || (mapping.verified ? "已验证并保存到 runtime.json" : "请选择轴向后应用并保存矩阵"));
+    const dispatcher = gateway.dispatcher || {};
+    picoText("pico-last-message", gateway.last_message_type || "--"); picoText("pico-signal-age", Number.isFinite(Number(gateway.last_signal_age_ms)) ? `${Number(gateway.last_signal_age_ms).toFixed(0)} ms` : "--"); picoText("pico-dispatch-queue", `${dispatcher.queue_depth ?? 0} / ${dispatcher.max_queue_depth ?? 0}`); picoText("pico-dropped-pose", dispatcher.overwritten_input_frames ?? gateway.input_frame_overwrites ?? 0);
+    picoText("pico-signal-status", gateway.last_dispatch_error ? `OSC执行异常：${gateway.last_dispatch_error}` : gateway.connection_state === "CONNECTED" ? "收包与 OSC 执行已解耦；只保留最新位姿。" : (gateway.connection_state || "等待 PICO 信号"));
+  }
+
+  async function submitPicoSensitivity() { try { const gain = Number($("pico-translation-gain")?.value); const confirmed = $("pico-hardware-gain-confirm")?.checked === true; const result = await api("/api/adapters/pico/sensitivity", "POST", { session_id: session().id, client_id: clientId, translation_gain: gain, rotation_gain: 1, hardware_high_gain_confirmed: confirmed }); state.pico = { ...(state.pico || {}), mapping: { ...((state.pico || {}).mapping || {}), translation_gain: result.translation_gain, rotation_gain: result.rotation_gain, adjustable: result.adjustable } }; picoText("pico-sensitivity-status", "灵敏度已应用。"); render(); } catch (error) { picoText("pico-sensitivity-status", `设置失败：${error.message}`); } }
+  async function submitPicoMapping() {
+    let position; let orientation;
+    try { position = mappingFromChoices("position"); orientation = mappingFromChoices("orientation"); }
+    catch (error) { state.picoMappingStatus = error.message; render(); return; }
+    state.picoMappingDraft = { positionChoices: mappingChoices("position"), orientationChoices: mappingChoices("orientation") };
+    state.picoMappingBusy = true; state.picoMappingStatus = "正在应用并保存矩阵…"; render();
+    try {
+      const result = await api("/api/adapters/pico/mapping", "POST", { session_id: session().id, client_id: clientId, position_axis_map: position, orientation_axis_map: orientation, mapping_verified: false });
+      if (!result.accepted) throw new Error(result.message || result.reason || "矩阵未接受");
+      const maps = { position: result.position_axis_map, orientation: result.orientation_axis_map };
+      state.picoMappingOverride = maps;
+      state.pico = { ...(state.pico || {}), mapping: { ...((state.pico || {}).mapping || {}), verified: result.mapping_verified, position_axis_map: maps.position, orientation_axis_map: maps.orientation } };
+      state.picoMappingDraft = null;
+      state.picoMappingStatus = result.applied_while_tracking ? "矩阵已保存；Grip 跟踪中的位置已连续重基准。" : "矩阵已应用并保存到 runtime.json。";
+    } catch (error) { state.picoMappingStatus = `保存失败：${error.message}`; }
+    finally { state.picoMappingBusy = false; render(); }
+  }
+  async function resetPicoAnchor() { try { state.pico = await api("/api/adapters/pico/rebase", "POST", { session_id: session().id, client_id: clientId }); render(); } catch (error) { phase(`PICO 重置失败：${error.message}`, true); } }
+  function renderDataset() { const data = state.dataset || {}; picoText("dataset-state", data.active ? "采集中" : (data.last_status || "未采集")); picoText("dataset-frames", data.frame_count ?? 0); picoText("dataset-dropped", data.dropped_frames ?? 0); picoText("dataset-path", data.episode_path || data.dataset_root || "--"); picoText("dataset-result", data.last_error || (data.active ? "正在记录双相机、状态和动作。" : "先打开两台相机，再开始采集。")); $("dataset-start") && ($("dataset-start").disabled = data.active === true); $("dataset-stop") && ($("dataset-stop").disabled = data.active !== true); $("dataset-failed") && ($("dataset-failed").disabled = data.active !== true); }
+  async function refreshDatasetState() { try { state.dataset = await api("/api/dataset/state"); renderDataset(); } catch (_) {} }
+  async function startDataset() { try { state.dataset = await api("/api/dataset/start", "POST", { task: $("dataset-task")?.value || "", description: $("dataset-description")?.value || "" }, 10000); renderDataset(); } catch (error) { picoText("dataset-result", `开始失败：${error.message}`); } }
+  async function stopDataset(completed) { try { state.dataset = await api("/api/dataset/stop", "POST", { status: completed ? "completed" : "failed" }, 10000); renderDataset(); } catch (error) { picoText("dataset-result", `结束失败：${error.message}`); } }
 
   async function startPico() {
     $("pico-start").disabled = true; phase("正在接入 PICO Adapter…");
@@ -849,6 +933,7 @@
     renderHierarchy(osc, broker, transport, hardwareFeedback, diagnostic, current);
     renderPi05();
     renderPico();
+    renderDataset();
     renderCameraControls();
   }
 
@@ -1022,6 +1107,10 @@
   }
 
   function stopWebAdapterForPageExit(reason) {
+    // This handler belongs solely to the browser joystick.  PICO has its own
+    // deadman and gateway watchdog; hiding the browser while using the PICO
+    // headset must not inject a second, unrelated OSC stop request.
+    if (!state.webAdapterActive) return;
     const current = session();
     if (current.state === "ACTIVE" && current.client_id === clientId && current.id) {
       const payload = JSON.stringify({ reason });
@@ -1143,6 +1232,7 @@
   attachStick("right");
   buildPi05Card();
   buildPicoCard();
+  buildDatasetCard();
   void loadSharedCameras();
   $("input-adapter")?.addEventListener("change", applyAdapterSelection);
   $("execution-mode")?.addEventListener("change", async () => {
@@ -1192,6 +1282,22 @@
   $("pi05-stop")?.addEventListener("click", stopPi05);
   $("pico-start")?.addEventListener("click", startPico);
   $("pico-stop")?.addEventListener("click", stopPico);
+  $("pico-rebase")?.addEventListener("click", resetPicoAnchor);
+  $("pico-translation-gain")?.addEventListener("change", submitPicoSensitivity);
+  $("pico-hardware-gain-confirm")?.addEventListener("change", submitPicoSensitivity);
+  $("pico-mapping-apply")?.addEventListener("click", submitPicoMapping);
+  ["pico-position-axis-x", "pico-position-axis-y", "pico-position-axis-z", "pico-orientation-axis-x", "pico-orientation-axis-y", "pico-orientation-axis-z"].forEach((id) => $(id)?.addEventListener("change", () => {
+    state.picoMappingDraft = { positionChoices: mappingChoices("position"), orientationChoices: mappingChoices("orientation") };
+    state.picoMappingStatus = "矩阵已修改；请点击应用并保存。";
+  }));
+  $("pico-mapping-default")?.addEventListener("click", () => {
+    [["position", PICO_RECOMMENDED_MAPPING.position_axis_map], ["orientation", PICO_RECOMMENDED_MAPPING.orientation_axis_map]].forEach(([kind, matrix]) => ["x", "y", "z"].forEach((axis, index) => { const select = $(`pico-${kind}-axis-${axis}`); if (select) select.value = axisChoice(matrix[index]); }));
+    state.picoMappingDraft = { positionChoices: mappingChoices("position"), orientationChoices: mappingChoices("orientation") };
+    picoText("pico-mapping-status", "已恢复推荐矩阵；请点击应用并保存。");
+  });
+  $("dataset-start")?.addEventListener("click", startDataset);
+  $("dataset-stop")?.addEventListener("click", () => stopDataset(true));
+  $("dataset-failed")?.addEventListener("click", () => stopDataset(false));
   ["pi05", "pico"].forEach((scope) => {
     $(`camera-open-${scope}`)?.addEventListener("click", activateSharedCameras);
     $(`camera-close-${scope}`)?.addEventListener("click", deactivateSharedCameras);
@@ -1245,6 +1351,7 @@
   setInterval(() => { void refresh(false); }, 20);
   setInterval(() => { void refresh(true); }, 500);
   setInterval(() => { void refreshPi05State(); }, 200);
+  setInterval(() => { void refreshDatasetState(); }, 500);
   setInterval(refreshPi05Frames, 200);
   setInterval(heartbeat, 1000);
   setInterval(() => {

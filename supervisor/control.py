@@ -132,6 +132,7 @@ class _ControllerOscCommandPort:
     def mark_osc_stopping(self, session_id: str, epoch: int, reason: str) -> bool: return self._controller.mark_osc_stopping(session_id, epoch, reason)
     def servo_can_write(self, session_id: str, epoch: int) -> bool: return self._controller.servo_can_write(session_id, epoch)
     def publish_servo_position(self, command: dict[str, Any], session_id: str, epoch: int) -> dict[str, Any]: return self._controller.publish_servo_position(command, session_id, epoch)
+    def revoke_servo_targets(self, epoch: int, target_generation: int, reason: str) -> dict[str, Any]: return self._controller.revoke_servo_targets(epoch, target_generation, reason)
     def servo_transport_diagnostics(self) -> dict[str, Any]: return self._controller.servo_transport_diagnostics()
     def wait_for_servo_result(self, mailbox_revision: int, timeout_s: float) -> dict[str, Any]: return self._controller.wait_for_servo_result(mailbox_revision, timeout_s)
     def latch_osc_hold(self, reason: str) -> dict[str, Any]: return self._controller.latch_osc_hold(reason)
@@ -528,6 +529,9 @@ class OperationalSpaceController:
             self._log("cpv_position_timeout", diagnostics=detail)
             self._schedule_transport_reset(f"asynchronous CPV position timeout: {detail}")
         return cpv
+
+    def revoke_servo_targets(self, epoch: int, target_generation: int, reason: str) -> dict[str, Any]:
+        return self._transport_owner.revoke_cpv_before_generation(epoch, target_generation, reason)
 
     def wait_for_servo_result(self, mailbox_revision: int, timeout_s: float) -> dict[str, Any]:
         return self._transport_owner.wait_cpv_result(mailbox_revision, timeout_s)
@@ -973,6 +977,16 @@ class OperationalSpaceController:
         """Renew an OSC command session without exposing an input adapter."""
         self._osc.heartbeat(client_id, session_id)
         return {"ok": True, "state": self.osc_state()}
+
+    def osc_input_hold(self, reason: str = "PICO right Grip released") -> dict[str, Any]:
+        """Deadman HOLD for PICO input while keeping its OSC session active."""
+        session = self._osc.status().get("session") or {}
+        mode = str(session.get("execution_mode") or "shadow")
+        if mode == "hardware":
+            return self._osc.request_hardware_hold(reason)
+        if mode == "shadow":
+            return self._osc.request_shadow_hold(reason)
+        raise RuntimeError("PICO input HOLD requires an active OSC session")
 
     def osc_command(self, body: dict[str, Any]) -> dict[str, Any]:
         command_type = str(body.get("type", "")).strip().lower()

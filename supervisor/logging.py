@@ -1,10 +1,47 @@
 from __future__ import annotations
 
 import json
+import queue
+import threading
 from pathlib import Path
 from typing import Any, Iterable
 
 from shared.schemas import jsonable, now_iso
+
+
+class AsyncJsonlTraceLogger:
+    """Non-blocking trace writer used by the high-rate PICO input path."""
+
+    def __init__(self, path: Path | str, metadata: dict[str, Any] | None = None) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.touch(exist_ok=True)
+        self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=20000)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._writer, name="pico-trace-writer", daemon=True)
+        self._thread.start()
+        self.append({"record_type": "metadata", "timestamp": now_iso(), "metadata": metadata or {}})
+
+    def append(self, record: dict[str, Any]) -> None:
+        try:
+            self._queue.put_nowait(dict(record))
+        except queue.Full:
+            pass
+
+    def _writer(self) -> None:
+        with self.path.open("a", encoding="utf-8") as handle:
+            while not self._stop.is_set() or not self._queue.empty():
+                try:
+                    record = self._queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if record is not None:
+                    handle.write(json.dumps(jsonable(record), ensure_ascii=False) + "\n")
+                    handle.flush()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
 
 
 class JsonlExperimentLogger:

@@ -50,8 +50,16 @@ class InstanceLock:
             handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
             if not handle:
                 return False
-            ctypes.windll.kernel32.CloseHandle(handle)
-            return True
+            try:
+                # OpenProcess can still succeed for a process object that has
+                # already exited but has not yet been fully collected.  Such
+                # a PID must not keep a stale single-instance lock forever.
+                exit_code = wintypes.DWORD()
+                if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                return int(exit_code.value) == 259  # STILL_ACTIVE
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
         try:
             os.kill(pid, 0)
             return True

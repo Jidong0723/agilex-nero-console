@@ -58,6 +58,29 @@ def _python_process_rows() -> list[dict[str, object]]:
     return [row for row in rows if isinstance(row, dict)]
 
 
+def _owns_local_port(pid: int, port: int) -> bool:
+    """Return whether a process owns the local control HTTP port on Windows."""
+    if os.name != "nt" or pid <= 0:
+        return False
+    try:
+        output = subprocess.check_output(
+            ["netstat.exe", "-ano", "-p", "tcp"],
+            text=True, stderr=subprocess.DEVNULL, timeout=3.0,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    marker = f":{int(port)}"
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) >= 5 and fields[0].upper() == "TCP" and fields[1].endswith(marker) and fields[3].upper() == "LISTENING":
+            try:
+                if int(fields[-1]) == int(pid):
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
 def matching_python_pids(project_root: Path, script_name: str) -> list[int]:
     if os.name != "nt":
         return []
@@ -70,7 +93,17 @@ def matching_python_pids(project_root: Path, script_name: str) -> list[int]:
             continue
         command_line = str(row.get("CommandLine") or "").lower()
         module_text = script_text.replace(".py", "").replace("\\", ".")
-        if root_text not in command_line or (script_text not in command_line and module_text not in command_line):
+        # ``run_console.cmd`` launches the service through the public module
+        # entry point, so its command line contains neither this script name
+        # nor ``nero_control_server``.  It is nevertheless the same local
+        # service and must be removed during a reset; otherwise it retains the
+        # LAN HTTP/PICO ports while the fresh instance only owns localhost.
+        module_serve = (
+            script_text == "nero_control_server.py"
+            and "-m nero_console serve" in command_line
+            and _owns_local_port(int(row.get("ProcessId") or 0), 8765)
+        )
+        if (root_text not in command_line and not module_serve) or (script_text not in command_line and module_text not in command_line and not module_serve):
             continue
         if "nero_control_service_restart.py" in command_line:
             continue

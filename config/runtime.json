@@ -10,7 +10,11 @@
     "local_loopback": false,
     "receive_own_messages": false,
     "effector": "agx_gripper",
-    "task_tcp_offset_from_flange_m": [0.175, 0.0, -0.0235]
+    "task_tcp_offset_from_flange_m": [
+      0.175,
+      0.0,
+      -0.0235
+    ]
   },
   "motion": {
     "feedback_timeout_s": 3.0,
@@ -34,7 +38,7 @@
     "allow_electronic_emergency_stop": false,
     "min_tcp_z_m": -0.01,
     "min_gripper_width_m": 0.0,
-    "max_gripper_width_m": 0.10,
+    "max_gripper_width_m": 0.1,
     "max_gripper_force_n": 3.0
   },
   "logging": {
@@ -65,13 +69,44 @@
     "lan_host": ""
   },
   "pico_adapter": {
-    "mapping_verified": true,
+    "mapping_verified": false,
     "translation_gain": 1.0,
     "rotation_gain": 1.0,
-    "position_axis_map": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-    "orientation_axis_map": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+    "position_axis_map": [
+      [
+        0.0,
+        0.0,
+        1.0
+      ],
+      [
+        -1.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        1.0,
+        0.0
+      ]
+    ],
+    "orientation_axis_map": [
+      [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      [
+        0.0,
+        1.0,
+        0.0
+      ],
+      [
+        1.0,
+        0.0,
+        0.0
+      ]
+    ],
     "gripper_open_width_m": 0.095,
     "gripper_force_n": 1.0
   }
 }
-
