@@ -65,6 +65,8 @@
     picoMappingOverride: null,
     picoMappingBusy: false,
     picoMappingStatus: "",
+    picoRefreshBusy: false,
+    picoRefreshSequence: 0,
     oscAnchor: null,
     relativePose: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
     lastPoseTick: performance.now(),
@@ -948,7 +950,6 @@
       if (includeAuxiliary) {
         requests.push(
           api("/api/pi05/state", "GET", undefined, statusTimeout),
-          api("/api/adapters/pico/state", "GET", undefined, statusTimeout),
         );
       }
       const results = await Promise.allSettled(requests);
@@ -964,12 +965,9 @@
       }
       if (includeAuxiliary) {
         const pi05Result = results[1];
-        const picoResult = results[2];
         const pi05 = pi05Result?.status === "fulfilled" ? pi05Result.value : null;
-        const pico = picoResult?.status === "fulfilled" ? picoResult.value : null;
         const previousPi05At = Number(state.pi05?.updated_at || 0);
         if (pi05 && Number(pi05.updated_at || 0) >= previousPi05At) state.pi05 = pi05;
-        if (pico) state.pico = pico;
       }
       if (resetPending) {
         state.resetPendingUntil = 0;
@@ -984,6 +982,25 @@
       if (generation === state.requestGeneration) phase(`服务不可用：${error.message}`, true);
     } finally {
       state.refreshBusy = false;
+    }
+  }
+
+  async function refreshPicoState() {
+    // PICO input arrives at up to 90 Hz. Do not put this poll behind the
+    // 50 Hz OSC state request: that request owns refreshBusy and can starve
+    // every auxiliary PICO refresh indefinitely.
+    if (state.picoRefreshBusy) return;
+    state.picoRefreshBusy = true;
+    const sequence = ++state.picoRefreshSequence;
+    try {
+      const pico = await api("/api/adapters/pico/state", "GET", undefined, 1000);
+      if (sequence !== state.picoRefreshSequence) return;
+      state.pico = pico;
+      renderPico();
+    } catch (_) {
+      // Keep the last good PICO snapshot visible while a single poll fails.
+    } finally {
+      state.picoRefreshBusy = false;
     }
   }
 
@@ -1346,10 +1363,12 @@
   updateInputView();
   applyAdapterSelection();
   refresh();
+  void refreshPicoState();
   // OSC state is cached and published without an SDK read, so the console
   // can consume the same 50 Hz state cadence as the servo loop.
   setInterval(() => { void refresh(false); }, 20);
   setInterval(() => { void refresh(true); }, 500);
+  setInterval(() => { void refreshPicoState(); }, 100);
   setInterval(() => { void refreshPi05State(); }, 200);
   setInterval(() => { void refreshDatasetState(); }, 500);
   setInterval(refreshPi05Frames, 200);
