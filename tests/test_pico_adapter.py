@@ -1,8 +1,18 @@
 from __future__ import annotations
 
 import math
+import json
+import tempfile
+import threading
+from pathlib import Path
 
-from supervisor.pico_adapter import DEFAULT_FRAME_MAP, PicoInputAdapter
+from nero_console.application.adapter_runtime import AdapterRuntime
+from supervisor.pico_adapter import (
+    DEFAULT_FRAME_MAP,
+    RECOMMENDED_ORIENTATION_FRAME_MAP,
+    RECOMMENDED_POSITION_FRAME_MAP,
+    PicoInputAdapter,
+)
 
 
 class Broker:
@@ -49,6 +59,18 @@ def test_pico_release_loss_and_disconnect_hold():
     assert value.snapshot()["connected"] is False
 
 
+def test_pico_socket_loss_holds_but_preserves_pairing_for_safe_reconnect():
+    value, broker = adapter()
+    value.anchor_begin({"position_m": [1, 2, 3], "orientation_xyzw": [0, 0, 0, 1]})
+    value.connection_lost("gateway input timeout")
+    snapshot = value.snapshot()
+    assert broker.commands[-1]["type"] == "hold"
+    assert snapshot["state"] == "READY"
+    assert snapshot["connected"] is False
+    assert snapshot["paired"] is True
+    assert snapshot["anchor_active"] is False
+
+
 def test_pico_gripper_and_heartbeat_use_standard_osc_interface():
     value, broker = adapter()
     value.gripper(.25); value.heartbeat()
@@ -73,19 +95,19 @@ def test_repeated_disconnect_after_osc_session_end_is_idempotent():
 
 def test_pico_translation_gain_is_linear_and_runtime_configured():
     value, broker = adapter()
-    value.update_sensitivity("osc-1", "browser", 2.0, 1.0)
+    value.update_sensitivity("osc-1", "browser", 0.5, 1.0)
     value.anchor_begin({"position_m": [1, 2, 3], "orientation_xyzw": [0, 0, 0, 1]})
     value.pose({"position_m": [1.1, 2, 3], "orientation_xyzw": [0, 0, 0, 1], "tracking_valid": True})
-    assert math.isclose(broker.commands[-1]["payload"]["target_pose"]["position_m"][0], 0.3)
+    assert math.isclose(broker.commands[-1]["payload"]["target_pose"]["position_m"][0], 0.15)
 
 
 def test_pico_recommended_frame_map_keeps_simulated_axes_consistent():
     value, broker = adapter()
-    value.update_mapping("osc-1", "browser", DEFAULT_FRAME_MAP, DEFAULT_FRAME_MAP)
+    value.update_mapping("osc-1", "browser", RECOMMENDED_POSITION_FRAME_MAP, RECOMMENDED_ORIENTATION_FRAME_MAP)
     value.anchor_begin({"position_m": [1, 2, 3], "orientation_xyzw": [0, 0, 0, 1]})
-    for raw, expected_delta in [([1.1, 2.0, 3.0], [0.0, -0.1, 0.0]),
+    for raw, expected_delta in [([1.1, 2.0, 3.0], [-0.1, 0.0, 0.0]),
                                 ([1.0, 2.1, 3.0], [0.0, 0.0, 0.1]),
-                                ([1.0, 2.0, 3.1], [0.1, 0.0, 0.0])]:
+                                ([1.0, 2.0, 3.1], [0.0, -0.1, 0.0])]:
         value.pose({"position_m": raw, "orientation_xyzw": [0, 0, 0, 1], "tracking_valid": True})
         actual = broker.commands[-1]["payload"]["target_pose"]["position_m"]
         expected = [0.1 + expected_delta[0], 0.2 + expected_delta[1], 0.3 + expected_delta[2]]
@@ -109,9 +131,11 @@ def test_pico_frame_mapping_can_be_changed_only_when_not_anchored():
     identity = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
     changed = value.update_mapping("osc-1", "browser", identity, identity, True)
     assert changed["accepted"] is True
-    assert changed["mapping_verified"] is True
+    assert changed["mapping_verified"] is False
+    recommended = value.update_mapping("osc-1", "browser", RECOMMENDED_POSITION_FRAME_MAP, RECOMMENDED_ORIENTATION_FRAME_MAP)
+    assert recommended["mapping_verified"] is True
     value.anchor_begin({"position_m": [1, 2, 3], "orientation_xyzw": [0, 0, 0, 1]})
-    changed_while_tracking = value.update_mapping("osc-1", "browser", DEFAULT_FRAME_MAP, DEFAULT_FRAME_MAP)
+    changed_while_tracking = value.update_mapping("osc-1", "browser", RECOMMENDED_POSITION_FRAME_MAP, RECOMMENDED_ORIENTATION_FRAME_MAP)
     assert changed_while_tracking["accepted"] is True
     assert changed_while_tracking["applied_while_tracking"] is True
 
@@ -173,11 +197,26 @@ def test_pico_absolute_orientation_tracks_one_to_one_after_calibration():
     assert math.isclose(abs(orientation[3]), math.cos(angle / 2), abs_tol=1e-6)
 
 
-def test_pico_rotation_gain_is_fixed_to_one_for_absolute_tracking():
+def test_pico_rotation_gain_attenuates_relative_rotation_from_anchor():
+    value, broker = adapter()
+    assert value.update_sensitivity("osc-1", "browser", 1.0, 0.5)["accepted"] is True
+    value.anchor_begin({"position_m": [1, 2, 3], "orientation_xyzw": [0, 0, 0, 1]})
+    angle = math.radians(40)
+    value.pose({"position_m": [1, 2, 3], "orientation_xyzw": [0, 0, math.sin(angle / 2), math.cos(angle / 2)], "tracking_valid": True})
+    target = broker.commands[-1]["payload"]["target_pose"]["orientation_xyzw"]
+    assert math.isclose(abs(target[2]), math.sin(math.radians(20) / 2), abs_tol=1e-6)
+    assert math.isclose(abs(target[3]), math.cos(math.radians(20) / 2), abs_tol=1e-6)
+
+
+def test_pico_sensitivity_rejects_values_outside_attenuation_range():
     value, _ = adapter()
-    result = value.update_sensitivity("osc-1", "browser", 1.0, 2.0)
-    assert result["reason"] == "absolute_orientation_requires_unity_gain"
-    assert value.snapshot()["mapping"]["rotation_gain"] == 1.0
+    for translation, rotation in [(0.2, 1.0), (1.0, 0.2), (1.01, 1.0), (1.0, 1.01)]:
+        try:
+            value.update_sensitivity("osc-1", "browser", translation, rotation)
+        except ValueError as exc:
+            assert "25% 至 100%" in str(exc)
+        else:
+            raise AssertionError("out-of-range PICO gain was accepted")
 
 
 def test_pico_anchor_requires_measured_tcp_feedback():
@@ -244,23 +283,85 @@ def test_first_grip_and_following_movement_send_immediately():
 def test_pico_sensitivity_rejects_active_anchor_without_changing_values():
     value, _ = adapter()
     value.anchor_begin({"position_m": [1, 2, 3], "orientation_xyzw": [0, 0, 0, 1]})
-    result = value.update_sensitivity("osc-1", "browser", 1.5, 1.5)
+    result = value.update_sensitivity("osc-1", "browser", 0.5, 0.5)
     assert result["reason"] == "release_grip_first"
     assert value.snapshot()["mapping"]["translation_gain"] == 1.0
 
 
-def test_pico_hardware_gain_requires_confirmation_and_resets_on_new_session():
-    broker = Broker()
-    broker._state["session"]["execution_mode"] = "hardware"
-    value = PicoInputAdapter(broker, {})
-    value.begin_pairing("osc-1", "browser"); value.paired()
-    rejected = value.update_sensitivity("osc-1", "browser", 1.5, 1.0)
-    assert rejected["reason"] == "hardware_high_gain_confirmation_required"
-    accepted = value.update_sensitivity("osc-1", "browser", 1.5, 1.0, True)
-    assert accepted["accepted"] is True
-    value.disconnected("end")
-    value.begin_pairing("osc-1", "browser"); value.paired()
-    assert value.snapshot()["mapping"]["translation_gain"] == 1.0
+def test_pico_sensitivity_persists_both_default_gains():
+    class PicoStub:
+        def update_sensitivity(self, *args):
+            return {"ok": True, "accepted": True, "translation_gain": 0.5, "rotation_gain": 0.75}
+
+    with tempfile.TemporaryDirectory() as temporary_dir:
+        root = Path(temporary_dir)
+        runtime = object.__new__(AdapterRuntime)
+        runtime._lock = threading.RLock()
+        runtime._runtime_config_path = root / "runtime.json"
+        runtime._runtime_config = {"pico_adapter": {"translation_gain": 1.0, "rotation_gain": 1.0}}
+        runtime.pico = PicoStub()
+        result = runtime.pico_update_sensitivity({"session_id": "osc-1", "client_id": "browser", "translation_gain": 0.5, "rotation_gain": 0.75})
+        persisted = json.loads(runtime._runtime_config_path.read_text(encoding="utf-8-sig"))
+    assert result["accepted"] is True
+    assert persisted["pico_adapter"]["translation_gain"] == 0.5
+    assert persisted["pico_adapter"]["rotation_gain"] == 0.75
+
+
+def test_recommended_mapping_is_separate_from_the_runtime_mapping_and_is_exposed():
+    value = PicoInputAdapter(Broker(), {})
+    mapping = value.snapshot()["mapping"]
+    assert mapping["position_axis_map"] == RECOMMENDED_POSITION_FRAME_MAP
+    assert mapping["orientation_axis_map"] == RECOMMENDED_ORIENTATION_FRAME_MAP
+    assert mapping["recommended_position_axis_map"] == RECOMMENDED_POSITION_FRAME_MAP
+    assert mapping["recommended_orientation_axis_map"] == RECOMMENDED_ORIENTATION_FRAME_MAP
+    assert mapping["verified"] is True
+    assert mapping["persisted"] is False
+    assert mapping["source"] == "built_in_recommended"
+
+
+def test_mapping_persistence_marks_saved_custom_mapping_and_keeps_recommendation_fixed():
+    class PicoStub:
+        def __init__(self): self.persisted = False
+        def update_mapping(self, *_args):
+            return {"ok": True, "accepted": True, "mapping_verified": False,
+                    "position_axis_map": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                    "orientation_axis_map": [[0, 1, 0], [1, 0, 0], [0, 0, -1]]}
+        def mapping_persisted(self):
+            self.persisted = True
+            return {"persisted": True}
+
+    with tempfile.TemporaryDirectory() as temporary_dir:
+        root = Path(temporary_dir)
+        runtime = object.__new__(AdapterRuntime)
+        runtime._lock = threading.RLock()
+        runtime._runtime_config_path = root / "runtime.json"
+        runtime._runtime_config = {"pico_adapter": {"position_axis_map": RECOMMENDED_POSITION_FRAME_MAP,
+                                                      "orientation_axis_map": RECOMMENDED_ORIENTATION_FRAME_MAP}}
+        runtime.pico = PicoStub()
+        result = runtime.pico_update_mapping({"session_id": "osc-1", "client_id": "browser",
+                                              "position_axis_map": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                                              "orientation_axis_map": [[0, 1, 0], [1, 0, 0], [0, 0, -1]],
+                                              "mapping_verified": True})
+        persisted = json.loads(runtime._runtime_config_path.read_text(encoding="utf-8-sig"))
+    assert result["persisted"] is True
+    assert persisted["pico_adapter"]["mapping_verified"] is False
+    assert persisted["pico_adapter"]["position_axis_map"] == [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+    assert RECOMMENDED_POSITION_FRAME_MAP == [[-1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]
+
+
+def test_mapping_lifecycle_is_logged_without_per_frame_diagnostics():
+    class Trace:
+        def __init__(self): self.events = []
+        def append(self, event): self.events.append(event)
+
+    trace = Trace()
+    value = PicoInputAdapter(Broker(), {}, trace)
+    value.begin_pairing("osc-1", "browser")
+    value.update_mapping("osc-1", "browser", RECOMMENDED_POSITION_FRAME_MAP, RECOMMENDED_ORIENTATION_FRAME_MAP)
+    value.mapping_persisted()
+    assert [event["event"] for event in trace.events if event.get("record_type") == "event"] == [
+        "adapter_mapping_loaded", "adapter_pairing_started", "adapter_mapping_updated", "adapter_mapping_persisted",
+    ]
 
 
 def test_input_frame_edges_anchor_release_and_trigger_are_server_side():

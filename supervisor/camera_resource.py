@@ -53,14 +53,23 @@ class SharedCameraResource:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = copy.deepcopy(config); self.lock = threading.RLock(); self.cameras: CameraPair | None = None
         self.preview_stop = threading.Event(); self.preview_thread: threading.Thread | None = None
-        self.frames: dict[str, Any] = {}; self.frame_version = 0; self.last_error: str | None = None
+        self.frames: dict[str, Any] = {}; self.frame_times: dict[str, float] = {}; self.frame_version = 0; self.last_error: str | None = None
         self._devices: list[dict[str, Any]] | None = None
         self._devices_at = 0.0
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
+            now = time.monotonic()
+            sources = {
+                key: {
+                    "available": self.cameras is not None,
+                    "frame_available": key in self.frames,
+                    "last_frame_age_ms": round((now - self.frame_times[key]) * 1000, 1) if key in self.frame_times else None,
+                }
+                for key in ("external", "wrist")
+            }
             return {"ready": self.cameras is not None, "state": "READY" if self.cameras else ("ERROR" if self.last_error else "IDLE"),
-                    "config": copy.deepcopy(self.config), "frame_version": self.frame_version, "last_error": self.last_error}
+                    "config": copy.deepcopy(self.config), "sources": sources, "frame_version": self.frame_version, "last_error": self.last_error}
 
     @staticmethod
     def _windows_camera_devices() -> list[dict[str, Any]]:
@@ -159,7 +168,10 @@ class SharedCameraResource:
             try:
                 if self.cameras is None: return
                 external, wrist = self.cameras.read()
-                with self.lock: self.frames = {"external": external, "wrist": wrist}; self.frame_version += 1
+                with self.lock:
+                    self.frames = {"external": external, "wrist": wrist}
+                    self.frame_times = {"external": time.monotonic(), "wrist": time.monotonic()}
+                    self.frame_version += 1
                 self.preview_stop.wait(.1)
             except Exception as exc:
                 with self.lock: self.last_error = f"{type(exc).__name__}: {exc}"
@@ -170,7 +182,7 @@ class SharedCameraResource:
             self.preview_stop.set()
             if self.preview_thread and self.preview_thread is not threading.current_thread(): self.preview_thread.join(timeout=.5)
             if self.cameras: self.cameras.close()
-            self.cameras = CameraPair(self.config); self.frames = {}; self.frame_version = 0; self.last_error = None; self.preview_stop = threading.Event()
+            self.cameras = CameraPair(self.config); self.frames = {}; self.frame_times = {}; self.frame_version = 0; self.last_error = None; self.preview_stop = threading.Event()
             self.preview_thread = threading.Thread(target=self._preview_loop, name="nero-shared-camera-preview", daemon=True); self.preview_thread.start()
             return self.snapshot()
 
@@ -182,7 +194,7 @@ class SharedCameraResource:
         if preview and preview is not threading.current_thread(): preview.join(timeout=1.0)
         with self.lock:
             if self.cameras: self.cameras.close()
-            self.cameras = None; self.preview_thread = None; self.frames = {}; self.frame_version = 0; self.last_error = None
+            self.cameras = None; self.preview_thread = None; self.frames = {}; self.frame_times = {}; self.frame_version = 0; self.last_error = None
             return self.snapshot()
 
     def read(self) -> tuple[Any, Any]:

@@ -40,3 +40,8 @@ captures/
 *.pth
 *.onnx
 .peer_console_extract*/
+*.env
+*.env.*
+config/*.local.json
+*.7z
+*.zip

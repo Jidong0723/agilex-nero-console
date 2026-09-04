@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NERO Control Runtime</title>
-  <link rel="stylesheet" href="styles.css?v=osc-card-v2">
+  <link rel="stylesheet" href="styles.css?v=pico-layout-v9">
 </head>
 <body>
   <header class="topbar">
@@ -56,8 +56,6 @@
       </div>
     </section>
 
-    <details class="maintenance"><summary><span>维护区</span><small>仅用于控制服务恢复，不属于日常操作</small></summary><div><p>重置只重启控制服务，不发送运动、夹爪、CPV、零力或急停命令。</p><button id="reset-control" class="button" type="button">重置控制服务</button><span id="maintenance-result" class="result"></span></div></details>
-
     <section class="panel osc-card" aria-label="Operational Space Controller">
       <div class="osc-card-head"><div><p class="section-label">OPERATIONAL SPACE CONTROLLER</p><h2>操作空间控制器</h2></div></div>
       <div class="layer-strip" aria-label="OSC 控制层级">
@@ -68,7 +66,9 @@
       </div>
     </section>
     <p id="tcp-reference-readout" class="result">当前 TCP：-- · 参考 TCP：--</p>
+
+    <details class="maintenance"><summary><span>维护区</span><small>仅用于控制服务恢复，不属于日常操作</small></summary><div><p>重置只重启控制服务，不发送运动、夹爪、CPV、零力或急停命令。</p><button id="reset-control" class="button" type="button">重置控制服务</button><span id="maintenance-result" class="result"></span></div></details>
   </main>
-  <script src="app.js?v=pico-independent-status-poll-v4"></script>
+  <script src="app.js?v=pico-layout-v9"></script>
 </body>
 </html>

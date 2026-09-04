@@ -39,12 +39,10 @@ See [Windows deployment](docs/DEPLOYMENT_WINDOWS.md), [Architecture](docs/ARCHIT
 Clone the repository and open PowerShell in its root:
 
 ```powershell
-git clone <YOUR_REPOSITORY_URL>
+git clone https://github.com/Jidong0723/agilex-nero-console.git
 cd agilex-nero-console
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
 ```
-
-Replace `<YOUR_REPOSITORY_URL>` with the GitHub repository URL after publishing.
 
 If Python 3.12 is not registered with the `py` launcher:
 
@@ -71,6 +69,8 @@ Connect the CANDO adapter and NERO CAN cable, clear the workspace, then run:
 ```
 
 Open <http://127.0.0.1:8765/>. The service binds to localhost by default. Do not expose it directly to a public or untrusted network.
+
+The checked-in configuration uses no personal LAN address. The PICO pairing page discovers the workstation's current LAN address only while the local service is running; keep any machine-specific configuration outside the repository rather than committing it.
 
 The first teleoperation session remains Shadow by default. Review live feedback and limits before explicitly enabling hardware control in the page.
 

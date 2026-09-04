@@ -133,24 +133,31 @@ class AdapterRuntime:
         return self.pico.reset_anchor(str(body.get("session_id", "")), str(body.get("client_id", "")))
     def pico_begin_pairing(self, session_id: str, client_id: str) -> None: self.pico.begin_pairing(session_id, client_id)
     def pico_paired(self) -> None: self.pico.paired()
+    def pico_connection_lost(self, reason: str) -> None: self.pico.connection_lost(reason)
     def pico_disconnected(self, reason: str) -> None: self.pico.disconnected(reason)
+    def _persist_pico_config(self, updates: dict[str, Any]) -> None:
+        with self._lock:
+            self._runtime_config.setdefault("pico_adapter", {}).update(updates)
+            temporary = self._runtime_config_path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(self._runtime_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8-sig")
+            temporary.replace(self._runtime_config_path)
+
     def pico_update_sensitivity(self, body: dict[str, Any]) -> dict[str, Any]:
-        return self.pico.update_sensitivity(str(body.get("session_id", "")), str(body.get("client_id", "")),
-                                            body.get("translation_gain", 1.0), body.get("rotation_gain", 1.0),
-                                            bool(body.get("hardware_high_gain_confirmed", False)))
+        result = self.pico.update_sensitivity(str(body.get("session_id", "")), str(body.get("client_id", "")),
+                                              body.get("translation_gain", 1.0), body.get("rotation_gain", 1.0),
+                                              bool(body.get("hardware_high_gain_confirmed", False)))
+        if result.get("accepted"):
+            self._persist_pico_config({"translation_gain": result["translation_gain"], "rotation_gain": result["rotation_gain"]})
+        return result
     def pico_update_mapping(self, body: dict[str, Any]) -> dict[str, Any]:
         result = self.pico.update_mapping(str(body.get("session_id", "")), str(body.get("client_id", "")),
                                           body.get("position_axis_map"), body.get("orientation_axis_map"),
                                           bool(body.get("mapping_verified", False)))
         if result.get("accepted"):
-            with self._lock:
-                pico_config = self._runtime_config.setdefault("pico_adapter", {})
-                pico_config["position_axis_map"] = result["position_axis_map"]
-                pico_config["orientation_axis_map"] = result["orientation_axis_map"]
-                pico_config["mapping_verified"] = bool(result.get("mapping_verified", False))
-                temporary = self._runtime_config_path.with_suffix(".json.tmp")
-                temporary.write_text(json.dumps(self._runtime_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8-sig")
-                temporary.replace(self._runtime_config_path)
+            self._persist_pico_config({"position_axis_map": result["position_axis_map"],
+                                       "orientation_axis_map": result["orientation_axis_map"],
+                                       "mapping_verified": bool(result.get("mapping_verified", False))})
+            result.update(self.pico.mapping_persisted())
         return result
 
     def pico_message(self, kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:

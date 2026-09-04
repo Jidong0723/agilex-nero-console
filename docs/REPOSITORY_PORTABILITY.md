@@ -23,8 +23,8 @@ These paths are intentionally ignored by Git. Recreate the first two environment
 ## Bootstrap on a new computer
 
 ```powershell
-git clone <YOUR_REPOSITORY_URL>
-cd neroAgilex-pico-osc
+git clone https://github.com/Jidong0723/agilex-nero-console.git
+cd agilex-nero-console
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
 powershell -ExecutionPolicy Bypass -File .\setup-kinematics.ps1
 .\run_console.cmd

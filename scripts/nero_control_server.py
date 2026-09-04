@@ -835,8 +835,9 @@ class PicoGateway:
                 "trace_logging": {"enabled": True, "path": str(self.trace_logger.path.resolve()), "schema": "pico-trace.v1"},
                 "connection_state": (
                     "CONNECTED_CONTROL_UNAVAILABLE"
-                    if active and self._last_connection_stage == "control_unavailable"
-                    else "CONNECTED" if active else "DISCONNECTED"
+                    if self._connection_active and self._last_connection_stage == "control_unavailable"
+                    else "CONNECTED" if self._connection_active
+                    else "RECONNECTING" if active else "DISCONNECTED"
                 ),
                 "last_input_age_s": None if not self._last_input_monotonic else max(0.0, time.monotonic() - self._last_input_monotonic),
                 "error": self.error,
@@ -920,7 +921,10 @@ class PicoGateway:
                 requested_host, requested_path = self._request_endpoint(connection)
                 valid = bool(
                     pair
-                    and not pair.get("paired")
+                    # A dropped headset socket may reconnect with its still
+                    # valid pairing record.  A second *simultaneous* socket
+                    # is rejected so it cannot contend for robot control.
+                    and (not pair.get("paired") or not self._connection_active)
                     and time.monotonic() <= float(pair["expires_monotonic"])
                     and secrets.compare_digest(str(message.get("code", "")), str(pair["code"]))
                     and supplied_pairing == str(pair["pairing_id"])
@@ -1059,8 +1063,14 @@ class PicoGateway:
                 self._dispatch = None
                 if dispatcher is not None:
                     dispatcher.close()
-                # Keep PicoInputAdapter READY so the next socket can resume
-                # the same receiver pairing without a new code.
+                try:
+                    self.runtime.require_adapters().pico_connection_lost(
+                        self._last_connection_error or "PICO input connection closed")
+                except Exception:
+                    pass
+                # Keep the short-lived pairing record so a reconnecting
+                # headset can resume safely.  The adapter is explicitly put
+                # into HOLD/READY and no target is emitted here.
 
 
 class ControlRequestHandler(BaseHTTPRequestHandler):

@@ -29,7 +29,9 @@ class DatasetRecorderTests(unittest.TestCase):
     def test_completed_episode_writes_frames_without_robot_commands(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             recorder = DatasetRecorder(self.osc, self.cameras, self.pico, Path(folder), sample_hz=20)
-            recorder.start({"task": "test_task", "description": "test"})
+            state = recorder.start({"task": "test_task", "description": "test", "control_source": "pico"})
+            self.assertTrue(state["recording"])
+            self.assertEqual(state["control_source"], "pico")
             time.sleep(0.15)
             result = recorder.stop("completed")
             episode = Path(result["episode_dir"])
@@ -38,19 +40,47 @@ class DatasetRecorderTests(unittest.TestCase):
             self.assertTrue((episode / "frames.jsonl").read_text(encoding="utf-8").splitlines())
             self.assertTrue((episode / "images" / "front" / "000000.jpg").exists())
             self.assertTrue((episode / "images" / "wrist" / "000000.jpg").exists())
+            self.assertEqual(metadata["files"]["images"]["external"], "images/front")
+            self.assertEqual(metadata["files"]["images"]["wrist"], "images/wrist")
+            self.assertIn("UTF-8 JSON Lines", metadata["data_contents"]["frames"]["format"])
             self.assertEqual(self.commands, 0)
 
     def test_failed_episode_is_deleted_and_path_cannot_escape_root(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             recorder = DatasetRecorder(self.osc, self.cameras, self.pico, root, sample_hz=20)
-            recorder.start({"task": "test_task"})
+            recorder.start({"task": "test_task", "control_source": "pico"})
             time.sleep(0.08)
             episode = Path(recorder.state()["episode_dir"])
             recorder.stop("failed")
             self.assertFalse(episode.exists())
             with self.assertRaises(RuntimeError):
                 recorder._assert_episode_path(root.parent / "outside")
+
+    def test_web_episode_records_state_without_cameras(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            recorder = DatasetRecorder(self.osc, self.cameras, self.pico, Path(folder), sample_hz=20)
+            state = recorder.start({"task": "web_only", "control_source": "web"})
+            self.assertEqual(state["camera_sources"], {})
+            self.assertTrue(state["warnings"])
+            time.sleep(0.08)
+            result = recorder.stop("completed")
+            episode = Path(result["episode_dir"])
+            row = json.loads((episode / "frames.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(row["observation"]["images"], {})
+            self.assertEqual(row["control_source"], "web")
+            self.assertFalse((episode / "images").exists())
+
+    def test_missing_camera_frame_does_not_stop_episode(self) -> None:
+        self.cameras.frame_jpeg = lambda source: b"jpeg-external" if source == "external" else None
+        with tempfile.TemporaryDirectory() as folder:
+            recorder = DatasetRecorder(self.osc, self.cameras, self.pico, Path(folder), sample_hz=20)
+            recorder.start({"task": "partial", "control_source": "pi05"})
+            time.sleep(0.1)
+            result = recorder.stop("completed")
+            self.assertGreater(result["camera_sources"]["external"]["captured_frames"], 0)
+            self.assertGreater(result["camera_sources"]["wrist"]["dropped_frames"], 0)
+            self.assertGreater(result["dropped_frames"], 0)
 
 
 if __name__ == "__main__":

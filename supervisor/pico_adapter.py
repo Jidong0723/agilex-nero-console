@@ -45,7 +45,13 @@ def _map(matrix: list[list[float]], value: list[float], gain: float) -> list[flo
     return [gain * sum(float(row[index]) * value[index] for index in range(3)) for row in matrix]
 
 
-DEFAULT_FRAME_MAP = [[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+# Physical-arm verified PICO-to-NERO frame mappings.  Position and
+# orientation intentionally use separate matrices; they are not interchangeable
+# defaults even though both are orthonormal axis maps.
+RECOMMENDED_POSITION_FRAME_MAP = [[-1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]
+RECOMMENDED_ORIENTATION_FRAME_MAP = [[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]
+# Compatibility alias for callers that historically used the position map.
+DEFAULT_FRAME_MAP = RECOMMENDED_POSITION_FRAME_MAP
 
 
 def _frame_map(value: Any, name: str) -> tuple[tuple[float, ...], ...]:
@@ -95,6 +101,11 @@ def _quaternion_from_rotation_vector(vector: list[float]) -> list[float]:
         return _normalise([0.5 * vector[0], 0.5 * vector[1], 0.5 * vector[2], 1.0])
     scale = math.sin(angle / 2.0) / angle
     return _normalise([vector[0] * scale, vector[1] * scale, vector[2] * scale, math.cos(angle / 2.0)])
+
+
+def _attenuate_relative_rotation(relative: list[float], gain: float) -> list[float]:
+    """Scale the shortest rotation from the Grip anchor without changing it."""
+    return _quaternion_from_rotation_vector([gain * value for value in _rotation_vector(relative)])
 
 
 def _quaternion_to_matrix(q: list[float]) -> list[list[float]]:
@@ -147,27 +158,34 @@ class PicoInputAdapter:
     """Convert raw headset input to absolute base-frame OSC targets."""
 
     MIN_GAIN = 0.25
-    MAX_GAIN = 2.0
+    MAX_GAIN = 1.0
 
     def __init__(self, osc: Any, config: dict[str, Any], trace_logger: Any | None = None) -> None:
+        supplied_config = dict(config or {})
+        has_persisted_mapping = "position_axis_map" in supplied_config and "orientation_axis_map" in supplied_config
         defaults = {"mapping_verified": False, "translation_gain": 1.0, "rotation_gain": 1.0,
-                    "position_axis_map": DEFAULT_FRAME_MAP,
-                    "orientation_axis_map": DEFAULT_FRAME_MAP,
+                    "position_axis_map": RECOMMENDED_POSITION_FRAME_MAP,
+                    "orientation_axis_map": RECOMMENDED_ORIENTATION_FRAME_MAP,
                     "gripper_open_width_m": 0.095, "gripper_force_n": 1.0}
-        defaults.update(config or {})
+        defaults.update(supplied_config)
         self.osc, self.config = osc, defaults
         self.trace_logger = trace_logger
         # Cache immutable hot-path settings.  Runtime configuration is loaded
         # once when the adapter is created, so looking these up through the
         # config dictionary on every pose sample only adds avoidable work.
         self._translation_gain = float(defaults.get("translation_gain", 1.0))
-        self._rotation_gain = 1.0
-        self.config["rotation_gain"] = 1.0
+        self._rotation_gain = float(defaults.get("rotation_gain", 1.0))
+        if not self.MIN_GAIN <= self._translation_gain <= self.MAX_GAIN or not self.MIN_GAIN <= self._rotation_gain <= self.MAX_GAIN:
+            raise ValueError("PICO translation_gain and rotation_gain must be between 0.25 and 1.00")
         self._position_axis_map = _frame_map(defaults["position_axis_map"], "position_axis_map")
         self._orientation_axis_map = _frame_map(defaults["orientation_axis_map"], "orientation_axis_map")
+        self._recommended_position_axis_map = _frame_map(RECOMMENDED_POSITION_FRAME_MAP, "recommended_position_axis_map")
+        self._recommended_orientation_axis_map = _frame_map(RECOMMENDED_ORIENTATION_FRAME_MAP, "recommended_orientation_axis_map")
+        self._mapping_persisted = has_persisted_mapping
+        self._mapping_source = "runtime_config" if has_persisted_mapping else "built_in_recommended"
+        self.config["mapping_verified"] = self._mapping_is_recommended()
         self._gripper_open_width_m = float(defaults.get("gripper_open_width_m", 0.095))
         self._gripper_force_n = float(defaults.get("gripper_force_n", 1.0))
-        self._hardware_high_gain_confirmed = False
         self._execution_mode: str | None = None
         self.lock = threading.RLock()
         self.state: dict[str, Any] = self._empty_state()
@@ -190,6 +208,16 @@ class PicoInputAdapter:
         # one loss must request HOLD, but repeated invalid telemetry must not
         # repeatedly restart hardware braking.
         self._last_frame_tracking_valid = False
+        if self.trace_logger:
+            self.trace_logger.append({"record_type": "event", "event": "adapter_mapping_loaded",
+                                      "monotonic_ns": time.monotonic_ns(),
+                                      "source": self._mapping_source, "persisted": self._mapping_persisted,
+                                      "verified": self.config["mapping_verified"],
+                                      "position_axis_map": [list(row) for row in self._position_axis_map],
+                                      "orientation_axis_map": [list(row) for row in self._orientation_axis_map]})
+
+    def _mapping_is_recommended(self) -> bool:
+        return self._position_axis_map == self._recommended_position_axis_map and self._orientation_axis_map == self._recommended_orientation_axis_map
 
     def _empty_state(self) -> dict[str, Any]:
         return {"adapter": "pico", "state": "IDLE", "session_id": None,
@@ -232,19 +260,23 @@ class PicoInputAdapter:
             received_ns = self.state.get("input_received_monotonic_ns")
             result["input_pose_age_ms"] = None if not received_ns else max(0.0, (time.monotonic_ns() - int(received_ns)) / 1e6)
             result.pop("input_received_monotonic_ns", None)
-            result["mapping"] = {"translation_gain": self.config.get("translation_gain", 1.0),
-                                 "rotation_gain": 1.0,
+            result["mapping"] = {"translation_gain": self._translation_gain,
+                                 "rotation_gain": self._rotation_gain,
                                  "min_gain": self.MIN_GAIN, "max_gain": self.MAX_GAIN,
                                  "adjustable": not bool(self.state.get("anchor_active")),
-                                 "hardware_high_gain_confirmed": self._hardware_high_gain_confirmed,
                                  "execution_mode": self._execution_mode,
                                  "verified": bool(self.config.get("mapping_verified", False)),
+                                 "persisted": self._mapping_persisted,
+                                 "source": self._mapping_source,
                                  "position_axis_map": [list(row) for row in self._position_axis_map],
-                                 "orientation_axis_map": [list(row) for row in self._orientation_axis_map]}
+                                 "orientation_axis_map": [list(row) for row in self._orientation_axis_map],
+                                 "recommended_position_axis_map": [list(row) for row in self._recommended_position_axis_map],
+                                 "recommended_orientation_axis_map": [list(row) for row in self._recommended_orientation_axis_map]}
             return result
 
     def update_mapping(self, session_id: str, client_id: str, position_axis_map: Any,
                        orientation_axis_map: Any, verified: bool = False) -> dict[str, Any]:
+        del verified  # The server determines verification from the fixed physical-arm recommendation.
         position_map = _frame_map(position_axis_map, "position_axis_map")
         orientation_map = _frame_map(orientation_axis_map, "orientation_axis_map")
         with self.lock:
@@ -277,13 +309,37 @@ class PicoInputAdapter:
             self._orientation_axis_map = orientation_map
             self.config["position_axis_map"] = [list(row) for row in position_map]
             self.config["orientation_axis_map"] = [list(row) for row in orientation_map]
-            self.config["mapping_verified"] = bool(verified)
+            self.config["mapping_verified"] = self._mapping_is_recommended()
+            self._mapping_persisted = False
+            self._mapping_source = "runtime_memory"
             self.state.update({"updated_at": time.time(), "mapping_applied_while_tracking": was_tracking,
                                "last_error": None})
-            return {"ok": True, "accepted": True, "mapping_verified": bool(verified),
+            result = {"ok": True, "accepted": True, "mapping_verified": self.config["mapping_verified"],
+                    "persisted": False,
                     "applied_while_tracking": was_tracking,
                     "position_axis_map": [list(row) for row in position_map],
                     "orientation_axis_map": [list(row) for row in orientation_map]}
+            if self.trace_logger:
+                self.trace_logger.append({"record_type": "event", "event": "adapter_mapping_updated",
+                                          "monotonic_ns": time.monotonic_ns(), "verified": self.config["mapping_verified"],
+                                          "position_axis_map": result["position_axis_map"],
+                                          "orientation_axis_map": result["orientation_axis_map"]})
+            return result
+
+    def mapping_persisted(self) -> dict[str, Any]:
+        """Record that the current validated mapping was durably written."""
+        with self.lock:
+            self._mapping_persisted = True
+            self._mapping_source = "runtime_config"
+            result = {"persisted": True, "mapping_verified": bool(self.config["mapping_verified"]),
+                      "position_axis_map": [list(row) for row in self._position_axis_map],
+                      "orientation_axis_map": [list(row) for row in self._orientation_axis_map]}
+            if self.trace_logger:
+                self.trace_logger.append({"record_type": "event", "event": "adapter_mapping_persisted",
+                                          "monotonic_ns": time.monotonic_ns(), "verified": result["mapping_verified"],
+                                          "position_axis_map": result["position_axis_map"],
+                                          "orientation_axis_map": result["orientation_axis_map"]})
+            return result
 
     def begin_pairing(self, session_id: str, client_id: str) -> None:
         osc = self.osc.state(); session = osc.get("session") or {}
@@ -295,12 +351,6 @@ class PicoInputAdapter:
             self._last_frame_trigger = 0.0
             self._last_frame_tracking_valid = False
             self._execution_mode = str(session.get("execution_mode") or "shadow")
-            # High gain is deliberately session-local. A new hardware session
-            # always starts at the conservative 1:1 mapping.
-            if self._execution_mode == "hardware":
-                self._translation_gain = self._rotation_gain = 1.0
-                self.config["translation_gain"] = self.config["rotation_gain"] = 1.0
-                self._hardware_high_gain_confirmed = False
             self._anchor_controller = self._anchor_tcp = None
             self._absolute_position_offset = None
             self._orientation_correction = [0.0, 0.0, 0.0, 1.0]
@@ -329,7 +379,7 @@ class PicoInputAdapter:
         if not math.isfinite(translation) or not math.isfinite(rotation):
             raise ValueError("灵敏度必须是有限数字")
         if not self.MIN_GAIN <= translation <= self.MAX_GAIN or not self.MIN_GAIN <= rotation <= self.MAX_GAIN:
-            raise ValueError("灵敏度范围必须为 0.25 至 2.00")
+            raise ValueError("平移与旋转增益范围必须为 25% 至 100%")
         with self.lock:
             if session_id != self._session_id or client_id != self._client_id:
                 raise PermissionError("只有当前 PICO 会话所有者可以修改灵敏度")
@@ -337,17 +387,8 @@ class PicoInputAdapter:
                 return {"ok": False, "accepted": False, "recoverable": True,
                         "reason": "release_grip_first", "message": "请先松开 Grip 再调整灵敏度",
                         "adjustable": False}
-            if not math.isclose(rotation, 1.0, abs_tol=1e-9):
-                return {"ok": False, "accepted": False, "recoverable": True,
-                        "reason": "absolute_orientation_requires_unity_gain",
-                        "message": "绝对姿态跟踪固定为 1:1，旋转增益必须为 1.0", "adjustable": False}
-            if self._execution_mode == "hardware" and (translation > 1.0 or rotation > 1.0) and not hardware_high_gain_confirmed:
-                return {"ok": False, "accepted": False, "recoverable": True,
-                        "reason": "hardware_high_gain_confirmation_required",
-                        "message": "真机使用 100% 以上灵敏度需要确认", "adjustable": True}
             self._translation_gain, self._rotation_gain = translation, rotation
             self.config["translation_gain"], self.config["rotation_gain"] = translation, rotation
-            self._hardware_high_gain_confirmed = bool(hardware_high_gain_confirmed) if self._execution_mode == "hardware" else False
             self.state["updated_at"] = time.time()
             return {"ok": True, "accepted": True, "translation_gain": translation,
                     "rotation_gain": rotation, "adjustable": True}
@@ -361,6 +402,29 @@ class PicoInputAdapter:
                 self.trace_logger.append({"record_type": "event", "event": "adapter_paired",
                                           "monotonic_ns": time.monotonic_ns(), "session_id": self._session_id})
             self._pairing_stop.set()
+
+    def connection_lost(self, reason: str) -> None:
+        """Make socket loss visible and safe without discarding a valid pairing.
+
+        The gateway can reconnect a headset with the same short-lived pairing
+        record.  Keeping the adapter binding lets the first new Grip frame
+        resume the OSC session, but it must never retain an active anchor or
+        advertise a live PICO connection while no input socket exists.
+        """
+        try:
+            self.stop(reason)
+        except Exception as exc:
+            with self.lock:
+                self.state["last_error"] = f"{type(exc).__name__}: {exc}"
+        with self.lock:
+            self.state.update({"state": "READY" if self._session_id else "IDLE",
+                               "connected": False, "paired": bool(self._session_id),
+                               "anchor_active": False, "tracking_valid": False,
+                               "updated_at": time.time()})
+            if self.trace_logger:
+                self.trace_logger.append({"record_type": "event", "event": "adapter_connection_lost",
+                                          "monotonic_ns": time.monotonic_ns(), "reason": reason,
+                                          "session_id": self._session_id})
 
     def _pairing_heartbeat_loop(self) -> None:
         while not self._pairing_stop.wait(1.0):
@@ -675,12 +739,16 @@ class PicoInputAdapter:
                 "position_m": list(self._anchor_tcp["position_m"]),
                 "orientation_xyzw": list(self._anchor_tcp["orientation_xyzw"]),
             }
-            anchor_controller_position = list(self._anchor_controller["position_m"])
+        anchor_controller_position = list(self._anchor_controller["position_m"])
+        anchor_controller_orientation = list(self._anchor_controller["orientation_xyzw"])
         # Preserve the original relative position mapping: the configured
         # matrix maps PICO tracking coordinates directly into the robot frame.
         mapped_position = _map(self._position_axis_map, position, self._translation_gain)
         orientation_correction = list(self._orientation_correction)
-        mapped_q = _normalise(_multiply(orientation_correction, mapped_orientation))
+        mapped_anchor_orientation = _map_absolute_orientation(self._orientation_axis_map, anchor_controller_orientation)
+        relative_orientation = _normalise(_multiply(_inverse(mapped_anchor_orientation), mapped_orientation))
+        attenuated_orientation = _attenuate_relative_rotation(relative_orientation, self._rotation_gain)
+        mapped_q = _normalise(_multiply(orientation_correction, _multiply(mapped_anchor_orientation, attenuated_orientation)))
         target = {"position_m": [self._absolute_position_offset[index] + mapped_position[index] for index in range(3)],
                   "orientation_xyzw": mapped_q}
         with self.lock:
