@@ -2,7 +2,7 @@
   "schema_version": "nero.pi05-adapter.v1",
   "cameras": {
     "external": {"index": 0, "width": 640, "height": 480},
-    "wrist": {"index": 1, "width": 640, "height": 480},
+    "wrist": {"index": 2, "width": 640, "height": 480},
     "model_width": 224,
     "model_height": 224
   },
