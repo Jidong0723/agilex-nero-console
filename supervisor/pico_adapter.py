@@ -259,6 +259,7 @@ class PicoInputAdapter:
                 result["last_target_age_ms"] = None
             received_ns = self.state.get("input_received_monotonic_ns")
             result["input_pose_age_ms"] = None if not received_ns else max(0.0, (time.monotonic_ns() - int(received_ns)) / 1e6)
+            result["diagnostics"] = {"input_received_monotonic_ns": received_ns}
             result.pop("input_received_monotonic_ns", None)
             result["mapping"] = {"translation_gain": self._translation_gain,
                                  "rotation_gain": self._rotation_gain,

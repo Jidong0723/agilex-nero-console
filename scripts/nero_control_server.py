@@ -172,7 +172,7 @@ class BackendProcessProxy:
             if response.get("kind") == "result" and response.get("id") == request_id:
                 return response.get("result")
             error_type = str(response.get("error_type", "RuntimeError"))
-            message = str(response.get("error", "backend request failed"))
+            message = str(response.get("error") or f"backend request failed: {response!r}")
             if error_type == "PermissionError":
                 raise PermissionError(message)
             if error_type == "LeaseError":
@@ -1096,6 +1096,8 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/broker/status":
                 return self._json_ok(self.broker.broker_status())
             if parsed.path == "/api/osc/state":
+                return self._json_ok(self.broker.osc_state())
+            if parsed.path == "/api/osc/fast-state":
                 return self._json_ok(self.broker.osc_state())
             if parsed.path == "/api/osc/kinematics":
                 return self._json_ok(self.broker.osc_kinematics())

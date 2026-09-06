@@ -2,9 +2,12 @@ from __future__ import annotations
 import ctypes
 import json
 import math
+import os
 import queue
+import shutil
 import subprocess
 import threading
+import tempfile
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -252,6 +255,11 @@ class KinematicsClient:
         self.python = python if python.is_absolute() else project_root / python
         self.script = project_root / str(solver.get("script", "motion/osc_kinematics_server.py"))
         self.urdf = project_root / str(solver.get("urdf", "vendor/nero_description/nero_description.urdf"))
+        # Pinocchio's native URDF parser cannot open paths containing the
+        # Chinese workspace name on this Windows installation.  Keep the
+        # project copy authoritative, but pass an ASCII temporary copy to the
+        # native parser.
+        self._solver_urdf: Path | None = None
         self.offset = config.get("tcp", {}).get("offset_from_link7_m", [0.175, 0.0, -0.0235])
         self.period_s = float(solver.get("dt_s", 0.02))
         self.startup_timeout_s = float(solver.get("startup_timeout_s", 12.0))
@@ -291,8 +299,10 @@ class KinematicsClient:
         self.discard_before_epoch(0)
         if not self.python.is_file() or not self.script.is_file() or not self.urdf.is_file():
             raise KinematicsUnavailable("Pinocchio/Pink solver executable, script, or URDF is missing")
+        self._solver_urdf = Path(tempfile.gettempdir()) / f"nero_console_osc_{os.getpid()}.urdf"
+        shutil.copyfile(self.urdf, self._solver_urdf)
         self.process = subprocess.Popen(
-            [str(self.python), "-u", str(self.script), "--urdf", str(self.urdf), "--tcp-offset", ",".join(map(str, self.offset)), "--period-s", str(self.period_s)],
+            [str(self.python), "-u", str(self.script), "--urdf", str(self._solver_urdf), "--tcp-offset", ",".join(map(str, self.offset)), "--period-s", str(self.period_s)],
             cwd=str(self.root), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", bufsize=1, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -329,6 +339,12 @@ class KinematicsClient:
                 pass
         if process and process.poll() is None:
             process.terminate()
+        if self._solver_urdf is not None:
+            try:
+                self._solver_urdf.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._solver_urdf = None
             try:
                 process.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
@@ -1558,6 +1574,21 @@ class _OperationalSpaceServo:
             debug = debug_fn() if callable(debug_fn) else {}
             return {"state_sequence": self.state_sequence, "session": self._session_view(), "command": dict(self.command) if self.command else None, "target_generation": self.target_generation, "last_error": self.last_error, "last_result": dict(self.last_result), "last_output": dict(self.last_output), "execution_sample": dict(self.execution_sample) if self.execution_sample else None, "arrival": {"reached": self._arrival_reached, "stable_since_monotonic_ns": self._arrival_since_monotonic_ns or None, "target_generation": self.target_generation}, "solver": {"running": bool(self.solver.process and self.solver.process.poll() is None), "python": str(self.solver.python), "tcp_verified": True, "debug": debug}, "workspace": {"min_xyz_m": list(self.limits.get("workspace_min_m", [-0.45, -0.15, -0.02])), "max_xyz_m": list(self.limits.get("workspace_max_m", [0.45, 0.60, 0.70])), "min_tcp_z_m": float(self.limits.get("min_tcp_z_m", -0.02))}, "diagnostics": {"trajectory_state": self.trajectory_state, "trajectory_brake_reason": self.trajectory_brake_reason, "motion_epoch": self.motion_epoch, "needs_resync": self.needs_resync, "last_sent_velocity_rad_s": list(self.last_sent_velocity), "trajectory": dict(self.trajectory) if self.trajectory else None, "state_estimator": dict(self._estimator_snapshot), "shadow_transport": self.shadow_plant.diagnostics() if self.shadow_plant else {"enabled": False}, "cpv_parameters": dict(self._cpv_parameters), "limit_authority": dict(self.authority.effective) if self.authority.effective else None, "supervisor": dict(self.supervisor.limit_data) if self.supervisor.limit_data else None, "timing": dict(self._timing), "cycle_trace": self._trace_public(), "loop_count": self.loop_count, "output_count": self.output_count, "cpv_dispatch_count": self.cpv_send_count, "recent_cpv_batches": list(self._batch_history)[-10:]}}
 
+    def fast_status(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "state_sequence": self.state_sequence,
+                "session": self._session_view(),
+                "target_generation": self.target_generation,
+                "target_pose": dict(self._target_pose) if self._target_pose else None,
+                "last_result": dict(self.last_result),
+                "last_output": dict(self.last_output),
+                "execution_sample": dict(self.execution_sample) if self.execution_sample else None,
+                "diagnostics": {"trajectory_state": self.trajectory_state, "motion_epoch": self.motion_epoch,
+                                "timing": dict(self._timing), "loop_count": self.loop_count,
+                                "output_count": self.output_count},
+            }
+
     def _public_target_pose(self) -> dict[str, list[float]] | None:
         with self.lock:
             return dict(self._target_pose) if self._target_pose else None
@@ -2124,6 +2155,7 @@ class OscRuntime:
         return self._receiver.wait_for_revision_after(revision, timeout_s)
 
     def status(self) -> dict[str, Any]: return self._servo.status()
+    def fast_status(self) -> dict[str, Any]: return self._servo.fast_status()
     def target_pose(self) -> dict[str, list[float]] | None: return self._servo._public_target_pose()
     def accepting_targets(self) -> bool: return self._servo._is_accepting_targets()
     def kinematics(self) -> dict[str, Any]: return self._servo.kinematics()

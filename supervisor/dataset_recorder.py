@@ -1,296 +1,153 @@
-"""Best-effort, read-only recorder for teleoperation demonstration episodes."""
+"""Timestamp-aligned, hardware-truth demonstration recorder."""
 from __future__ import annotations
-
-import copy
-import json
-import shutil
-import threading
-import time
-from datetime import datetime, timezone
+import copy, json, shutil, threading, time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-
-def _utc() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
+def _utc() -> str: return datetime.now(timezone.utc).isoformat()
 
 def _finite_list(value: Any, length: int | None = None) -> list[float] | None:
-    if not isinstance(value, (list, tuple)) or (length is not None and len(value) != length):
-        return None
+    if not isinstance(value, (list, tuple)) or (length is not None and len(value) != length): return None
     try:
-        return [float(item) for item in value]
-    except (TypeError, ValueError):
-        return None
+        values = [float(x) for x in value]
+        return values if all(x == x and abs(x) != float("inf") for x in values) else None
+    except (TypeError, ValueError): return None
 
+def _number(value: Any) -> float | None:
+    try:
+        value = float(value); return value if value == value and abs(value) != float("inf") else None
+    except (TypeError, ValueError): return None
 
 class DatasetRecorder:
-    """Threaded recorder. It never opens cameras or sends robot commands."""
-
+    """Record synchronized frames. It never opens cameras or sends commands."""
     _CAMERAS = {"external": ("front", "外部 RGB"), "wrist": ("wrist", "腕部 RGB")}
+    _MAX_GAP_NS = 100_000_000
 
     def __init__(self, osc: Any, cameras: Any, pico: Any, dataset_root: Path, sample_hz: float = 20.0) -> None:
-        self.osc = osc
-        self.cameras = cameras
-        self.pico = pico
-        self.root = Path(dataset_root)
-        self.sample_hz = max(1.0, float(sample_hz))
-        self.sample_period = 1.0 / self.sample_hz
-        self.lock = threading.RLock()
-        self.active: dict[str, Any] | None = None
-        self.last_episode: dict[str, Any] | None = None
-        self.stop_event = threading.Event()
-        self.thread: threading.Thread | None = None
+        self.osc, self.cameras, self.pico = osc, cameras, pico; self.root = Path(dataset_root)
+        self.sample_hz, self.sample_period = 20.0, 0.05; self.lock = threading.RLock()
+        self.active: dict[str, Any] | None = None; self.last_episode = None; self.stop_event = threading.Event(); self.thread = None
 
     def _ensure_root(self) -> None:
         (self.root / "episodes").mkdir(parents=True, exist_ok=True)
         readme = self.root / "README.md"
-        if not readme.exists():
-            readme.write_text(
-                "# NERO demonstration dataset\n\n"
-                "Each episode contains `metadata.json`, `frames.jsonl`, and JPEG image directories when camera frames are available.\n"
-                "The JSONL schema is intentionally close to LeRobot and can be converted after validation.\n",
-                encoding="utf-8",
-            )
+        if not readme.exists(): readme.write_text("# NERO demonstration dataset\n\nNew episodes use synchronized nero-demonstration.v2 frames; legacy v1 remains readable.\n", encoding="utf-8")
 
     def _next_episode_index(self) -> int:
-        indexes: list[int] = []
-        for item in (self.root / "episodes").glob("episode_*"):
-            try:
-                indexes.append(int(item.name.split("_")[-1]))
-            except ValueError:
-                pass
-        return max(indexes, default=0) + 1
+        values = []
+        for path in (self.root / "episodes").glob("episode_*"):
+            try: values.append(int(path.name.split("_")[-1]))
+            except ValueError: pass
+        return max(values, default=0) + 1
 
-    def _assert_episode_path(self, episode_dir: Path) -> Path:
-        root = (self.root / "episodes").resolve()
-        target = episode_dir.resolve()
-        if root not in target.parents:
-            raise RuntimeError("refusing to delete an episode outside the dataset root")
+    def _assert_episode_path(self, path: Path) -> Path:
+        root, target = (self.root / "episodes").resolve(), path.resolve()
+        if root not in target.parents: raise RuntimeError("refusing to delete outside dataset root")
         return target
 
     @staticmethod
-    def _control_source(value: Any) -> str:
+    def _source(value: Any) -> tuple[str, str]:
         source = str(value or "web").strip().lower()
-        return source if source in {"web", "pi05", "pico"} else "web"
+        return {"pico": ("teleoperation", "pico_4_ultra"), "web": ("teleoperation", "web_joystick"), "pi05": ("policy", "pi05"), "spacemouse": ("teleoperation", "spacemouse"), "keyboard": ("teleoperation", "keyboard")}.get(source, ("teleoperation", source or "unknown"))
 
-    def _camera_sources(self, camera_state: dict[str, Any], control_source: str) -> dict[str, dict[str, Any]]:
-        # Web control has no camera selector. PICO and pi0.5 share the
-        # resource configured by their own panels; recording only snapshots it.
-        if control_source not in {"pi05", "pico"}:
-            return {}
-        config = camera_state.get("config") if isinstance(camera_state.get("config"), dict) else {}
-        reported = camera_state.get("sources") if isinstance(camera_state.get("sources"), dict) else {}
-        result: dict[str, dict[str, Any]] = {}
+    def _camera_sources(self, state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        config, reported = state.get("config") or {}, state.get("sources") or {}; result = {}
         for source, (folder, label) in self._CAMERAS.items():
-            item = config.get(source) if isinstance(config.get(source), dict) else {}
-            status = reported.get(source) if isinstance(reported.get(source), dict) else {}
-            result[source] = {
-                "source": source, "folder": folder, "label": label,
-                "index": item.get("index"), "width": item.get("width"), "height": item.get("height"),
-                "available": bool(status.get("available", camera_state.get("ready", False))),
-                "frame_available": bool(status.get("frame_available", camera_state.get("ready", False))),
-                "last_frame_age_ms": status.get("last_frame_age_ms"),
-                "captured_frames": 0, "dropped_frames": 0, "bytes_written": 0,
-                "last_frame_at": None,
-            }
+            item, status = config.get(source) or {}, reported.get(source) or {}
+            result[source] = {"source": source, "folder": folder, "label": label, "index": item.get("index"), "width": item.get("width"), "height": item.get("height"), "available": bool(status.get("available")), "frame_available": bool(status.get("frame_available")), "captured_frames": 0, "dropped_frames": 0, "bytes_written": 0}
         return result
 
-    @staticmethod
-    def _contents(camera_sources: dict[str, dict[str, Any]]) -> dict[str, Any]:
-        images = [{"source": value["source"], "label": value["label"], "format": "JPEG",
-                   "directory": f"images/{value['folder']}", "available": value["available"]}
-                  for value in camera_sources.values()]
-        return {
-            "metadata": {"path": "metadata.json", "format": "UTF-8 JSON"},
-            "frames": {"path": "frames.jsonl", "format": "UTF-8 JSON Lines, one 20 Hz sample per line"},
-            "timestamps": "ISO 8601 timestamp plus episode_index and frame_index",
-            "observation": "7 joint positions (rad), TCP pose, gripper width (m); unavailable values are null",
-            "action": "joint target (rad), TCP target and gripper width (m)",
-            "execution": "execution mode and selected control source",
-            "pico_input": "position (m), quaternion (xyzw), Grip and Trigger; null when unavailable",
-            "images": images,
-        }
-
     def _public(self, active: dict[str, Any], recording: bool) -> dict[str, Any]:
-        result = {key: copy.deepcopy(value) for key, value in active.items() if not key.startswith("_")}
-        elapsed = max(0.0, time.monotonic() - float(active.get("_started_monotonic", time.monotonic()))) if recording else float(result.get("duration_s", 0.0))
-        if recording:
-            now = datetime.now(timezone.utc)
-            for source in result.get("camera_sources", {}).values():
-                stamp = source.get("last_frame_at")
-                if stamp:
-                    try:
-                        source["last_frame_age_ms"] = round(max(0.0, (now - datetime.fromisoformat(stamp)).total_seconds()) * 1000, 1)
-                    except (TypeError, ValueError):
-                        pass
-        result["recording"] = recording
-        result["duration_s"] = round(elapsed, 3)
-        result["effective_hz"] = round(float(result.get("frame_count", 0)) / elapsed, 3) if elapsed else 0.0
-        result["sample_hz"] = self.sample_hz
+        result = {k: copy.deepcopy(v) for k, v in active.items() if not k.startswith("_")}; elapsed = max(0.0, time.monotonic() - active["_started_monotonic"]) if recording else float(result.get("duration_s", 0.0))
+        result.update(recording=recording, duration_s=round(elapsed, 3), sample_hz=self.sample_hz, effective_hz=round(result.get("frame_count", 0) / elapsed, 3) if elapsed else 0.0)
         return result
 
     def state(self) -> dict[str, Any]:
-        with self.lock:
-            if self.active:
-                return self._public(self.active, True)
-            return {"recording": False, "dataset_root": str(self.root), "last_episode": copy.deepcopy(self.last_episode)}
+        with self.lock: return self._public(self.active, True) if self.active else {"recording": False, "dataset_root": str(self.root), "last_episode": copy.deepcopy(self.last_episode)}
 
     def start(self, body: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
-            if self.active:
-                raise RuntimeError("已有 Episode 正在采集")
-            task = str(body.get("task", "")).strip()
-            description = str(body.get("description", "")).strip()
-            if not task:
-                raise ValueError("任务名称不能为空")
-            control_source = self._control_source(body.get("control_source"))
-            camera_state = self.cameras.snapshot() or {}
-            camera_sources = self._camera_sources(camera_state, control_source)
-            self._ensure_root()
-            index = self._next_episode_index()
-            episode_dir = self.root / "episodes" / f"episode_{index:06d}"
-            episode_dir.mkdir(parents=True)
-            metadata = {
-                "schema": "nero-demonstration.v1", "episode_index": index, "task": task,
-                "description": description, "status": "recording", "started_at": _utc(),
-                "sample_hz": self.sample_hz, "control_source": control_source,
-                "camera_snapshot": copy.deepcopy(camera_sources), "data_contents": self._contents(camera_sources),
-                "files": {"frames": "frames.jsonl", "images": {}},
-            }
-            (episode_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            frames = (episode_dir / "frames.jsonl").open("w", encoding="utf-8")
-            warnings = []
-            if not camera_sources:
-                warnings.append("当前控制源未选择相机；本 Episode 仅记录状态、动作和控制输入。")
-            else:
-                unavailable = [value["label"] for value in camera_sources.values() if not value["available"]]
-                if unavailable:
-                    warnings.append(f"相机当前不可用：{'、'.join(unavailable)}；其余数据仍会记录。")
-            self.active = {
-                "episode_index": index, "episode_dir": str(episode_dir), "task": task, "description": description,
-                "status": "recording", "started_at": metadata["started_at"], "control_source": control_source,
-                "execution_mode": None, "frame_count": 0, "dropped_frames": 0, "bytes_written": 0,
-                "sample_errors": 0, "last_error": None, "warnings": warnings, "camera_sources": camera_sources,
-                "data_contents": metadata["data_contents"], "_frames": frames, "_metadata": metadata,
-                "_started_monotonic": time.monotonic(),
-            }
-            self.stop_event = threading.Event()
-            self.thread = threading.Thread(target=self._loop, name=f"nero-dataset-episode-{index:06d}", daemon=True)
-            self.thread.start()
-            return self._public(self.active, True)
+            if self.active: raise RuntimeError("已有 Episode 正在采集")
+            task, description = str(body.get("task", "")).strip(), str(body.get("description", "")).strip()
+            if not task: raise ValueError("任务名称不能为空")
+            category, device = self._source(body.get("control_source")); cameras = self._camera_sources(self.cameras.snapshot() or {})
+            self._ensure_root(); index = self._next_episode_index(); directory = self.root / "episodes" / f"episode_{index:06d}"; directory.mkdir(parents=True)
+            metadata = {"schema": "nero-demonstration.v2", "episode_index": index, "task": task, "description": description, "status": "recording", "started_at": _utc(), "sample_hz": self.sample_hz, "control_source": category, "operator_device": device, "alignment": {"clock": "monotonic_ns", "state": "interpolation_or_nearest", "image": "nearest", "max_gap_ms": 100}, "camera_snapshot": copy.deepcopy(cameras), "files": {"frames": "frames.jsonl", "images": {}}, "data_contents": {"observation": "measured hardware state only", "action": "actually accepted target command", "diagnostics": "per-source monotonic timestamps"}}
+            (directory / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            self.active = {"episode_index": index, "episode_dir": str(directory), "task": task, "description": description, "status": "recording", "started_at": metadata["started_at"], "control_source": category, "operator_device": device, "execution_mode": None, "frame_count": 0, "dropped_frames": 0, "sample_errors": 0, "last_error": None, "camera_sources": cameras, "data_contents": metadata["data_contents"], "_metadata": metadata, "_frames": (directory / "frames.jsonl").open("w", encoding="utf-8"), "_started_monotonic": time.monotonic(), "_started_ns": time.monotonic_ns(), "_started_utc": datetime.now(timezone.utc), "_states": [], "_actions": []}
+            self.stop_event = threading.Event(); self.thread = threading.Thread(target=self._loop, daemon=True); self.thread.start(); return self._public(self.active, True)
 
-    def _sample(self, frame_index: int) -> dict[str, Any]:
-        osc = self.osc.state() or {}
-        execution, transport = osc.get("execution") or {}, osc.get("transport") or {}
-        feedback = transport.get("hardware_feedback") or {}
-        joints = (_finite_list(feedback.get("joint_angles_rad"), 7) or _finite_list(execution.get("measured_joint_state_rad"), 7)
-                  or _finite_list(execution.get("observed_joint_state_rad"), 7) or _finite_list(execution.get("commanded_joint_state_rad"), 7))
-        gripper = (osc.get("gripper") or {}).get("width_m")
-        command, pico = osc.get("command") or {}, (self.pico.snapshot() if self.pico is not None else {})
-        target_tcp = command.get("target_tcp") or pico.get("last_target_pose")
-        target_joints = _finite_list(command.get("final_joint_target_rad"), 7)
-        with self.lock:
-            active = self.active
-            if not active:
-                return {"frame_index": frame_index, "timestamp": _utc(), "error": "recorder stopped"}
-            sources = copy.deepcopy(active["camera_sources"])
-            episode_dir = Path(active["episode_dir"])
-        paths: dict[str, str | None] = {}
-        for source, details in sources.items():
-            payload = self.cameras.frame_jpeg(source)
-            folder = str(details["folder"])
-            if payload:
-                relative = f"images/{folder}/{frame_index:06d}.jpg"
-                path = episode_dir / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(payload)
-                paths[source] = relative
-                with self.lock:
-                    if self.active:
-                        stats = self.active["camera_sources"][source]
-                        stats["captured_frames"] += 1; stats["bytes_written"] += len(payload); stats["last_frame_at"] = _utc()
-                        self.active["bytes_written"] += len(payload)
-                        self.active["_metadata"]["files"]["images"][source] = f"images/{folder}"
-            else:
-                paths[source] = None
-                with self.lock:
-                    if self.active:
-                        self.active["dropped_frames"] += 1
-                        self.active["camera_sources"][source]["dropped_frames"] += 1
-        execution_mode = (osc.get("session") or {}).get("execution_mode")
-        with self.lock:
-            if self.active:
-                self.active["execution_mode"] = execution_mode
-                for details in self.active["camera_sources"].values():
-                    if details.get("last_frame_at"):
-                        details["last_frame_age_ms"] = 0.0
-        return {
-            "episode_index": active["episode_index"], "frame_index": frame_index, "timestamp": _utc(),
-            "observation": {"images": paths, "state": {"joint_positions_rad": joints, "gripper_width_m": gripper,
-                            "tcp_pose": feedback.get("tcp_pose") or execution.get("measured_tcp_pose")}},
-            "action": {"joint_target_rad": target_joints, "tcp_target": target_tcp, "gripper_width_m": gripper},
-            "input": {"pico_position_m": pico.get("input_position_m"), "pico_orientation_xyzw": pico.get("input_orientation_xyzw"),
-                      "grip": pico.get("input_clutch"), "trigger": pico.get("input_trigger_value")},
-            "execution_mode": execution_mode, "control_source": active["control_source"],
-        }
+    @classmethod
+    def _nearest_or_interp(cls, samples: list[tuple[int, list[float]]], target: int) -> tuple[list[float] | None, int | None]:
+        if not samples: return None, None
+        before = [x for x in samples if x[0] <= target]; after = [x for x in samples if x[0] >= target]
+        if before and after:
+            a, b = before[-1], after[0]
+            if target - a[0] > cls._MAX_GAP_NS or b[0] - target > cls._MAX_GAP_NS: return None, None
+            if a[0] == b[0]: return list(a[1]), a[0]
+            ratio = (target - a[0]) / (b[0] - a[0]); return [x + (y - x) * ratio for x, y in zip(a[1], b[1])], target
+        nearest = min(samples, key=lambda x: abs(x[0] - target)); return (list(nearest[1]), nearest[0]) if abs(nearest[0] - target) <= cls._MAX_GAP_NS else (None, None)
+
+    def _sample(self, timeline_index: int) -> dict[str, Any] | None:
+        active, target = self.active, self.active["_started_ns"] + int(timeline_index * 50_000_000); osc = self.osc.state() or {}; pico = self.pico.snapshot() if self.pico is not None else {}; now = time.monotonic_ns()
+        execution, transport = osc.get("execution") or {}, osc.get("transport") or {}; feedback = transport.get("hardware_feedback") or {}; joints = _finite_list(feedback.get("joint_angles_rad"), 7)
+        if joints is None: return None
+        state_ns_raw = feedback.get("received_monotonic_ns") or (transport.get("feedback_mailbox") or {}).get("received_monotonic_ns") or (osc.get("diagnostics") or {}).get("timing", {}).get("feedback_received_monotonic_ns")
+        if state_ns_raw is None: return None
+        state_ns = int(state_ns_raw); active["_states"].append((state_ns, joints)); del active["_states"][:-20]
+        measured, measured_ns = self._nearest_or_interp(active["_states"], target)
+        command, diagnostics = osc.get("command") or {}, osc.get("diagnostics") or {}; targets = _finite_list(command.get("final_joint_target_rad"), 7)
+        sent_ns_raw = (diagnostics.get("timing") or {}).get("joint_sent_monotonic_ns") or command.get("sent_monotonic_ns")
+        if measured is None or targets is None or sent_ns_raw is None: return None
+        sent_ns = int(sent_ns_raw)
+        if abs(sent_ns - target) > self._MAX_GAP_NS: return None
+        active["_actions"].append((sent_ns, targets)); del active["_actions"][:-40]; action_ns, action_joints = min(active["_actions"], key=lambda x: abs(x[0] - target))
+        if abs(action_ns - target) > self._MAX_GAP_NS: return None
+        paths, image_times, payloads = {}, {}, {}
+        camera_state = self.cameras.snapshot() or {}
+        for source, details in active["camera_sources"].items():
+            stamp = self.cameras.frame_timestamp(source, target); payload = self.cameras.frame_jpeg(source, target)
+            if not payload or stamp is None or abs(int(stamp) - target) > self._MAX_GAP_NS: return None
+            payloads[source], image_times[source] = payload, int(stamp)
+        directory = Path(active["episode_dir"]); frame_id = active["frame_count"]
+        for source, payload in payloads.items():
+            rel = f"images/{active['camera_sources'][source]['folder']}/{frame_id:06d}.jpg"; path = directory / rel; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(payload); paths[source] = rel
+        gripper = _number((osc.get("gripper") or {}).get("width_m")); target_gripper = command.get("gripper_target_width_m") or (osc.get("active_action") or {}).get("width_m"); front_path = paths.pop("external"); paths["front"] = front_path
+        timestamp = (active["_started_utc"] + timedelta(seconds=(target - active["_started_ns"]) / 1e9)).isoformat()
+        return {"episode_index": active["episode_index"], "frame_index": frame_id, "timestamp": timestamp, "observation": {"images": paths, "state": {"joint_positions_rad": measured, "gripper_width_measured_m": gripper, "tcp_pose": feedback.get("tcp_pose") or execution.get("measured_tcp_pose")}}, "action": {"joint_target_rad": action_joints, "tcp_target": command.get("target_tcp"), "gripper_width_target_m": target_gripper}, "diagnostics": {"timestamps_ns": {"robot_feedback": measured_ns, "control_command": action_ns, "pico": (pico.get("diagnostics") or {}).get("input_received_monotonic_ns"), "front_camera": image_times.get("external"), "wrist_camera": image_times.get("wrist")}, "alignment_target_monotonic_ns": target}}
 
     def _loop(self) -> None:
-        frame_index = 0
+        index = 0
         while not self.stop_event.is_set():
             started = time.monotonic()
             try:
-                row = self._sample(frame_index)
-                encoded = json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+                row = self._sample(index)
                 with self.lock:
-                    if self.active:
-                        self.active["_frames"].write(encoded); self.active["_frames"].flush()
-                        self.active["frame_count"] = frame_index + 1; self.active["bytes_written"] += len(encoded.encode("utf-8"))
-                frame_index += 1
+                    if row is None: self.active["dropped_frames"] += 1
+                    else: self.active["_frames"].write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"); self.active["_frames"].flush(); self.active["frame_count"] += 1
+                index += 1
             except Exception as exc:
                 with self.lock:
-                    if self.active:
-                        self.active["sample_errors"] += 1; self.active["last_error"] = f"{type(exc).__name__}: {exc}"
+                    if self.active: self.active["sample_errors"] += 1; self.active["last_error"] = f"{type(exc).__name__}: {exc}"
             self.stop_event.wait(max(0.0, self.sample_period - (time.monotonic() - started)))
 
     def stop(self, status: str = "completed", reason: str = "") -> dict[str, Any]:
         with self.lock:
-            if not self.active:
-                return self.state()
-            active, thread = self.active, self.thread
-            delete_episode = status in {"failed", "discarded"}
-            active["status"] = "completed"; active["reason"] = reason; active["ended_at"] = _utc()
-            active["duration_s"] = max(0.0, time.monotonic() - float(active["_started_monotonic"]))
-            self.stop_event.set()
-        if thread and thread is not threading.current_thread():
-            thread.join(timeout=3.0)
+            if not self.active: return self.state()
+            active, thread = self.active, self.thread; active["status"] = "completed"; active["reason"] = reason; active["duration_s"] = time.monotonic() - active["_started_monotonic"]; self.stop_event.set()
+        if thread and thread is not threading.current_thread(): thread.join(timeout=3)
         with self.lock:
-            active = self.active
-            if not active:
-                return {"recording": False}
-            active.pop("_frames").close()
-            metadata, episode_dir = active.pop("_metadata"), Path(active["episode_dir"])
-            result = self._public(active, False)
-            if delete_episode:
-                shutil.rmtree(self._assert_episode_path(episode_dir), ignore_errors=False)
-                result.update({"deleted": True, "status": "deleted", "reason": reason or "operator discarded episode"})
-            else:
-                metadata.update({key: value for key, value in result.items() if key not in {"recording", "episode_dir"}})
-                metadata["status"] = "completed"
-                episode_dir.joinpath("metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            self.last_episode = copy.deepcopy(result)
-            self.active = None; self.thread = None
-            return result
+            active = self.active; active.pop("_frames").close(); metadata, directory = active.pop("_metadata"), Path(active["episode_dir"]); result = self._public(active, False); delete = status in {"failed", "discarded"}
+            if delete: shutil.rmtree(self._assert_episode_path(directory)); result.update(deleted=True, status="deleted", reason=reason or "operator discarded episode")
+            else: metadata.update({k: v for k, v in result.items() if k not in {"recording", "episode_dir"}}); metadata["status"] = "completed"; (directory / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            self.last_episode = copy.deepcopy(result); self.active = None; self.thread = None; return result
 
-    def close(self) -> None:
-        self.stop("discarded", "control service shutdown")
+    def close(self) -> None: self.stop("discarded", "control service shutdown")
 
     def episodes(self) -> dict[str, Any]:
-        self._ensure_root()
-        items = []
+        self._ensure_root(); items = []
         for path in sorted((self.root / "episodes").glob("episode_*/metadata.json")):
-            try:
-                items.append(json.loads(path.read_text(encoding="utf-8")))
-            except (OSError, json.JSONDecodeError):
-                items.append({"episode_dir": str(path.parent), "status": "invalid"})
+            try: items.append(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError): items.append({"episode_dir": str(path.parent), "status": "invalid"})
         return {"dataset_root": str(self.root), "episodes": items[-100:]}
