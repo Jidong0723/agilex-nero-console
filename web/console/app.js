@@ -554,12 +554,7 @@
     const result = $("pi05-result"); if (result) result.textContent = pi.last_error || "";
     $("pi05-external-preview").textContent = pi.camera_ready ? "模型输入 224 × 224 RGB" : "等待画面";
     $("pi05-wrist-preview").textContent = pi.camera_ready ? "模型输入 224 × 224 RGB" : "等待画面";
-    const frameVersion = Number(pi.frame_version || state.cameras?.frame_version || 0);
-    if (frameVersion) {
-      $("pi05-external-frame").src = `/api/cameras/frame/external.jpg?v=${frameVersion}`;
-      $("pi05-wrist-frame").src = `/api/cameras/frame/wrist.jpg?v=${frameVersion}`;
-      $("pi05-external-frame").classList.add("ready"); $("pi05-wrist-frame").classList.add("ready");
-    }
+    refreshPi05Frames();
     if ($("pi05-cameras")) $("pi05-cameras").disabled = pi.state === "RUNNING";
     $("pi05-start").disabled = pi.execution_enabled === true || !pi.camera_ready;
     $("pi05-stop").disabled = pi.execution_enabled !== true;
@@ -580,9 +575,13 @@
   }}; }
 
   async function loadSharedCameras() {
+    const selectionVersion = state.cameraSelectionVersion || 0;
     try {
       const [result, cameras] = await Promise.all([api("/api/cameras/list", "GET", undefined, 12000), api("/api/cameras/state", "GET", undefined, 12000)]); state.pi05Cameras = result.cameras || []; state.cameras = cameras;
-      const config = cameras.config || {}; const fill = (id, selected) => { const select = $(id); if (!select) return; select.innerHTML = state.pi05Cameras.map((camera) => `<option value="${Number(camera.index)}">${Number(camera.index)} · ${String(camera.name || "Camera")}</option>`).join("") || `<option value="${selected}">${selected} · 未检测到相机</option>`; select.value = String(selected); select.onchange = activateSharedCameras; };
+      // A slow initial device request must not overwrite a just-selected
+      // RealSense entry with the configuration it observed before the click.
+      if (selectionVersion !== (state.cameraSelectionVersion || 0)) return;
+      const config = cameras.config || {}; const fill = (id, selected) => { const select = $(id); if (!select) return; select.innerHTML = state.pi05Cameras.map((camera) => `<option value="${Number(camera.index)}">${Number(camera.index)} · ${String(camera.name || "Camera")}</option>`).join("") || `<option value="${selected}">${selected} · 未检测到相机</option>`; select.value = String(selected); select.onchange = scheduleSharedCameraActivation; };
       ["pi05-external-index", "pico-external-index"].forEach((id) => fill(id, config.external?.index ?? 0));
       ["pi05-wrist-index", "pico-wrist-index"].forEach((id) => fill(id, config.wrist?.index ?? 1));
     } catch (error) { const result = $("pi05-result"); if (result) result.textContent = `相机列表读取失败：${error.message}`; }
@@ -590,8 +589,42 @@
 
   function refreshPi05Frames() {
     if ((selectedAdapter() !== "pi05" && selectedAdapter() !== "pico") || !state.cameras?.ready) return;
-    const stamp = Date.now();
-    ["pi05", "pico"].forEach((prefix) => { const external = $(`${prefix}-external-frame`), wrist = $(`${prefix}-wrist-frame`); if (external) { external.src = `/api/cameras/frame/external.jpg?t=${stamp}`; external.classList.add("ready"); } if (wrist) { wrist.src = `/api/cameras/frame/wrist.jpg?t=${stamp}`; wrist.classList.add("ready"); } });
+    const sources = state.cameras?.sources || {};
+    ["pi05", "pico"].forEach((prefix) => ["external", "wrist"].forEach((source) => {
+      const image = $(`${prefix}-${source}-frame`); const details = sources[source] || {};
+      if (!image || !details.frame_available) return;
+      const stamp = String(details.timestamp_monotonic_ns || state.cameras.frame_version || 0);
+      if (!stamp || image.dataset.cameraStamp === stamp) return;
+      image.dataset.cameraStamp = stamp;
+      image.src = `/api/cameras/frame/${source}.jpg?v=${encodeURIComponent(stamp)}`;
+      image.classList.add("ready");
+    }));
+  }
+
+  async function pollSharedCameraFrames() {
+    if ((selectedAdapter() !== "pi05" && selectedAdapter() !== "pico") || state.cameraRefreshBusy) return;
+    state.cameraRefreshBusy = true;
+    try {
+      state.cameras = await api("/api/cameras/state", "GET", undefined, 900);
+      refreshPi05Frames();
+    } catch (_) {
+      // Keep the last successful preview visible while a camera is warming up.
+    } finally {
+      state.cameraRefreshBusy = false;
+    }
+  }
+
+  function clearSharedCameraFrames() {
+    ["pi05", "pico"].forEach((prefix) => ["external", "wrist"].forEach((source) => {
+      const image = $(`${prefix}-${source}-frame`); if (!image) return;
+      image.removeAttribute("src"); image.classList.remove("ready"); delete image.dataset.cameraStamp;
+    }));
+  }
+
+  function scheduleSharedCameraActivation() {
+    state.cameraSelectionVersion = (state.cameraSelectionVersion || 0) + 1;
+    clearTimeout(state.cameraActivationTimer);
+    state.cameraActivationTimer = setTimeout(() => { void activateSharedCameras(); }, 120);
   }
 
   function nextOscSequence() {
@@ -1177,9 +1210,16 @@
   }
 
   async function activateSharedCameras() {
+    const request = (state.cameraActivationRequest || 0) + 1;
+    state.cameraActivationRequest = request;
+    const config = cameraConfigBody();
+    clearSharedCameraFrames();
     try {
-      await api("/api/cameras/config", "POST", cameraConfigBody());
-      state.cameras = await api("/api/cameras/activate", "POST", {} , 10000);
+      await api("/api/cameras/config", "POST", config);
+      if (request !== state.cameraActivationRequest) return;
+      const cameras = await api("/api/cameras/activate", "POST", {} , 10000);
+      if (request !== state.cameraActivationRequest) return;
+      state.cameras = cameras;
       renderPi05();
     } catch (error) { phase(`公共相机接入失败：${error.message}`, true); await refresh(); }
   }
@@ -1187,7 +1227,7 @@
   async function deactivateSharedCameras() {
     try {
       state.cameras = await api("/api/cameras/deactivate", "POST", {}, 10000);
-      ["pi05", "pico"].forEach((prefix) => { ["external", "wrist"].forEach((source) => { const image = $(`${prefix}-${source}-frame`); if (image) { image.removeAttribute("src"); image.classList.remove("ready"); } }); });
+      clearSharedCameraFrames();
       render();
     } catch (error) { phase(`关闭相机失败：${error.message}`, true); }
   }
@@ -1478,7 +1518,7 @@
   setInterval(() => { void refreshPicoState(); }, 100);
   setInterval(() => { void refreshPi05State(); }, 200);
   setInterval(() => { void refreshDatasetState(); }, 500);
-  setInterval(refreshPi05Frames, 200);
+  setInterval(() => { void pollSharedCameraFrames(); }, 200);
   setInterval(heartbeat, 1000);
   setInterval(() => {
     const now = performance.now();

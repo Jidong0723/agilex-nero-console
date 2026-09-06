@@ -30,7 +30,9 @@ class CameraPair:
                 self.sources[key] = self.captures[index]
                 continue
             capture = cv2.VideoCapture(index, cv2.CAP_DSHOW if hasattr(cv2, "CAP_DSHOW") else 0)
-            capture.set(cv2.CAP_PROP_FRAME_WIDTH, int(item["width"])); capture.set(cv2.CAP_PROP_FRAME_HEIGHT, int(item["height"]))
+            # Keep the driver-negotiated format. The RealSense RGB DirectShow
+            # endpoint on this host returns black frames after a forced 640×480
+            # mode change; frames are resized below for the model input.
             if capture.isOpened():
                 self.captures[index] = capture
                 self.sources[key] = capture
@@ -49,6 +51,13 @@ class CameraPair:
             for index, capture in self.captures.items():
                 ok, frame = capture.read()
                 if not ok or frame is None:
+                    frames[index] = None
+                    continue
+                # Some DirectShow RealSense drivers intermittently deliver an
+                # all-black placeholder frame between valid RGB frames. Do not
+                # publish it: replacing the last image with that placeholder
+                # is perceived as a flashing black preview in the console.
+                if float(self.cv2.mean(frame)[0] + self.cv2.mean(frame)[1] + self.cv2.mean(frame)[2]) / 3.0 <= 2.0:
                     frames[index] = None
                     continue
                 rgb = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2RGB)
@@ -181,7 +190,6 @@ class SharedCameraResource:
                 index = int(item.get("index", self.config[key]["index"]))
                 if not 0 <= index <= 32: raise ValueError(f"{key} camera index must be 0-32")
                 self.config[key]["index"] = index
-            if self.config["external"]["index"] == self.config["wrist"]["index"]: raise ValueError("external and wrist cameras must be different")
             return self.snapshot()
 
     def _preview_loop(self) -> None:
@@ -193,11 +201,19 @@ class SharedCameraResource:
                     captured_ns = time.monotonic_ns()
                     current = {key: frame for key, frame in (("external", external), ("wrist", wrist)) if frame is not None}
                     if not current:
-                        raise RuntimeError("no camera produced a frame")
+                        # USB cameras, especially RealSense, can have a short
+                        # warm-up interval or transient empty read. Keep the
+                        # worker alive and retain any previously captured JPEG
+                        # instead of turning a momentary gap into a black UI.
+                        self.last_error = None if self.frames else "waiting for a camera frame"
+                        self.preview_stop.wait(.05)
+                        continue
                     self.last_error = None
-                    self.frames = current
-                    self.frame_times = {key: captured_ns / 1e9 for key in current}
-                    self.frame_times_ns = {key: captured_ns for key in current}
+                    # A failed source must not erase a last-known-good frame
+                    # from the other source (or from a shared capture).
+                    self.frames.update(current)
+                    self.frame_times.update({key: captured_ns / 1e9 for key in current})
+                    self.frame_times_ns.update({key: captured_ns for key in current})
                     for key, frame in current.items():
                         history = self.frame_history.setdefault(key, [])
                         history.append((captured_ns, frame.copy()))
@@ -205,8 +221,9 @@ class SharedCameraResource:
                     self.frame_version += 1
                 self.preview_stop.wait(.05)
             except Exception as exc:
+                # Keep previewing after a recoverable camera/backend hiccup.
                 with self.lock: self.last_error = f"{type(exc).__name__}: {exc}"
-                return
+                self.preview_stop.wait(.1)
 
     def activate(self) -> dict[str, Any]:
         with self.lock:
