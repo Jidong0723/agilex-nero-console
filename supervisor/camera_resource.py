@@ -21,31 +21,51 @@ class CameraPair:
         import cv2
         self.cv2 = cv2; self.read_lock = threading.Lock()
         self.width, self.height = int(config["model_width"]), int(config["model_height"])
-        self.captures = []
+        self.captures: dict[int, Any] = {}
+        self.sources: dict[str, Any | None] = {}
         for key in ("external", "wrist"):
             item = config[key]
-            capture = cv2.VideoCapture(int(item["index"]), cv2.CAP_DSHOW if hasattr(cv2, "CAP_DSHOW") else 0)
+            index = int(item["index"])
+            if index in self.captures:
+                self.sources[key] = self.captures[index]
+                continue
+            capture = cv2.VideoCapture(index, cv2.CAP_DSHOW if hasattr(cv2, "CAP_DSHOW") else 0)
             capture.set(cv2.CAP_PROP_FRAME_WIDTH, int(item["width"])); capture.set(cv2.CAP_PROP_FRAME_HEIGHT, int(item["height"]))
-            if not capture.isOpened():
-                self.close(); raise RuntimeError(f"cannot open {key} camera index {item['index']}")
-            self.captures.append(capture)
+            if capture.isOpened():
+                self.captures[index] = capture
+                self.sources[key] = capture
+            else:
+                capture.release()
+                self.sources[key] = None
+        if not self.captures:
+            raise RuntimeError("cannot open any configured camera")
 
-    def read(self) -> tuple[Any, Any]:
-        frames = []
+    def available(self, source: str) -> bool:
+        return self.sources.get(source) is not None
+
+    def read(self) -> tuple[Any | None, Any | None]:
+        frames: dict[Any, Any | None] = {}
         with self.read_lock:
-            for capture in self.captures:
+            for index, capture in self.captures.items():
                 ok, frame = capture.read()
-                if not ok or frame is None: raise RuntimeError("camera frame capture failed")
+                if not ok or frame is None:
+                    frames[index] = None
+                    continue
                 rgb = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2RGB)
                 h, w = rgb.shape[:2]; scale = min(self.width / w, self.height / h)
                 resized = self.cv2.resize(rgb, (max(1, round(w * scale)), max(1, round(h * scale))))
                 canvas = __import__("numpy").zeros((self.height, self.width, 3), dtype=__import__("numpy").uint8)
                 y, x = (self.height - resized.shape[0]) // 2, (self.width - resized.shape[1]) // 2
-                canvas[y:y + resized.shape[0], x:x + resized.shape[1]] = resized; frames.append(canvas)
-        return frames[0], frames[1]
+                canvas[y:y + resized.shape[0], x:x + resized.shape[1]] = resized
+                frames[index] = canvas
+        return tuple(frames.get(self._source_index(source)) for source in ("external", "wrist"))
+
+    def _source_index(self, source: str) -> int | None:
+        capture = self.sources.get(source)
+        return next((index for index, item in self.captures.items() if item is capture), None)
 
     def close(self) -> None:
-        for capture in getattr(self, "captures", []): capture.release()
+        for capture in getattr(self, "captures", {}).values(): capture.release()
 
 
 class SharedCameraResource:
@@ -62,7 +82,7 @@ class SharedCameraResource:
             now = time.monotonic()
             sources = {
                 key: {
-                    "available": self.cameras is not None,
+                    "available": self.cameras is not None and self.cameras.available(key),
                     "frame_available": key in self.frames,
                     "last_frame_age_ms": round((now - self.frame_times[key]) * 1000, 1) if key in self.frame_times else None,
                     "timestamp_monotonic_ns": self.frame_times_ns.get(key),
@@ -171,10 +191,14 @@ class SharedCameraResource:
                 external, wrist = self.cameras.read()
                 with self.lock:
                     captured_ns = time.monotonic_ns()
-                    self.frames = {"external": external, "wrist": wrist}
-                    self.frame_times = {"external": captured_ns / 1e9, "wrist": captured_ns / 1e9}
-                    self.frame_times_ns = {"external": captured_ns, "wrist": captured_ns}
-                    for key, frame in (("external", external), ("wrist", wrist)):
+                    current = {key: frame for key, frame in (("external", external), ("wrist", wrist)) if frame is not None}
+                    if not current:
+                        raise RuntimeError("no camera produced a frame")
+                    self.last_error = None
+                    self.frames = current
+                    self.frame_times = {key: captured_ns / 1e9 for key in current}
+                    self.frame_times_ns = {key: captured_ns for key in current}
+                    for key, frame in current.items():
                         history = self.frame_history.setdefault(key, [])
                         history.append((captured_ns, frame.copy()))
                         del history[:-40]
