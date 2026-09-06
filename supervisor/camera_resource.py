@@ -16,6 +16,42 @@ import time
 from typing import Any
 
 
+class RealSenseRgbCapture:
+    """Open a RealSense RGB sensor through librealsense, not DirectShow."""
+    def __init__(self) -> None:
+        import pyrealsense2 as rs
+        self.rs = rs
+        devices = list(rs.context().query_devices())
+        if not devices:
+            raise RuntimeError("no RealSense device found by librealsense")
+        device = devices[0]
+        self.serial = device.get_info(rs.camera_info.serial_number)
+        self.pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_device(self.serial)
+        config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        self.pipeline.start(config)
+
+    def isOpened(self) -> bool:
+        return True
+
+    def read(self) -> tuple[bool, Any | None]:
+        try:
+            frames = self.pipeline.wait_for_frames(1500)
+            color = frames.get_color_frame()
+            if not color:
+                return False, None
+            return True, __import__("numpy").asanyarray(color.get_data()).copy()
+        except RuntimeError:
+            return False, None
+
+    def release(self) -> None:
+        try:
+            self.pipeline.stop()
+        except RuntimeError:
+            pass
+
+
 class CameraPair:
     def __init__(self, config: dict[str, Any]) -> None:
         import cv2
@@ -29,7 +65,7 @@ class CameraPair:
             if index in self.captures:
                 self.sources[key] = self.captures[index]
                 continue
-            capture = cv2.VideoCapture(index, cv2.CAP_DSHOW if hasattr(cv2, "CAP_DSHOW") else 0)
+            capture = self._open_capture(index)
             # Keep the driver-negotiated format. The RealSense RGB DirectShow
             # endpoint on this host returns black frames after a forced 640×480
             # mode change; frames are resized below for the model input.
@@ -41,6 +77,24 @@ class CameraPair:
                 self.sources[key] = None
         if not self.captures:
             raise RuntimeError("cannot open any configured camera")
+
+    def _open_capture(self, index: int) -> Any:
+        """Prefer librealsense for the RGB endpoint, with OpenCV fallback."""
+        name = ""
+        try:
+            from cv2_enumerate_cameras import enumerate_cameras
+            item = next((item for item in enumerate_cameras(self.cv2.CAP_DSHOW) if int(item.index) == index), None)
+            name = str(getattr(item, "name", ""))
+        except Exception:
+            pass
+        if "realsense" in name.lower() and "rgb" in name.lower():
+            try:
+                return RealSenseRgbCapture()
+            except (ImportError, RuntimeError):
+                # Keeping the OpenCV fallback makes non-RealSense setups and
+                # installations without librealsense continue to work.
+                pass
+        return self.cv2.VideoCapture(index, self.cv2.CAP_DSHOW if hasattr(self.cv2, "CAP_DSHOW") else 0)
 
     def available(self, source: str) -> bool:
         return self.sources.get(source) is not None
