@@ -36,24 +36,25 @@ class DatasetRecorderTests(unittest.TestCase):
         time.sleep(duration)
         return recorder.stop("completed")
 
-    def test_idle_pico_writes_images_without_a_control_command(self) -> None:
+    def test_idle_pico_writes_observations_and_both_images(self) -> None:
         result = self._record()
         episode = Path(result["episode_dir"])
         rows = [json.loads(line) for line in (episode / "frames.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertGreater(result["frame_count"], 0)
-        self.assertEqual(result["uncommanded_frame_count"], result["frame_count"])
-        self.assertEqual(rows[0]["control_context"], None)
+        self.assertNotIn("control_context", rows[0])
+        self.assertNotIn("action", rows[0])
         self.assertTrue((episode / "images" / "front" / "000000.jpg").exists())
         self.assertTrue((episode / "images" / "wrist" / "000000.jpg").exists())
         self.assertGreater(result["camera_sources"]["external"]["captured_frames"], 0)
         self.assertGreater(result["camera_sources"]["wrist"]["captured_frames"], 0)
 
-    def test_active_pico_command_is_optional_control_context(self) -> None:
+    def test_control_commands_are_not_saved(self) -> None:
         self.command = [1, 2, 3, 4, 5, 6, 7]
         result = self._record()
         row = json.loads((Path(result["episode_dir"]) / "frames.jsonl").read_text(encoding="utf-8").splitlines()[0])
-        self.assertGreater(result["commanded_frame_count"], 0)
-        self.assertEqual(row["control_context"]["joint_target_rad"], self.command)
+        self.assertNotIn("control_context", row)
+        self.assertNotIn("action", row)
+        self.assertNotIn("control_command", row["diagnostics"]["timestamps_ns"])
 
     def test_single_missing_camera_does_not_drop_other_image(self) -> None:
         self.camera_payloads["wrist"] = None
