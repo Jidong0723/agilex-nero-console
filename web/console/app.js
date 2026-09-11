@@ -187,7 +187,7 @@
     if ($("dataset-panel")) return;
     const panel = document.createElement("section");
     panel.id = "dataset-panel"; panel.className = "dataset-panel";
-    panel.innerHTML = `<div class="pico-head"><span class="pi05-index">D</span><div><strong>示范数据采集</strong><small>独立记录 · 目标 20 Hz</small></div><span id="dataset-state" class="badge neutral">未采集</span></div><div class="dataset-fields"><label>任务名称<input id="dataset-task" value="red_cube_to_tray" maxlength="120"></label><label>任务描述<input id="dataset-description" value="pick up the red cube and place it in the tray" maxlength="500"></label></div><section class="dataset-source"><strong>当前采集来源</strong><div id="dataset-source-summary">正在读取当前控制源和相机状态…</div></section><section class="dataset-content"><strong>本 Episode 采集内容</strong><div id="dataset-content-summary">元数据、20 Hz 时序样本、机器人观测、目标动作与可选 PICO 输入。</div></section><div class="pico-actions"><button id="dataset-start" class="button primary" type="button">开始采集 Episode</button><button id="dataset-stop" class="button quiet" type="button">结束并保存</button><button id="dataset-failed" class="button quiet" type="button">失败并删除</button></div><div class="dataset-readout"><span>运行时间<b id="dataset-duration">0.0 s</b></span><span>帧数 / 实际频率<b id="dataset-frames">0 / 0 Hz</b></span><span>无命令 / 有命令<b id="dataset-sample-kinds">0 / 0</b></span><span>采样拒绝<b id="dataset-rejected">0</b></span><span>图像丢帧<b id="dataset-dropped">0</b></span><span>已写入数据<b id="dataset-bytes">0 B</b></span><span>执行模式<b id="dataset-execution-mode">--</b></span><span>保存位置<b id="dataset-path">--</b></span></div><p id="dataset-result" class="result">采集器不会配置相机或发送机器人命令。</p>`;
+    panel.innerHTML = `<div class="pico-head"><span class="pi05-index">D</span><div><strong>示范数据采集</strong><small>原始 RGB · 目标 20 Hz · 异步 JPEG 写盘</small></div><span id="dataset-state" class="badge neutral">未采集</span></div><div class="dataset-fields"><label>任务名称<input id="dataset-task" value="red_cube_to_tray" maxlength="120"></label><label>任务描述<input id="dataset-description" value="pick up the red cube and place it in the tray" maxlength="500"></label></div><section class="dataset-source"><strong>当前采集来源</strong><div id="dataset-source-summary">正在读取当前控制源和相机状态…</div></section><section class="dataset-content"><strong>本 Episode 采集内容</strong><div id="dataset-content-summary">元数据、时序观测、原始 RGB 图像、机器人状态与可选控制上下文。</div></section><div class="pico-actions"><button id="dataset-start" class="button primary" type="button">开始采集 Episode</button><button id="dataset-stop" class="button quiet" type="button">结束并保存</button><button id="dataset-failed" class="button quiet" type="button">失败并删除</button></div><div class="dataset-readout"><span>运行时间<b id="dataset-duration">0.0 s</b></span><span>帧数 / 实际频率<b id="dataset-frames">0 / 0 Hz</b></span><span>无命令 / 有命令<b id="dataset-sample-kinds">0 / 0</b></span><span>采样拒绝<b id="dataset-rejected">0</b></span><span>重复/过期<b id="dataset-duplicates">0</b></span><span>写盘背压<b id="dataset-backpressure">0</b></span><span>已写入数据<b id="dataset-bytes">0 B</b></span><span>保存位置<b id="dataset-path">--</b></span></div><p id="dataset-result" class="result">采集器不会配置相机或发送机器人命令。</p>`;
     document.querySelector(".osc-card")?.insertAdjacentElement("afterend", panel);
   }
 
@@ -474,7 +474,7 @@
     const camera_sources = (control_source === "pi05" || control_source === "pico") ? Object.fromEntries(["external", "wrist"].map((source) => {
       const item = config[source] || {}; const status = sources[source] || {};
       return [source, { source, label: source === "external" ? "外部 RGB" : "腕部 RGB", folder: source === "external" ? "front" : "wrist",
-        index: item.index, width: item.width, height: item.height, available: status.available === true,
+        index: item.index, width: item.width, height: item.height, saved_width: status.dataset_size?.[0] || item.width, saved_height: status.dataset_size?.[1] || item.height, preview_width: status.preview_size?.[0], preview_height: status.preview_size?.[1], available: status.available === true,
         frame_available: status.frame_available === true, captured_frames: 0, dropped_frames: 0 }];
     })) : {};
     return { control_source, camera_sources, data_contents: { images: Object.values(camera_sources).map((camera) => ({
@@ -484,9 +484,9 @@
   function renderDatasetSources(data) {
     const source = data.control_source || selectedAdapter(); const cameras = data.camera_sources || {};
     const rows = Object.values(cameras).map((camera) => {
-      const resolution = camera.width && camera.height ? `${camera.width} × ${camera.height}` : "规格未报告";
+      const resolution = camera.saved_width && camera.saved_height ? `保存 ${camera.saved_width} × ${camera.saved_height}` : "保存规格未报告";
       const status = camera.available ? (camera.frame_available === false ? "已选择，等待画面" : "可用") : "当前不可用";
-      const stats = data.recording ? ` · 成功 ${camera.captured_frames || 0} / 丢失 ${camera.dropped_frames || 0}${Number.isFinite(Number(camera.last_frame_age_ms)) ? ` / 最近 ${Number(camera.last_frame_age_ms).toFixed(0)} ms` : ""}` : "";
+      const stats = data.recording ? ` · 成功 ${camera.captured_frames || 0} / 丢失 ${camera.dropped_frames || 0} / 重复 ${camera.duplicate_or_stale_frames || 0}${Number.isFinite(Number(camera.last_frame_age_ms)) ? ` / 最近 ${Number(camera.last_frame_age_ms).toFixed(0)} ms` : ""}` : "";
       return `<span class="${camera.available ? "ok" : "warn"}">${camera.label || camera.source} · 设备 ${camera.index ?? "--"} · ${resolution} · ${status}${stats}</span>`;
     });
     $("dataset-source-summary").innerHTML = `<span>控制源：<b>${datasetSourceLabel(source)}</b></span>${rows.length ? rows.join("") : "<span class=\"warn\">该控制源未选择相机；将仅记录状态、动作和控制输入。</span>"}`;
@@ -496,7 +496,7 @@
     const images = Array.isArray(contents.images) && contents.images.length
       ? contents.images.map((item) => `${item.label || item.source} JPEG → ${item.directory}`).join("；")
       : "无图像流（仅状态、动作和控制输入）";
-    $("dataset-content-summary").innerHTML = `<span><b>metadata.json</b>：UTF-8 JSON（任务、来源、相机快照和统计）</span><span><b>frames.jsonl</b>：UTF-8 JSON Lines，20 Hz；每行含 ISO 8601 时间、帧号、7 关节 rad、TCP、夹爪 m、目标动作与执行模式</span><span><b>PICO 输入</b>：位置 m、四元数 xyzw、Grip/Trigger；不可用时为 null</span><span><b>图像</b>：${images}</span>`;
+    $("dataset-content-summary").innerHTML = `<span><b>metadata.json</b>：UTF-8 JSON（任务、请求来源、实际 PICO 连接状态、相机快照和统计）</span><span><b>frames.jsonl</b>：UTF-8 JSON Lines；每行含 ISO 8601 时间、帧号、7 关节 rad、TCP、夹爪 m、图像路径及可选控制上下文</span><span><b>图像</b>：原始 RGB JPEG，重复或过期帧不会伪造写入；${images}</span>`;
   }
   function renderDataset() {
     const raw = state.dataset || {}; const data = datasetDetails(raw); const recording = raw.recording === true;
@@ -504,8 +504,7 @@
     picoText("dataset-state", recording ? "采集中" : (data.status === "deleted" ? "已删除" : data.status === "completed" ? "已保存" : "未采集"));
     picoText("dataset-duration", `${Number(data.duration_s || 0).toFixed(1)} s`);
     picoText("dataset-frames", `${data.frame_count ?? 0} / ${Number(data.effective_hz || 0).toFixed(1)} Hz`);
-    picoText("dataset-sample-kinds", `${data.uncommanded_frame_count ?? 0} / ${data.commanded_frame_count ?? 0}`); picoText("dataset-rejected", data.rejected_samples ?? data.dropped_frames ?? 0); picoText("dataset-dropped", data.dropped_frames ?? 0); picoText("dataset-bytes", datasetBytes(data.bytes_written));
-    picoText("dataset-execution-mode", data.execution_mode || "--");
+    picoText("dataset-sample-kinds", `${data.uncommanded_frame_count ?? 0} / ${data.commanded_frame_count ?? 0}`); picoText("dataset-rejected", data.rejected_samples ?? data.dropped_frames ?? 0); picoText("dataset-duplicates", Object.values(data.camera_sources || {}).reduce((sum, camera) => sum + Number(camera.duplicate_or_stale_frames || 0), 0)); picoText("dataset-backpressure", data.backpressure_drops ?? 0); picoText("dataset-bytes", datasetBytes(data.bytes_written));
     picoText("dataset-path", data.episode_dir || raw.dataset_root || "--");
     renderDatasetSources(preview); renderDatasetContents(preview);
     const reasons = Object.entries(data.rejection_reasons || {}).map(([reason, count]) => `${reason} ${count}`).join("；");

@@ -99,7 +99,8 @@ class CameraPair:
     def available(self, source: str) -> bool:
         return self.sources.get(source) is not None
 
-    def read(self) -> tuple[Any | None, Any | None]:
+    def read_with_raw(self) -> dict[str, tuple[Any, Any]]:
+        """Return separate model-sized and native RGB frames for each source."""
         frames: dict[Any, Any | None] = {}
         with self.read_lock:
             for index, capture in self.captures.items():
@@ -120,8 +121,20 @@ class CameraPair:
                 canvas = __import__("numpy").zeros((self.height, self.width, 3), dtype=__import__("numpy").uint8)
                 y, x = (self.height - resized.shape[0]) // 2, (self.width - resized.shape[1]) // 2
                 canvas[y:y + resized.shape[0], x:x + resized.shape[1]] = resized
-                frames[index] = canvas
-        return tuple(frames.get(self._source_index(source)) for source in ("external", "wrist"))
+                # Keep the native RGB image for recording.  The preview/model
+                # image remains deliberately 224×224 and must not leak into a
+                # dataset that claims to contain 640×480 camera observations.
+                frames[index] = (canvas, rgb)
+        result: dict[str, tuple[Any, Any]] = {}
+        for source in ("external", "wrist"):
+            frame = frames.get(self._source_index(source))
+            if frame is not None:
+                result[source] = frame
+        return result
+
+    def read(self) -> tuple[Any | None, Any | None]:
+        frames = self.read_with_raw()
+        return tuple(frames.get(source, (None, None))[0] for source in ("external", "wrist"))
 
     def _source_index(self, source: str) -> int | None:
         capture = self.sources.get(source)
@@ -136,7 +149,9 @@ class SharedCameraResource:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = copy.deepcopy(config); self.lock = threading.RLock(); self.cameras: CameraPair | None = None
         self.preview_stop = threading.Event(); self.preview_thread: threading.Thread | None = None
-        self.frames: dict[str, Any] = {}; self.frame_times: dict[str, float] = {}; self.frame_times_ns: dict[str, int] = {}; self.frame_history: dict[str, list[tuple[int, Any]]] = {"external": [], "wrist": []}; self.frame_version = 0; self.last_error: str | None = None
+        self.frames: dict[str, Any] = {}; self.frame_times: dict[str, float] = {}; self.frame_times_ns: dict[str, int] = {}; self.frame_history: dict[str, list[tuple[int, Any]]] = {"external": [], "wrist": []}
+        self.dataset_frame_history: dict[str, list[tuple[int, Any]]] = {"external": [], "wrist": []}; self.dataset_frame_sizes: dict[str, tuple[int, int]] = {}
+        self.frame_version = 0; self.last_error: str | None = None
         self._devices: list[dict[str, Any]] | None = None
         self._devices_at = 0.0
 
@@ -149,6 +164,8 @@ class SharedCameraResource:
                     "frame_available": key in self.frames,
                     "last_frame_age_ms": round((now - self.frame_times[key]) * 1000, 1) if key in self.frame_times else None,
                     "timestamp_monotonic_ns": self.frame_times_ns.get(key),
+                    "preview_size": [int(self.config.get("model_width", 224)), int(self.config.get("model_height", 224))],
+                    "dataset_size": list(self.dataset_frame_sizes[key]) if key in self.dataset_frame_sizes else None,
                 }
                 for key in ("external", "wrist")
             }
@@ -250,10 +267,10 @@ class SharedCameraResource:
         while not self.preview_stop.is_set():
             try:
                 if self.cameras is None: return
-                external, wrist = self.cameras.read()
+                captured = self.cameras.read_with_raw()
                 with self.lock:
                     captured_ns = time.monotonic_ns()
-                    current = {key: frame for key, frame in (("external", external), ("wrist", wrist)) if frame is not None}
+                    current = {key: pair[0] for key, pair in captured.items()}
                     if not current:
                         # USB cameras, especially RealSense, can have a short
                         # warm-up interval or transient empty read. Keep the
@@ -272,8 +289,15 @@ class SharedCameraResource:
                         history = self.frame_history.setdefault(key, [])
                         history.append((captured_ns, frame.copy()))
                         del history[:-40]
+                        raw = captured[key][1]
+                        raw_history = self.dataset_frame_history.setdefault(key, [])
+                        raw_history.append((captured_ns, raw.copy()))
+                        # 12 frames is enough for the recorder's 100 ms
+                        # alignment window while bounding native-frame memory.
+                        del raw_history[:-12]
+                        self.dataset_frame_sizes[key] = (int(raw.shape[1]), int(raw.shape[0]))
                     self.frame_version += 1
-                self.preview_stop.wait(.05)
+                self.preview_stop.wait(.01)
             except Exception as exc:
                 # Keep previewing after a recoverable camera/backend hiccup.
                 with self.lock: self.last_error = f"{type(exc).__name__}: {exc}"
@@ -284,7 +308,7 @@ class SharedCameraResource:
             self.preview_stop.set()
             if self.preview_thread and self.preview_thread is not threading.current_thread(): self.preview_thread.join(timeout=.5)
             if self.cameras: self.cameras.close()
-            self.cameras = CameraPair(self.config); self.frames = {}; self.frame_times = {}; self.frame_times_ns = {}; self.frame_history = {"external": [], "wrist": []}; self.frame_version = 0; self.last_error = None; self.preview_stop = threading.Event()
+            self.cameras = CameraPair(self.config); self.frames = {}; self.frame_times = {}; self.frame_times_ns = {}; self.frame_history = {"external": [], "wrist": []}; self.dataset_frame_history = {"external": [], "wrist": []}; self.dataset_frame_sizes = {}; self.frame_version = 0; self.last_error = None; self.preview_stop = threading.Event()
             self.preview_thread = threading.Thread(target=self._preview_loop, name="nero-shared-camera-preview", daemon=True); self.preview_thread.start()
             return self.snapshot()
 
@@ -296,7 +320,7 @@ class SharedCameraResource:
         if preview and preview is not threading.current_thread(): preview.join(timeout=1.0)
         with self.lock:
             if self.cameras: self.cameras.close()
-            self.cameras = None; self.preview_thread = None; self.frames = {}; self.frame_times = {}; self.frame_times_ns = {}; self.frame_history = {"external": [], "wrist": []}; self.frame_version = 0; self.last_error = None
+            self.cameras = None; self.preview_thread = None; self.frames = {}; self.frame_times = {}; self.frame_times_ns = {}; self.frame_history = {"external": [], "wrist": []}; self.dataset_frame_history = {"external": [], "wrist": []}; self.dataset_frame_sizes = {}; self.frame_version = 0; self.last_error = None
             return self.snapshot()
 
     def read(self) -> tuple[Any, Any]:
@@ -322,6 +346,18 @@ class SharedCameraResource:
             if not history: return None
             if target_monotonic_ns is None: return self.frame_times_ns.get(source)
             return min(history, key=lambda item: abs(item[0] - int(target_monotonic_ns)))[0]
+
+    def dataset_frame(self, source: str, target_monotonic_ns: int | None = None) -> tuple[int, Any] | None:
+        """Return a copy of the nearest native RGB frame for DatasetRecorder."""
+        with self.lock:
+            history = self.dataset_frame_history.get(source, [])
+            if not history:
+                return None
+            if target_monotonic_ns is None:
+                stamp, frame = history[-1]
+            else:
+                stamp, frame = min(history, key=lambda item: abs(item[0] - int(target_monotonic_ns)))
+            return stamp, frame.copy()
 
     def close(self) -> None:
         self.deactivate()
