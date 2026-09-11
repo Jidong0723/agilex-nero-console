@@ -82,9 +82,9 @@ class DatasetRecorder:
             cameras = self._camera_sources(self.cameras.snapshot() or {}) if requested_source in {"pico", "pi05"} else {}
             self._ensure_root(); index = self._next_episode_index(); directory = self.root / "episodes" / f"episode_{index:06d}"; directory.mkdir(parents=True)
             image_paths = {details["source"]: f"images/{details['folder']}" for details in cameras.values()}
-            metadata = {"schema": "nero-demonstration.v2", "episode_index": index, "task": task, "description": description, "status": "recording", "started_at": _utc(), "sample_hz": self.sample_hz, "control_source": category, "operator_device": device, "alignment": {"clock": "monotonic_ns", "state": "interpolation_or_nearest", "image": "nearest", "max_gap_ms": 100}, "camera_snapshot": copy.deepcopy(cameras), "files": {"frames": "frames.jsonl", "images": image_paths}, "data_contents": {"observation": "primary training data: measured hardware state and camera images", "diagnostics": "per-source feedback and camera timestamps plus rejection reasons"}}
+            metadata = {"schema": "nero-demonstration.v2", "episode_index": index, "task": task, "description": description, "status": "recording", "started_at": _utc(), "sample_hz": self.sample_hz, "control_source": category, "operator_device": device, "alignment": {"clock": "monotonic_ns", "state": "interpolation_or_nearest", "image": "nearest", "max_gap_ms": 100}, "camera_snapshot": copy.deepcopy(cameras), "files": {"frames": "frames.jsonl", "images": image_paths}, "data_contents": {"observation": "primary training data: measured hardware state and camera images", "control_context": "optional provenance only; not required as a visual-model training target", "diagnostics": "per-source monotonic timestamps and rejection reasons"}}
             (directory / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            self.active = {"episode_index": index, "episode_dir": str(directory), "task": task, "description": description, "status": "recording", "started_at": metadata["started_at"], "control_source": category, "operator_device": device, "execution_mode": None, "frame_count": 0, "dropped_frames": 0, "rejected_samples": 0, "rejection_reasons": {}, "sample_errors": 0, "last_error": None, "camera_sources": cameras, "data_contents": metadata["data_contents"], "bytes_written": 0, "_metadata": metadata, "_frames": (directory / "frames.jsonl").open("w", encoding="utf-8"), "_started_monotonic": time.monotonic(), "_started_ns": time.monotonic_ns(), "_started_utc": datetime.now(timezone.utc), "_states": []}
+            self.active = {"episode_index": index, "episode_dir": str(directory), "task": task, "description": description, "status": "recording", "started_at": metadata["started_at"], "control_source": category, "operator_device": device, "execution_mode": None, "frame_count": 0, "uncommanded_frame_count": 0, "commanded_frame_count": 0, "dropped_frames": 0, "rejected_samples": 0, "rejection_reasons": {}, "sample_errors": 0, "last_error": None, "camera_sources": cameras, "data_contents": metadata["data_contents"], "bytes_written": 0, "_metadata": metadata, "_frames": (directory / "frames.jsonl").open("w", encoding="utf-8"), "_started_monotonic": time.monotonic(), "_started_ns": time.monotonic_ns(), "_started_utc": datetime.now(timezone.utc), "_states": [], "_actions": []}
             self.stop_event = threading.Event(); self.thread = threading.Thread(target=self._loop, daemon=True); self.thread.start(); return self._public(self.active, True)
 
     @classmethod
@@ -103,7 +103,7 @@ class DatasetRecorder:
         reasons = active["rejection_reasons"]; reasons[reason] = int(reasons.get(reason, 0)) + 1
 
     def _sample(self, timeline_index: int) -> dict[str, Any] | None:
-        active, target = self.active, time.monotonic_ns(); osc = self.osc.state() or {}
+        active, target = self.active, time.monotonic_ns(); osc = self.osc.state() or {}; pico = self.pico.snapshot() if self.pico is not None else {}
         execution, transport = osc.get("execution") or {}, osc.get("transport") or {}; feedback = transport.get("hardware_feedback") or {}; joints = _finite_list(feedback.get("joint_angles_rad"), 7)
         if joints is None:
             self._reject(active, "feedback_joints_unavailable"); return None
@@ -115,6 +115,14 @@ class DatasetRecorder:
         measured, measured_ns = self._nearest_or_interp(active["_states"], target)
         if measured is None:
             self._reject(active, "feedback_stale"); return None
+        command, diagnostics = osc.get("command") or {}, osc.get("diagnostics") or {}; targets = _finite_list(command.get("final_joint_target_rad"), 7)
+        sent_ns_raw = (diagnostics.get("timing") or {}).get("joint_sent_monotonic_ns") or command.get("sent_monotonic_ns")
+        sent_ns = _monotonic_ns(sent_ns_raw)
+        action_ns, action_joints = None, None
+        if targets is not None and sent_ns is not None and abs(sent_ns - target) <= self._MAX_GAP_NS:
+            active["_actions"].append((sent_ns, targets)); del active["_actions"][:-40]
+            action_ns, action_joints = min(active["_actions"], key=lambda x: abs(x[0] - target))
+            if abs(action_ns - target) > self._MAX_GAP_NS: action_ns, action_joints = None, None
         paths, image_times, payloads, missing_sources = {}, {}, {}, []
         for source, details in active["camera_sources"].items():
             stamp = self.cameras.frame_timestamp(source, target); payload = self.cameras.frame_jpeg(source, target)
@@ -129,9 +137,10 @@ class DatasetRecorder:
             rel = f"images/{active['camera_sources'][source]['folder']}/{frame_id:06d}.jpg"; path = directory / rel; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(payload); paths[source] = rel
             details = active["camera_sources"][source]; details["captured_frames"] += 1; details["bytes_written"] += len(payload); active["bytes_written"] += len(payload)
         if "external" in paths: paths["front"] = paths.pop("external")
-        gripper = _number((osc.get("gripper") or {}).get("width_m"))
+        gripper = _number((osc.get("gripper") or {}).get("width_m")); target_gripper = command.get("gripper_target_width_m") or (osc.get("active_action") or {}).get("width_m")
         timestamp = (active["_started_utc"] + timedelta(seconds=(target - active["_started_ns"]) / 1e9)).isoformat()
-        return {"episode_index": active["episode_index"], "frame_index": frame_id, "timestamp": timestamp, "observation": {"images": paths, "missing_image_sources": missing_sources, "state": {"joint_positions_rad": measured, "gripper_width_measured_m": gripper, "tcp_pose": feedback.get("tcp_pose") or execution.get("measured_tcp_pose")}}, "diagnostics": {"timestamps_ns": {"robot_feedback": measured_ns, "front_camera": image_times.get("external"), "wrist_camera": image_times.get("wrist")}, "alignment_target_monotonic_ns": target}}
+        control_context = None if action_joints is None else {"joint_target_rad": action_joints, "tcp_target": command.get("target_tcp"), "gripper_width_target_m": target_gripper}
+        return {"episode_index": active["episode_index"], "frame_index": frame_id, "timestamp": timestamp, "observation": {"images": paths, "missing_image_sources": missing_sources, "state": {"joint_positions_rad": measured, "gripper_width_measured_m": gripper, "tcp_pose": feedback.get("tcp_pose") or execution.get("measured_tcp_pose")}}, "control_context": control_context, "diagnostics": {"control_command_recorded": control_context is not None, "timestamps_ns": {"robot_feedback": measured_ns, "control_command": action_ns, "pico": (pico.get("diagnostics") or {}).get("input_received_monotonic_ns"), "front_camera": image_times.get("external"), "wrist_camera": image_times.get("wrist")}, "alignment_target_monotonic_ns": target}}
 
     def _loop(self) -> None:
         index = 0
@@ -142,6 +151,8 @@ class DatasetRecorder:
                 with self.lock:
                     if row is not None:
                         self.active["_frames"].write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"); self.active["_frames"].flush(); self.active["frame_count"] += 1
+                        if row["control_context"] is None: self.active["uncommanded_frame_count"] += 1
+                        else: self.active["commanded_frame_count"] += 1
                 index += 1
             except Exception as exc:
                 with self.lock:
