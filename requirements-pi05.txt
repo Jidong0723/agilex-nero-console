@@ -1,0 +1,7 @@
+# Optional runtime dependencies for the in-process π0.5 input adapter.
+# Install into the environment that starts scripts/nero_control_server.py.
+numpy>=1.24,<3
+msgpack>=1.0.5
+websockets>=12.0
+opencv-python>=4.8,<4.12
+cv2-enumerate-cameras>=1.3.3

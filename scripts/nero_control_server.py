@@ -1,0 +1,1406 @@
+from __future__ import annotations
+
+import argparse
+from collections import deque
+import json
+import math
+import mimetypes
+import multiprocessing
+import os
+import secrets
+import socket
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from urllib.error import URLError
+from urllib.parse import parse_qs, urlparse
+from urllib.request import urlopen
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+VENDOR_ROOT = PROJECT_ROOT / "vendor"
+if str(VENDOR_ROOT) not in sys.path:
+    sys.path.insert(0, str(VENDOR_ROOT))
+
+from supervisor.instance_lock import InstanceLock  # noqa: E402
+from nero_console.runtime import assert_control_interpreter, control_python  # noqa: E402
+from nero_console.application.adapter_runtime import AdapterRuntime  # noqa: E402
+from supervisor.logging import AsyncJsonlTraceLogger  # noqa: E402
+
+if TYPE_CHECKING:
+    from supervisor.control import OperationalSpaceController
+
+
+WEB_ROOT = PROJECT_ROOT / "web" / "console"
+CONTROL_PYTHON = control_python(PROJECT_ROOT)
+
+
+def _local_ipv4_address() -> str:
+    """Return the IPv4 address selected by the local routing table."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("192.0.2.1", 9))
+            address = str(probe.getsockname()[0])
+            if address and not address.startswith("127."):
+                return address
+    except OSError:
+        pass
+    return ""
+_RESET_LOCK = threading.Lock()
+_RESET_PENDING = False
+
+
+class ControlServiceUnavailable(RuntimeError):
+    """The web console is up, but its robot-control backend is not ready."""
+
+
+class LeaseError(RuntimeError):
+    """Local representation of a lease error returned by the backend process."""
+
+
+def _backend_worker_main(connection: Any, config: str) -> None:
+    """Own every SDK/CAN object in a disposable child process."""
+    osc = None
+    try:
+        # Windows ``spawn`` may otherwise start from the base interpreter of a
+        # virtual environment.  Reassert the project import roots in the
+        # hardware owner itself: this process must import the vendored NERO
+        # SDK, never a globally installed package with the same name.
+        worker_root = Path(__file__).resolve().parents[1]
+        # ``spawn`` on Windows can otherwise inherit the base interpreter of
+        # a virtual environment.  The process below owns the SDK/CAN handle,
+        # so fail closed instead of silently using globally installed modules.
+        assert_control_interpreter(worker_root)
+        for import_root in (
+            worker_root,
+            worker_root / "vendor",
+            # This backend is distributed as a nested vendored package rather
+            # than directly below ``vendor``.  The Windows multiprocessing
+            # child can use the base Python image, so it does not inherit the
+            # .venv's editable-package path automatically.
+            worker_root / "vendor" / "python-can-agx-cando",
+            worker_root / "vendor" / "pyAgxArm",
+            worker_root / ".venv" / "Lib" / "site-packages",
+        ):
+            import_text = str(import_root)
+            if import_root.is_dir() and import_text not in sys.path:
+                sys.path.insert(0, import_text)
+        from supervisor.control import OperationalSpaceController
+
+        osc = OperationalSpaceController(Path(config))
+        initial = osc.start()
+        connection.send({"kind": "ready", "initial": initial})
+        while True:
+            request = connection.recv()
+            if request.get("method") == "__close__":
+                break
+            try:
+                method = getattr(osc, str(request["method"]))
+                result = method(*request.get("args", ()), **request.get("kwargs", {}))
+                connection.send({"kind": "result", "id": request["id"], "result": result})
+            except BaseException as exc:
+                connection.send({
+                    "kind": "error",
+                    "id": request.get("id"),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                })
+    except BaseException as exc:
+        try:
+            connection.send({"kind": "startup_error", "error_type": type(exc).__name__, "error": str(exc)})
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        if osc is not None:
+            try:
+                osc.close()
+            except BaseException:
+                pass
+        connection.close()
+
+
+class BackendProcessProxy:
+    """RPC facade for the one process permitted to own the hardware transport."""
+
+    def __init__(self, process: Any, connection: Any, call_timeout_s: float = 30.0) -> None:
+        self.process = process
+        self.connection = connection
+        self.call_timeout_s = call_timeout_s
+        self._lock = threading.Lock()
+        self._request_id = 0
+
+    def __getattr__(self, method: str) -> Any:
+        def invoke(*args: Any, **kwargs: Any) -> Any:
+            return self.call(method, *args, **kwargs)
+        return invoke
+
+    def call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            if not self.process.is_alive():
+                raise ControlServiceUnavailable(
+                    f"hardware backend process exited (code={self.process.exitcode})"
+                )
+            self._request_id += 1
+            request_id = self._request_id
+            try:
+                self.connection.send({
+                    "id": request_id,
+                    "method": method,
+                    "args": args,
+                    "kwargs": kwargs,
+                })
+                if not self.connection.poll(self.call_timeout_s):
+                    raise ControlServiceUnavailable(
+                        f"hardware backend call {method} exceeded {self.call_timeout_s:.0f}s; use Reset to release it"
+                    )
+                response = self.connection.recv()
+            except (BrokenPipeError, EOFError, OSError) as exc:
+                raise ControlServiceUnavailable(
+                    f"hardware backend process unavailable (code={self.process.exitcode})"
+                ) from exc
+            if response.get("kind") == "result" and response.get("id") == request_id:
+                return response.get("result")
+            error_type = str(response.get("error_type", "RuntimeError"))
+            message = str(response.get("error") or f"backend request failed: {response!r}")
+            if error_type == "PermissionError":
+                raise PermissionError(message)
+            if error_type == "LeaseError":
+                raise LeaseError(message)
+            raise RuntimeError(f"{error_type}: {message}")
+
+    def terminate(self) -> None:
+        if not self.process.is_alive():
+            return
+        try:
+            self.process.kill()
+        except (AttributeError, OSError):
+            self.process.terminate()
+        self.process.join(timeout=2.0)
+
+
+class ServiceRuntime:
+    """Thread-safe bootstrap state kept independent from USB-CAN startup.
+
+    The HTTP server owns this small object from the moment the port is bound.
+    Importing the control stack, constructing the SDK, and connecting hardware
+    all happen on a daemon worker, so none of them can delay the web page.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._broker: OperationalSpaceController | None = None
+        self._phase = "starting"
+        self._error: str | None = None
+        self._initial: dict[str, Any] | None = None
+        self._started_monotonic = time.monotonic()
+        self._backend_process: Any | None = None
+        self._adapters: AdapterRuntime | None = None
+        self._runtime_config: dict[str, Any] = {}
+
+    def initialize(self, config: Path, broker_factory: Any | None = None) -> None:
+        try:
+            self._runtime_config = (
+                {} if broker_factory is not None
+                else json.loads(Path(config).read_text(encoding="utf-8-sig"))
+            )
+            if broker_factory is not None:
+                # Unit tests can inject a harmless in-process fake. Production
+                # always uses the crash boundary below.
+                broker = broker_factory(config)
+                initial = broker.start()
+            else:
+                # ``multiprocessing`` defaults to ``sys._base_executable`` on
+                # Windows venvs. That loses this project's site-packages and
+                # can import an incompatible global ``pyAgxArm``. Hardware
+                # workers must use the same interpreter as this service.
+                multiprocessing.set_executable(str(CONTROL_PYTHON))
+                context = multiprocessing.get_context("spawn")
+                parent_connection, child_connection = context.Pipe()
+                process = context.Process(
+                    target=_backend_worker_main,
+                    args=(child_connection, str(Path(config).resolve())),
+                    name="nero-hardware-backend",
+                    daemon=False,
+                )
+                process.start()
+                child_connection.close()
+                self._backend_process = process
+                # The worker's broker has its own bounded startup timeout. A
+                # native SDK crash closes the pipe without taking HTTP down.
+                if not parent_connection.poll(25.0):
+                    raise RuntimeError("hardware backend did not finish startup within 25s")
+                try:
+                    response = parent_connection.recv()
+                except EOFError as exc:
+                    process.join(timeout=0.5)
+                    raise RuntimeError(
+                        f"hardware backend exited during startup (code={process.exitcode})"
+                    ) from exc
+                if response.get("kind") != "ready":
+                    raise RuntimeError(
+                        f"{response.get('error_type', 'RuntimeError')}: "
+                        f"{response.get('error', 'hardware backend startup failed')}"
+                    )
+                initial = response.get("initial")
+                broker = BackendProcessProxy(process, parent_connection)
+        except BaseException as exc:
+            # SystemExit raised by a dependency must not take down the page.
+            with self._lock:
+                self._phase = "error"
+                self._error = f"{type(exc).__name__}: {exc}"
+            print(json.dumps({"control_backend_ready": False, "error": self._error}, ensure_ascii=False), flush=True)
+            return
+        with self._lock:
+            self._broker = broker
+            self._initial = dict(initial) if isinstance(initial, dict) else {"result": initial}
+            self._phase = "ready"
+            self._error = None
+        try:
+            adapters = AdapterRuntime(broker, PROJECT_ROOT, self._runtime_config)
+        except BaseException as exc:
+            with self._lock:
+                self._phase = "error"
+                self._error = f"AdapterRuntime: {type(exc).__name__}: {exc}"
+            return
+        with self._lock:
+            self._adapters = adapters
+        print(json.dumps({"control_backend_ready": True, "initial": initial}, ensure_ascii=False, default=str), flush=True)
+
+    def require_broker(self) -> OperationalSpaceController:
+        with self._lock:
+            if self._broker is not None and self._phase == "ready":
+                return self._broker
+            detail = self._error or "control backend is still initializing"
+            raise ControlServiceUnavailable(detail)
+
+    def require_adapters(self) -> AdapterRuntime:
+        with self._lock:
+            if self._adapters is not None and self._phase == "ready":
+                return self._adapters
+            raise ControlServiceUnavailable(self._error or "input adapters are still initializing")
+
+    def health(self) -> dict[str, Any]:
+        with self._lock:
+            broker = self._broker
+            result = {
+                "role": "nero-control-service",
+                "pid": os.getpid(),
+                "http_ready": True,
+                "control_backend_phase": self._phase,
+                "control_backend_ready": self._phase == "ready" and broker is not None,
+                "control_backend_error": self._error,
+                "bootstrap_elapsed_s": max(0.0, time.monotonic() - self._started_monotonic),
+                "initial": dict(self._initial) if self._initial is not None else None,
+            }
+        if broker is not None:
+            try:
+                result.update(broker.health())
+            except Exception as exc:
+                result["broker_health_error"] = f"{type(exc).__name__}: {exc}"
+        with self._lock:
+            adapters = self._adapters
+        if adapters is not None:
+            result.update(adapters.health())
+        return result
+
+    def close(self) -> None:
+        with self._lock:
+            broker = self._broker
+            self._broker = None
+            adapters = self._adapters
+            self._adapters = None
+            self._phase = "stopped"
+        if adapters is not None:
+            adapters.close()
+        if isinstance(broker, BackendProcessProxy):
+            broker.terminate()
+        elif broker is not None:
+            broker.close()
+        elif self._backend_process is not None:
+            BackendProcessProxy(self._backend_process, None).terminate()
+
+
+def control_page_is_healthy(url: str) -> bool:
+    """Only open an existing console after proving that it answers locally."""
+    try:
+        with urlopen(f"{url.rstrip('/')}/api/health", timeout=0.5) as response:
+            return response.status == HTTPStatus.OK
+    except (OSError, URLError):
+        return False
+
+
+def schedule_service_reset() -> dict[str, Any]:
+    """Schedule an independent process restart without touching the robot.
+
+    The HTTP handler returns before the current process exits.  The helper
+    waits for this PID to disappear, then starts exactly one replacement
+    service.  This remains usable even when an SDK call is stuck in another
+    thread.
+    """
+    global _RESET_PENDING
+    with _RESET_LOCK:
+        if _RESET_PENDING:
+            return {"status": "already_scheduled", "robot_commands_sent": False}
+        _RESET_PENDING = True
+    command = [
+        str(CONTROL_PYTHON),
+        str(Path(__file__).resolve().with_name("nero_control_service_restart.py")),
+        "--old-pid",
+        str(os.getpid()),
+        "--project-root",
+        str(PROJECT_ROOT),
+        "--service-script",
+        str(Path(__file__).resolve()),
+        "--service-python",
+        str(CONTROL_PYTHON),
+        "--config",
+        str(PROJECT_ROOT / "config" / "runtime.json"),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8765",
+    ]
+    if os.name == "nt":
+        # A direct detached child can still be collected with the service by
+        # the Windows process job used by the desktop shell.  PowerShell's
+        # Start-Process creates the independent process tree we need here.
+        quote_ps = lambda value: "'" + str(value).replace("'", "''") + "'"
+        arguments = ",".join(quote_ps(value) for value in command[1:])
+        powershell = (
+            f"Start-Process -FilePath {quote_ps(command[0])} "
+            f"-ArgumentList @({arguments}) -WorkingDirectory {quote_ps(PROJECT_ROOT)} "
+            "-WindowStyle Hidden"
+        )
+        subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", powershell],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    else:
+        subprocess.Popen(
+            command,
+            cwd=str(PROJECT_ROOT),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+
+    def terminate_after_response() -> None:
+        time.sleep(0.5)
+        os._exit(0)
+
+    threading.Thread(target=terminate_after_response, name="control-service-reset", daemon=True).start()
+    return {"status": "restart_scheduled", "robot_commands_sent": False, "retry_after_s": 2}
+
+
+def ensure_reset_watchdog() -> None:
+    """Keep a separate localhost reset agent available for this service."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.2)
+        if probe.connect_ex(("127.0.0.1", 8767)) == 0:
+            return
+    command = [
+        str(CONTROL_PYTHON),
+        str(Path(__file__).resolve().with_name("nero_control_watchdog.py")),
+        "--project-root",
+        str(PROJECT_ROOT),
+        "--service-script",
+        str(Path(__file__).resolve()),
+        "--config",
+        str(PROJECT_ROOT / "config" / "runtime.json"),
+        "--service-python",
+        str(CONTROL_PYTHON),
+        "--port",
+        "8767",
+    ]
+    if os.name == "nt":
+        quote_ps = lambda value: "'" + str(value).replace("'", "''") + "'"
+        arguments = ",".join(quote_ps(value) for value in command[1:])
+        powershell = (
+            f"Start-Process -FilePath {quote_ps(command[0])} "
+            f"-ArgumentList @({arguments}) -WorkingDirectory {quote_ps(PROJECT_ROOT)} "
+            "-WindowStyle Hidden"
+        )
+        subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", powershell],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    else:
+        subprocess.Popen(
+            command,
+            cwd=str(PROJECT_ROOT),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+
+
+def _matching_local_processes(script_name: str) -> list[int]:
+    if os.name != "nt":
+        return []
+    command = (
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { $_.Name -like 'python*' } | "
+        "Select-Object ProcessId,CommandLine | ConvertTo-Json"
+    )
+    try:
+        output = subprocess.check_output(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=3.0,
+        ).strip()
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if not output:
+        return []
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return []
+    rows = payload if isinstance(payload, list) else [payload]
+    root_text = str(PROJECT_ROOT).lower()
+    script_text = script_name.lower()
+    pids: list[int] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        command_line = str(row.get("CommandLine") or "").lower()
+        module_text = script_text.replace(".py", "").replace("\\", ".")
+        if root_text not in command_line or (script_text not in command_line and module_text not in command_line):
+            continue
+        if "nero_control_service_restart.py" in command_line:
+            continue
+        if script_text == "nero_control_server.py" and "nero_control_watchdog.py" in command_line:
+            continue
+        if script_text == "nero_control_watchdog.py" and "nero_control_server.py --config" in command_line:
+            continue
+        try:
+            pids.append(int(row.get("ProcessId")))
+        except (TypeError, ValueError):
+            pass
+    return pids
+
+
+def _terminate_pid(pid: int) -> None:
+    if pid <= 0 or pid == os.getpid():
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            check=False,
+        )
+    else:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+
+
+def _lock_pid(path: Path) -> int | None:
+    try:
+        return int(json.loads(path.read_text(encoding="utf-8")).get("pid", 0))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def prune_duplicate_local_processes() -> None:
+    service_lock_pid = _lock_pid(PROJECT_ROOT / "runtime" / "nero_control_service.lock")
+    if service_lock_pid != os.getpid():
+        return
+    for pid in _matching_local_processes("nero_control_server.py"):
+        if pid != os.getpid():
+            _terminate_pid(pid)
+    watchdog_lock_pid = _lock_pid(PROJECT_ROOT / "runtime" / "nero_control_watchdog.lock")
+    for pid in _matching_local_processes("nero_control_watchdog.py"):
+        if watchdog_lock_pid is not None and pid != watchdog_lock_pid:
+            _terminate_pid(pid)
+
+
+class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+    def server_bind(self) -> None:
+        super().server_bind()
+
+
+class PicoIngressDispatcher:
+    """Dispatch one latest PICO input frame to the robot-facing adapter."""
+
+    def __init__(self, process: Any, observe: Any, complete: Any | None = None) -> None:
+        self._process, self._observe, self._complete = process, observe, complete
+        self._condition = threading.Condition(threading.RLock())
+        self._latest_frame: tuple[str, dict[str, Any], int] | None = None
+        # Grip is a dead-man control edge, not a droppable telemetry sample.
+        # Keep edge frames separately so a burst of pose samples cannot
+        # overwrite the press before the worker handles it.
+        self._control_frames: deque[tuple[str, dict[str, Any], int]] = deque(maxlen=8)
+        self._last_grip: bool | None = None
+        self._stop = False
+        self._closed = False
+        self._overwritten_frames = 0
+        self._max_depth = 0
+        self._thread = threading.Thread(target=self._run, name="nero-pico-osc-dispatch", daemon=True)
+        self._thread.start()
+
+    def submit(self, kind: str, payload: dict[str, Any], sequence: int) -> dict[str, Any]:
+        with self._condition:
+            if kind == "input_frame" and "grip" in payload:
+                grip = bool(payload.get("grip"))
+                if self._last_grip is None or grip != self._last_grip:
+                    self._control_frames.append((kind, payload, sequence))
+                self._last_grip = grip
+            if self._latest_frame is not None:
+                self._overwritten_frames += 1
+            self._latest_frame = (kind, payload, sequence)
+            depth = int(self._latest_frame is not None)
+            self._max_depth = max(self._max_depth, depth)
+            self._condition.notify()
+            return {"accepted": True, "queued": True,
+                    "pending": True,
+                    "queue_depth": depth,
+                    "overwritten_input_frames": self._overwritten_frames}
+
+    def _take(self) -> tuple[str, dict[str, Any], int] | None:
+        with self._condition:
+            while not self._stop and self._latest_frame is None and not self._control_frames:
+                self._condition.wait(timeout=0.25)
+            if self._stop:
+                return None
+            if self._control_frames:
+                item = self._control_frames.popleft()
+            else:
+                item, self._latest_frame = self._latest_frame, None
+            return item
+
+    def _run(self) -> None:
+        while True:
+            item = self._take()
+            if item is None:
+                return
+            kind, payload, sequence = item
+            started = time.monotonic_ns()
+            self._observe("dispatch_started", kind, sequence, started, self.depth())
+            try:
+                result = self._process(kind, payload)
+                self._observe("dispatch_finished", kind, sequence, time.monotonic_ns(), self.depth(), result=result)
+                result_dict = result if isinstance(result, dict) else {}
+                if self._complete is not None and result_dict.get("event"):
+                    self._complete(str(result_dict["event"]), sequence, result_dict, None)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                self._observe("dispatch_error", kind, sequence, time.monotonic_ns(), self.depth(), error=error)
+                if self._complete is not None:
+                    self._complete(kind, sequence, None, error)
+
+    def depth(self) -> int:
+        with self._condition:
+            return int(self._latest_frame is not None) + len(self._control_frames)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._condition:
+            return {"queue_depth": self.depth(), "max_queue_depth": self._max_depth,
+                    "overwritten_input_frames": self._overwritten_frames,
+                    "worker_alive": self._thread.is_alive()}
+
+    def close(self) -> None:
+        with self._condition:
+            self._stop = True
+            self._control_frames.clear()
+            self._condition.notify_all()
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=2.0)
+
+
+class PicoGateway:
+    """Small, paired LAN ingress which never exposes the HTTP control API."""
+
+    def __init__(self, runtime: ServiceRuntime, config: dict[str, Any]) -> None:
+        self.runtime, self.config = runtime, dict(config)
+        self.server_instance_id = secrets.token_hex(8)
+        self._lock = threading.RLock()
+        self._send_lock = threading.RLock()
+        self._server: Any | None = None
+        self._thread: threading.Thread | None = None
+        self._pair: dict[str, Any] | None = None
+        self._connection_active = False
+        self._last_input_monotonic = 0.0
+        self._connection_attempts = 0
+        self._last_connection_attempt_at: float | None = None
+        self._last_client: str | None = None
+        self._last_connection_stage = "idle"
+        self._last_connection_error: str | None = None
+        self._last_message_type: str | None = None
+        self._last_message_sequence: int | None = None
+        self._received_count = 0
+        self._sequence_gap_count = 0
+        self._last_receive_gap_ms: float | None = None
+        self._last_receive_monotonic_ns: int | None = None
+        self._input_frame_receive_times_ns: list[int] = []
+        self._input_frame_rx_hz: float | None = None
+        self._last_input_frame_grip = False
+        self._last_input_frame_trigger = 0.0
+        self._last_input_frame_tracking = False
+        self._last_input_frame_position = [0.0, 0.0, 0.0]
+        self._last_input_frame_orientation = [0.0, 0.0, 0.0, 1.0]
+        self._input_frame_overwrites = 0
+        self._last_ack_processing_ms: float | None = None
+        self._last_dispatch_type: str | None = None
+        self._last_dispatch_sequence: int | None = None
+        self._last_dispatch_duration_ms: float | None = None
+        self._last_dispatch_error: str | None = None
+        self._dispatch_started_ns: int | None = None
+        self._dispatch: PicoIngressDispatcher | None = None
+        self.error: str | None = None
+        trace_dir = PROJECT_ROOT / "runtime" / "logs" / "pico"
+        self.trace_logger = AsyncJsonlTraceLogger(
+            trace_dir / f"pico-gateway-{time.strftime('%Y%m%dT%H%M%S')}.jsonl",
+            {"component": "pico_gateway", "server_instance_id": self.server_instance_id},
+        )
+
+    def _advertised_host(self) -> str:
+        host = str(self.config.get("host", "0.0.0.0"))
+        advertised = str(self.config.get("advertise_host", "")).strip()
+        if not advertised and host in {"0.0.0.0", "", "localhost", "127.0.0.1"}:
+            advertised = (_local_ipv4_address() or "<PC-LAN-IP>")
+        return advertised or host
+
+    @staticmethod
+    def _canonical_endpoint(value: str) -> str:
+        parsed = urlparse(str(value).strip())
+        if parsed.scheme not in {"ws", "wss"} or not parsed.hostname or parsed.query or parsed.fragment:
+            return ""
+        host = parsed.hostname.lower()
+        port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+        return f"{parsed.scheme.lower()}://{host}:{port}{parsed.path.rstrip('/') or '/'}"
+
+    @staticmethod
+    def _request_endpoint(connection: Any) -> tuple[str, str]:
+        request = getattr(connection, "request", None) or getattr(getattr(connection, "protocol", None), "request", None)
+        if request is None:
+            return "", ""
+        return str(getattr(request, "headers", {}).get("Host", "")).strip().lower(), str(getattr(request, "path", "") or "")
+
+    def start(self) -> None:
+        if not bool(self.config.get("enabled", True)):
+            return
+        try:
+            from websockets.sync.server import serve
+        except ImportError as exc:
+            self.error = "websockets dependency is not installed"
+            print(json.dumps({"pico_gateway_ready": False, "error": self.error}), flush=True)
+            return
+        host, port = str(self.config.get("host", "0.0.0.0")), int(self.config.get("port", 8768))
+        try:
+            self._server = serve(
+                self._handle_connection, host, port,
+                max_size=int(self.config.get("max_message_bytes", 4096)),
+                ping_interval=10, ping_timeout=5,
+            )
+        except OSError as exc:
+            self.error = f"could not bind {host}:{port}: {exc}"
+            print(json.dumps({"pico_gateway_ready": False, "error": self.error}), flush=True)
+            return
+        self._thread = threading.Thread(target=self._server.serve_forever, name="nero-pico-gateway", daemon=True)
+        self._thread.start()
+        print(json.dumps({"pico_gateway_ready": True, "host": host, "port": port}), flush=True)
+
+    def close(self) -> None:
+        dispatcher = self._dispatch
+        self._dispatch = None
+        if dispatcher is not None:
+            dispatcher.close()
+        server = self._server
+        self._server = None
+        if server is not None:
+            server.shutdown()
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout=1.0)
+        self.trace_logger.close()
+
+    def create_pairing(self, session_id: str, client_id: str) -> dict[str, Any]:
+        if self._server is None:
+            raise RuntimeError(self.error or "PICO WebSocket gateway is unavailable")
+        self.runtime.require_adapters().pico_begin_pairing(session_id, client_id)
+        code, pairing_id = f"{secrets.randbelow(1_000_000):06d}", secrets.token_urlsafe(18).rstrip("=")
+        ttl = float(self.config.get("pair_ttl_s", 120.0))
+        ws_url = f"ws://{self._advertised_host()}:{int(self.config.get('port', 8768))}/pair/{pairing_id}"
+        with self._lock:
+            self._pair = {"session_id": session_id, "client_id": client_id, "code": code, "pairing_id": pairing_id,
+                          "ws_url": ws_url, "expires_monotonic": time.monotonic() + ttl, "expires_at": time.time() + ttl, "paired": False}
+            self._connection_active = False
+            self._last_input_monotonic = 0.0
+            self._input_frame_receive_times_ns = []
+            self._input_frame_rx_hz = None
+            self._last_input_frame_grip = False
+            self._last_input_frame_trigger = 0.0
+            self._last_input_frame_tracking = False
+            self._input_frame_overwrites = 0
+            self._last_connection_stage = "waiting_for_auth"
+            self._last_connection_error = None
+        result = self.runtime.require_adapters().pico_state()
+        result["gateway"] = self.status()
+        return result
+
+    def resolve_pairing_url(self, code: str, base_url: str) -> dict[str, Any]:
+        with self._lock:
+            pair = dict(self._pair) if self._pair else None
+            expected = urlparse(str(pair.get("ws_url", ""))) if pair else None
+            requested = urlparse(str(base_url).strip())
+            if not pair or time.monotonic() > float(pair["expires_monotonic"]):
+                raise PermissionError("PICO pairing is missing or expired")
+            if not secrets.compare_digest(str(code).strip(), str(pair["code"])):
+                raise PermissionError("PICO pairing code is incorrect")
+            if not expected or requested.scheme != expected.scheme or requested.netloc.lower() != expected.netloc.lower() or requested.path not in {"", "/"} or requested.query or requested.fragment:
+                raise PermissionError("PICO gateway address does not match the console-generated host")
+            return {"ws_url": pair["ws_url"], "pairing_id": pair["pairing_id"], "expires_at": pair["expires_at"]}
+
+    def invalidate(self) -> None:
+        dispatcher = self._dispatch
+        self._dispatch = None
+        if dispatcher is not None:
+            dispatcher.close()
+        with self._lock:
+            self._pair = None
+            self._connection_active = False
+        try:
+            self.runtime.require_adapters().pico_disconnected("PICO pairing invalidated")
+        except Exception:
+            pass
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            pair = dict(self._pair) if self._pair else None
+            active = bool(pair and pair.get("paired"))
+            dispatcher_snapshot = self._dispatch.snapshot() if self._dispatch is not None else {"worker_alive": False, "queue_depth": 0, "overwritten_input_frames": 0}
+            host = str(self.config.get("host", "0.0.0.0"))
+            advertised_host = self._advertised_host()
+            result = {
+                "enabled": bool(self.config.get("enabled", True)), "ready": self._server is not None,
+                "host": host, "port": int(self.config.get("port", 8768)),
+                "ws_url": pair.get("ws_url") if pair else f"ws://{advertised_host}:{int(self.config.get('port', 8768))}",
+                "session_id": pair.get("session_id") if pair else None,
+                "pair_code": pair.get("code") if pair and not pair.get("paired") else None,
+                "pairing_id": pair.get("pairing_id") if pair else None,
+                "expires_at": pair.get("expires_at") if pair else None,
+                "paired": active, "connection_active": self._connection_active,
+                "connection_attempts": self._connection_attempts,
+                "last_connection_attempt_at": self._last_connection_attempt_at,
+                "last_client": self._last_client,
+                "connection_stage": self._last_connection_stage,
+                "last_connection_error": self._last_connection_error,
+                "last_message_type": self._last_message_type,
+                "last_message_sequence": self._last_message_sequence,
+                "received_count": self._received_count,
+                "sequence_gap_count": self._sequence_gap_count,
+                "last_receive_gap_ms": self._last_receive_gap_ms,
+                "pose_rx_hz": self._input_frame_rx_hz,
+                "input_frame_rx_hz": self._input_frame_rx_hz,
+                "input_frame_grip": self._last_input_frame_grip,
+                "input_frame_trigger_value": self._last_input_frame_trigger,
+                "input_frame_tracking_valid": self._last_input_frame_tracking,
+                "input_frame_position_m": list(self._last_input_frame_position),
+                "input_frame_orientation_xyzw": list(self._last_input_frame_orientation),
+                "input_frame_overwrites": dispatcher_snapshot.get("overwritten_input_frames", self._input_frame_overwrites),
+                "last_ack_processing_ms": self._last_ack_processing_ms,
+                "last_signal_age_ms": None if self._last_receive_monotonic_ns is None else max(0.0, (time.monotonic_ns() - self._last_receive_monotonic_ns) / 1e6),
+                "last_dispatch_type": self._last_dispatch_type,
+                "last_dispatch_sequence": self._last_dispatch_sequence,
+                "last_dispatch_duration_ms": self._last_dispatch_duration_ms,
+                "last_dispatch_error": self._last_dispatch_error,
+                "dispatcher": dispatcher_snapshot,
+                "trace_logging": {"enabled": True, "path": str(self.trace_logger.path.resolve()), "schema": "pico-trace.v1"},
+                "connection_state": (
+                    "CONNECTED_CONTROL_UNAVAILABLE"
+                    if self._connection_active and self._last_connection_stage == "control_unavailable"
+                    else "CONNECTED" if self._connection_active
+                    else "RECONNECTING" if active else "DISCONNECTED"
+                ),
+                "last_input_age_s": None if not self._last_input_monotonic else max(0.0, time.monotonic() - self._last_input_monotonic),
+                "error": self.error,
+            }
+            return result
+
+    def pair_svg(self) -> bytes | None:
+        status = self.status()
+        if not status.get("pair_code"):
+            return None
+        uri = f"nero-pico://pair?ws={status['ws_url']}&session={status['session_id']}&code={status['pair_code']}"
+        import qrcode
+        import qrcode.image.svg
+        return qrcode.make(uri, image_factory=qrcode.image.svg.SvgPathImage, border=1).to_string(encoding="utf-8")
+
+    def _send(self, connection: Any, payload: dict[str, Any]) -> None:
+        with self._send_lock:
+            connection.send(json.dumps(payload, ensure_ascii=False))
+
+    def _send_control_result(self, connection: Any, kind: str, sequence: int, result: Any, error: str | None) -> None:
+        data = dict(result) if isinstance(result, dict) else {}
+        if error:
+            data.update({"accepted": False, "recoverable": True, "reason": "control_unavailable", "message": error})
+        else:
+            data.setdefault("accepted", bool(data.get("ok", False)))
+        try:
+            self._send(connection, {"ok": not bool(error) and bool(data.get("accepted", False)),
+                                    "type": "control_result", "event": kind, "sequence": sequence, "data": data})
+        except Exception:
+            # The socket may have closed while the robot-facing worker was
+            # finishing a control edge. The connection cleanup owns that case.
+            pass
+
+    def _observe_dispatch(self, event: str, kind: str, sequence: int, monotonic_ns: int, depth: int, *, result: Any = None, error: str | None = None) -> None:
+        with self._lock:
+            if event == "dispatch_started":
+                self._dispatch_started_ns = monotonic_ns
+            elif event == "dispatch_finished":
+                self._last_dispatch_type = kind
+                self._last_dispatch_sequence = sequence
+                self._last_dispatch_error = None
+                self._last_dispatch_duration_ms = max(0.0, (monotonic_ns - (self._dispatch_started_ns or monotonic_ns)) / 1e6)
+            elif event == "dispatch_error":
+                self._last_dispatch_type = kind
+                self._last_dispatch_sequence = sequence
+                self._last_dispatch_error = error
+                self._last_dispatch_duration_ms = max(0.0, (monotonic_ns - (self._dispatch_started_ns or monotonic_ns)) / 1e6)
+                self._last_connection_stage = "control_unavailable"
+                self._last_connection_error = error
+        self.trace_logger.append({"record_type": "sample", "event": f"gateway_{event}",
+                                  "monotonic_ns": monotonic_ns, "pico_sequence": sequence,
+                                  "message_type": kind, "queue_depth": depth, "error": error,
+                                  "result": result if event == "dispatch_finished" else None})
+
+    def _handle_connection(self, connection: Any) -> None:
+        paired_session: str | None = None
+        paired_pairing_id: str | None = None
+        last_sequence = 0
+        client = getattr(connection, "remote_address", None)
+        client_label = str(client) if client is not None else "unknown"
+        with self._lock:
+            self._connection_attempts += 1
+            self._last_connection_attempt_at = time.time()
+            self._last_client = client_label
+            self._last_connection_stage = "waiting_for_auth"
+            self._last_connection_error = None
+        try:
+            raw = connection.recv(timeout=10)
+            message = json.loads(raw)
+            self.trace_logger.append({"record_type": "event", "event": "gateway_pair_received",
+                                      "monotonic_ns": time.monotonic_ns(), "remote": client_label})
+            if not isinstance(message, dict) or message.get("type") != "pair":
+                raise PermissionError("first WebSocket message must be pair")
+            with self._lock:
+                pair = dict(self._pair) if self._pair else None
+                supplied_session = str(message.get("session_id", "")).strip()
+                supplied_pairing = str(message.get("pairing_id", "")).strip()
+                supplied_gateway = self._canonical_endpoint(str(message.get("gateway_url", "")))
+                expected_gateway = self._canonical_endpoint(str(pair.get("ws_url", ""))) if pair else ""
+                expected_uri = urlparse(str(pair.get("ws_url", ""))) if pair else None
+                requested_host, requested_path = self._request_endpoint(connection)
+                valid = bool(
+                    pair
+                    # A dropped headset socket may reconnect with its still
+                    # valid pairing record.  A second *simultaneous* socket
+                    # is rejected so it cannot contend for robot control.
+                    and (not pair.get("paired") or not self._connection_active)
+                    and time.monotonic() <= float(pair["expires_monotonic"])
+                    and secrets.compare_digest(str(message.get("code", "")), str(pair["code"]))
+                    and supplied_pairing == str(pair["pairing_id"])
+                    and supplied_gateway == expected_gateway
+                    and (not supplied_session or supplied_session == str(pair["session_id"]))
+                    and requested_host == str(expected_uri.netloc).lower()
+                    and requested_path == str(expected_uri.path)
+                )
+                if not valid:
+                    raise PermissionError("PICO pairing rejected: invalid code, endpoint, or session")
+                self._pair["paired"] = True
+                self._connection_active = True
+                paired_session = str(pair["session_id"])
+                paired_pairing_id = str(pair["pairing_id"])
+            self.trace_logger.append({"record_type": "event", "event": "gateway_pair_accepted",
+                                      "monotonic_ns": time.monotonic_ns(), "session_id": paired_session,
+                                      "pairing_id": paired_pairing_id})
+            self.runtime.require_adapters().pico_paired()
+            with self._lock:
+                self._last_connection_stage = "paired"
+            dispatcher = PicoIngressDispatcher(
+                lambda kind, payload: self.runtime.require_adapters().pico_message(kind, payload),
+                self._observe_dispatch,
+                lambda kind, sequence, result, error: self._send_control_result(connection, kind, sequence, result, error),
+            )
+            self._dispatch = dispatcher
+            self._send(connection, {"ok": True, "type": "paired", "session_id": paired_session,
+                                    "server_instance_id": self.server_instance_id,
+                                    "capabilities": ["input_frame", "disconnect"],
+                                    "recommended_input_hz": 100,
+                                    "control_period_ms": 20})
+            idle_since = time.monotonic()
+            while True:
+                try:
+                    raw = connection.recv(timeout=float(self.config.get("message_timeout_s", 2.0)))
+                except TimeoutError:
+                    if time.monotonic() - idle_since >= float(self.config.get("idle_timeout_s", 30.0)):
+                        raise TimeoutError("PICO gateway idle timeout")
+                    continue
+                if len(raw.encode("utf-8")) > int(self.config.get("max_message_bytes", 4096)):
+                    raise ValueError("PICO message is too large")
+                message = json.loads(raw)
+                if not isinstance(message, dict):
+                    raise PermissionError("PICO message must be an object")
+                sequence = int(message.get("sequence", -1))
+                if sequence <= last_sequence:
+                    raise PermissionError("PICO sequence is not monotonic")
+                if last_sequence and sequence > last_sequence + 1:
+                    with self._lock:
+                        self._sequence_gap_count += sequence - last_sequence - 1
+                kind = str(message.get("type", ""))
+                with self._lock:
+                    self._last_message_type = kind
+                    self._last_message_sequence = sequence
+                if kind not in {"input_frame", "disconnect"}:
+                    raise ValueError("unsupported PICO message type; input_frame is required")
+                if kind == "disconnect":
+                    last_sequence = sequence
+                    self._send(connection, {"ok": True, "type": "ack", "sequence": sequence})
+                    break
+                position = message.get("position_m")
+                orientation = message.get("orientation_xyzw")
+                grip = bool(message.get("grip", False))
+                trigger_value = float(message.get("trigger_value", 0.0))
+                if not isinstance(position, list) or len(position) != 3:
+                    raise ValueError("input_frame.position_m must contain 3 values")
+                if not isinstance(orientation, list) or len(orientation) != 4:
+                    raise ValueError("input_frame.orientation_xyzw must contain 4 values")
+                if not math.isfinite(trigger_value) or trigger_value < 0.0 or trigger_value > 1.0:
+                    raise ValueError("input_frame.trigger_value must be between 0 and 1")
+                gateway_received_ns = time.monotonic_ns()
+                with self._lock:
+                    self._received_count += 1
+                    self._last_receive_gap_ms = None if self._last_receive_monotonic_ns is None else max(0.0, (gateway_received_ns - self._last_receive_monotonic_ns) / 1e6)
+                    self._last_receive_monotonic_ns = gateway_received_ns
+                    self._input_frame_receive_times_ns.append(gateway_received_ns)
+                    if len(self._input_frame_receive_times_ns) > 32:
+                        del self._input_frame_receive_times_ns[:-32]
+                    if len(self._input_frame_receive_times_ns) >= 2:
+                        elapsed_ns = self._input_frame_receive_times_ns[-1] - self._input_frame_receive_times_ns[0]
+                        self._input_frame_rx_hz = ((len(self._input_frame_receive_times_ns) - 1) * 1e9 / elapsed_ns) if elapsed_ns > 0 else None
+                    self._last_input_frame_grip = grip
+                    self._last_input_frame_trigger = trigger_value
+                    self._last_input_frame_tracking = bool(message.get("tracking_valid", True))
+                    self._last_input_frame_position = list(position)
+                    self._last_input_frame_orientation = list(orientation)
+                self.trace_logger.append({"record_type": "sample", "event": "gateway_message_received",
+                                          "monotonic_ns": gateway_received_ns, "pico_sequence": sequence,
+                                          "message_type": kind, "session_id": paired_session})
+                payload: dict[str, Any] = {"position_m": position, "orientation_xyzw": orientation,
+                                            "tracking_valid": bool(message.get("tracking_valid", True)),
+                                            "grip": grip, "trigger_value": trigger_value,
+                                            "_pico_sequence": sequence,
+                                            "_gateway_received_monotonic_ns": gateway_received_ns}
+                result = dispatcher.submit(kind, payload, sequence)
+                with self._lock:
+                    self._last_connection_stage = "paired"
+                    self._last_connection_error = None
+                last_sequence = sequence
+                idle_since = time.monotonic()
+                with self._lock:
+                    self._last_input_monotonic = time.monotonic()
+                with self._lock:
+                    self._last_ack_processing_ms = max(0.0, (time.monotonic_ns() - gateway_received_ns) / 1e6)
+                self.trace_logger.append({"record_type": "sample", "event": "gateway_frame_accepted",
+                                          "monotonic_ns": time.monotonic_ns(), "pico_sequence": sequence,
+                                          "message_type": kind, "processing_ms": max(0.0, (time.monotonic_ns() - gateway_received_ns) / 1e6),
+                                          "input_frame_overwrites": result.get("overwritten_input_frames", 0) if isinstance(result, dict) else 0})
+        except TimeoutError:
+            with self._lock:
+                self._last_connection_stage = "auth_timeout" if not paired_session else "input_timeout"
+                self._last_connection_error = "PICO connection timed out waiting for data"
+        except Exception as exc:
+            with self._lock:
+                self._last_connection_stage = "rejected" if not paired_session else "runtime_error"
+                self._last_connection_error = f"{type(exc).__name__}: {exc}"
+            try:
+                self._send(connection, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            except Exception:
+                pass
+        finally:
+            owns_current_pair = False
+            with self._lock:
+                # An obsolete or rejected socket must never tear down a newer
+                # successfully paired socket.  Only the connection that owns
+                # the current pairing record may clear gateway and adapter
+                # state. Session IDs can be reused, so compare pairing IDs.
+                if paired_pairing_id and self._pair and str(self._pair.get("pairing_id")) == paired_pairing_id:
+                    owns_current_pair = True
+                    self._connection_active = False
+                    # Socket loss is a transport reconnect, not receiver stop.
+                    # The explicit console Stop button is the only invalidator.
+                    self._pair["paired"] = True
+            if owns_current_pair:
+                dispatcher = self._dispatch
+                self._dispatch = None
+                if dispatcher is not None:
+                    dispatcher.close()
+                try:
+                    self.runtime.require_adapters().pico_connection_lost(
+                        self._last_connection_error or "PICO input connection closed")
+                except Exception:
+                    pass
+                # Keep the short-lived pairing record so a reconnecting
+                # headset can resume safely.  The adapter is explicitly put
+                # into HOLD/READY and no target is emitted here.
+
+
+class ControlRequestHandler(BaseHTTPRequestHandler):
+    runtime: ServiceRuntime
+    pico_gateway: PicoGateway | None = None
+
+    @property
+    def broker(self) -> OperationalSpaceController:
+        return self.runtime.require_broker()
+
+    def log_message(self, format: str, *args: Any) -> None:
+        print(f"[control-ui] {self.address_string()} {format % args}")
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path == "/api/status":
+                return self._json_ok(self.broker.status())
+            if parsed.path.startswith("/api/actions/"):
+                return self._json_ok(self.broker.action_status(parsed.path.rsplit("/", 1)[-1]))
+            if parsed.path == "/api/health":
+                return self._json_ok(self.runtime.health())
+            if parsed.path == "/api/broker/status":
+                return self._json_ok(self.broker.broker_status())
+            if parsed.path == "/api/osc/state":
+                return self._json_ok(self.broker.osc_state())
+            if parsed.path == "/api/osc/fast-state":
+                return self._json_ok(self.broker.osc_state())
+            if parsed.path == "/api/osc/kinematics":
+                return self._json_ok(self.broker.osc_kinematics())
+            if parsed.path == "/api/osc/telemetry/read-only":
+                query = parse_qs(parsed.query)
+                samples = int((query.get("samples") or [50])[0])
+                return self._json_ok(self.broker.osc_calibrate_readonly_hardware(samples))
+            if parsed.path == "/api/pi05/state":
+                return self._json_ok(self.runtime.require_adapters().pi05_state())
+            if parsed.path == "/api/cameras/state":
+                return self._json_ok(self.runtime.require_adapters().camera_state())
+            if parsed.path == "/api/dataset/state":
+                return self._json_ok(self.runtime.require_adapters().dataset_state())
+            if parsed.path == "/api/dataset/episodes":
+                return self._json_ok(self.runtime.require_adapters().dataset_episodes())
+            if parsed.path == "/api/adapters/pico/state":
+                result = self.runtime.require_adapters().pico_state()
+                if self.pico_gateway is not None:
+                    result["gateway"] = self.pico_gateway.status()
+                return self._json_ok(result)
+            if parsed.path == "/api/adapters/pico/resolve":
+                if self.pico_gateway is None:
+                    raise RuntimeError("PICO gateway is unavailable")
+                query = parse_qs(parsed.query)
+                return self._json_ok(self.pico_gateway.resolve_pairing_url(
+                    str((query.get("code") or [""])[0]), str((query.get("ws") or [""])[0])))
+            if parsed.path == "/api/adapters/pico/pair.svg":
+                if self.pico_gateway is None:
+                    return self.send_error(HTTPStatus.NOT_FOUND, "PICO gateway is unavailable")
+                payload = self.pico_gateway.pair_svg()
+                if payload is None:
+                    return self.send_error(HTTPStatus.NOT_FOUND, "PICO pairing QR is not available")
+                return self._send_bytes(payload, "image/svg+xml")
+            if parsed.path in {"/api/cameras/list", "/api/pi05/cameras/list"}:
+                return self._json_ok({"cameras": self.runtime.require_adapters().camera_devices()})
+            if parsed.path in {"/api/cameras/frame/external.jpg", "/api/cameras/frame/wrist.jpg", "/api/pi05/frame/external.jpg", "/api/pi05/frame/wrist.jpg"}:
+                payload = self.runtime.require_adapters().camera_frame_jpeg("external" if "external" in parsed.path else "wrist")
+                if payload is None:
+                    return self.send_error(HTTPStatus.NOT_FOUND, "π0.5 camera frame is not available")
+                return self._send_bytes(payload, "image/jpeg")
+            return self._static(parsed.path)
+        except ControlServiceUnavailable as exc:
+            self._json_error(exc, HTTPStatus.SERVICE_UNAVAILABLE)
+        except Exception as exc:
+            self._json_error(exc)
+
+    def do_POST(self) -> None:
+        try:
+            body = self._read_json()
+            if self.path == "/api/control/reset":
+                result = schedule_service_reset()
+                self._json_accepted(result)
+                return
+            if self.path == "/api/actions":
+                return self._json_accepted(self.broker.submit_action_job(body))
+            if self.path == "/api/osc/session/start":
+                return self._json_ok(self.broker.osc_start(
+                    str(body.get("client_id", "anonymous")),
+                    str(body.get("execution_mode", "shadow")),
+                ))
+            if self.path == "/api/osc/command":
+                return self._json_ok(self.broker.osc_command(body))
+            if self.path == "/api/osc/session/stop":
+                return self._json_ok(self.broker.osc_stop(str(body.get("reason", "OSC session stopped"))))
+            if self.path == "/api/osc/session/heartbeat":
+                return self._json_ok(self.broker.osc_heartbeat(
+                    str(body.get("client_id", "anonymous")),
+                    str(body.get("session_id", "")),
+                ))
+            if self.path == "/api/osc/cpv-profile/sync":
+                return self._json_ok(self.broker.osc_sync_cpv_profile_to_osc_limits())
+            if self.path == "/api/pi05/config":
+                return self._json_ok(self.runtime.require_adapters().pi05_update_config(body))
+            if self.path in {"/api/cameras/config", "/api/pi05/cameras/config"}:
+                return self._json_ok(self.runtime.require_adapters().camera_update_config(body))
+            if self.path in {"/api/cameras/activate", "/api/pi05/cameras/activate"}:
+                return self._json_ok(self.runtime.require_adapters().camera_activate())
+            if self.path in {"/api/cameras/deactivate", "/api/pi05/cameras/deactivate"}:
+                return self._json_ok(self.runtime.require_adapters().camera_deactivate())
+            if self.path == "/api/dataset/start":
+                return self._json_ok(self.runtime.require_adapters().dataset_start(body))
+            if self.path == "/api/dataset/stop":
+                return self._json_ok(self.runtime.require_adapters().dataset_stop(body))
+            if self.path == "/api/pi05/start":
+                return self._json_ok(self.runtime.require_adapters().pi05_start(
+                    str(body.get("session_id", "")), str(body.get("client_id", "anonymous"))
+                ))
+            if self.path == "/api/pi05/stop":
+                return self._json_ok(self.runtime.require_adapters().pi05_stop(str(body.get("reason", "pi05 adapter stopped"))))
+            if self.path in {"/api/adapters/pico/connect", "/api/adapters/pico/pair"}:
+                if self.pico_gateway is None:
+                    raise RuntimeError("PICO WebSocket gateway is unavailable")
+                return self._json_ok(self.pico_gateway.create_pairing(
+                    str(body.get("session_id", "")), str(body.get("client_id", "anonymous"))))
+            if self.path == "/api/adapters/pico/sensitivity":
+                return self._json_ok(self.runtime.require_adapters().pico_update_sensitivity(body))
+            if self.path == "/api/adapters/pico/mapping":
+                return self._json_ok(self.runtime.require_adapters().pico_update_mapping(body))
+            if self.path == "/api/adapters/pico/rebase":
+                return self._json_ok(self.runtime.require_adapters().pico_reset_anchor(body))
+            if self.path == "/api/adapters/pico/disconnect":
+                if self.pico_gateway is not None:
+                    self.pico_gateway.invalidate()
+                return self._json_ok(self.runtime.require_adapters().pico_state())
+            if self.path == "/api/operator/handoff-to-console":
+                return self._json_ok(self.broker.handoff_to_console(str(body.get("reason", "operator returned to the control console"))))
+            if self.path == "/api/lease/acquire":
+                return self._json_ok(self.broker.acquire(str(body.get("owner", "client")), body.get("ttl_s")))
+            if self.path == "/api/lease/renew":
+                return self._json_ok(self.broker.renew(str(body.get("token", "")), body.get("ttl_s")))
+            if self.path == "/api/lease/release":
+                return self._json_ok(self.broker.release(str(body.get("token", ""))))
+            reason = str(body.get("reason", "operator request from local control page"))
+            if self.path == "/api/safety/hold":
+                return self._json_ok(self.broker.hold(reason))
+            if self.path == "/api/safety/freedrive":
+                return self._json_ok(self.broker.freedrive(
+                    reason,
+                    recover_emergency=bool(body.get("recover_emergency", False)),
+                    preserve_gripper=bool(body.get("preserve_gripper", False)),
+                ))
+            if self.path == "/api/safety/emergency-damping":
+                return self._json_ok(self.broker.emergency_damping(reason))
+            if self.path == "/api/operator/gripper":
+                width = body.get("width_m")
+                return self._json_ok(self.broker.command_gripper(
+                    mode=str(body.get("mode", "")),
+                    width_m=float(width) if width is not None else None,
+                    force_n=float(body.get("force_n", 1.0)),
+                    preserve_on_freedrive=bool(body.get("preserve_on_freedrive", False)),
+                    resume_osc=bool(body.get("resume_osc", False)),
+                ))
+            if self.path == "/api/operator/gripper/clear-hold":
+                return self._json_ok(self.broker.clear_gripper_hold())
+            if self.path == "/api/operator/gripper/zero-force":
+                return self._json_ok(self.broker.release_gripper_zero_force())
+            if self.path == "/api/operator/gripper/teaching-params":
+                if "teaching_friction" in body:
+                    return self._json_ok(self.broker.set_gripper_teaching_friction(
+                        int(body["teaching_friction"])
+                    ))
+                return self._json_ok(self.broker.get_gripper_teaching_params())
+            self._json_error(RuntimeError("unknown endpoint"), HTTPStatus.NOT_FOUND)
+        except PermissionError as exc:
+            self._json_error(exc, HTTPStatus.FORBIDDEN)
+        except ControlServiceUnavailable as exc:
+            self._json_error(exc, HTTPStatus.SERVICE_UNAVAILABLE)
+        except Exception as exc:
+            status = HTTPStatus.CONFLICT if type(exc).__name__ == "LeaseError" else HTTPStatus.INTERNAL_SERVER_ERROR
+            self._json_error(exc, status)
+
+    def _read_json(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length == 0:
+            return {}
+        value = json.loads(self.rfile.read(length).decode("utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("JSON request body must be an object")
+        return value
+
+    def _static(self, request_path: str) -> None:
+        relative = "index.html" if request_path in {"", "/"} else request_path.lstrip("/")
+        target = (WEB_ROOT / relative).resolve()
+        if WEB_ROOT.resolve() not in target.parents and target != WEB_ROOT.resolve():
+            return self.send_error(HTTPStatus.FORBIDDEN)
+        if not target.is_file():
+            return self.send_error(HTTPStatus.NOT_FOUND)
+        payload = target.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        if content_type.startswith("text/") or content_type == "application/javascript":
+            content_type += "; charset=utf-8"
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send_bytes(self, payload: bytes, content_type: str) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _json_ok(self, data: Any) -> None:
+        self._send_json(HTTPStatus.OK, {"ok": True, "data": data})
+
+    def _json_accepted(self, data: Any) -> None:
+        self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "data": data})
+
+    def _json_error(self, exc: Exception, status: HTTPStatus = HTTPStatus.INTERNAL_SERVER_ERROR) -> None:
+        self._send_json(status, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+    def _send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(encoded)
+
+
+def main() -> int:
+    assert_control_interpreter(PROJECT_ROOT)
+    parser = argparse.ArgumentParser(description="Local NERO shared-control service and safety console.")
+    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "runtime.json")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--lan-host", default="")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--no-browser", action="store_true")
+    args = parser.parse_args()
+    url = f"http://127.0.0.1:{args.port}/"
+    instance_lock = InstanceLock(PROJECT_ROOT / "runtime" / "nero_control_service.lock", "nero-control-service")
+    try:
+        instance_lock.acquire()
+    except RuntimeError as exc:
+        instance_lock.release()
+        if control_page_is_healthy(url):
+            print("NERO control service is already running; opening the active control page.")
+            if not args.no_browser:
+                webbrowser.open(url)
+            return 0
+        print(f"NERO control service could not start and no page is listening on {url}: {exc}")
+        print("Check the console output above; no browser page was opened because the service is unavailable.")
+        return 1
+
+    runtime = ServiceRuntime()
+    ControlRequestHandler.runtime = runtime
+    try:
+        runtime_config = json.loads(Path(args.config).read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        runtime_config = {}
+        print(f"PICO gateway configuration unavailable: {exc}", flush=True)
+    lan_host = str(args.lan_host or (runtime_config.get("pico_http") or {}).get("lan_host", "")).strip()
+    if not lan_host:
+        lan_host = _local_ipv4_address()
+    listen_hosts = [args.host]
+    if lan_host and lan_host not in listen_hosts:
+        listen_hosts.append(lan_host)
+    if any(host not in {"127.0.0.1", "localhost", lan_host} for host in listen_hosts):
+        raise SystemExit("Unsupported HTTP host for PICO pairing")
+    servers = []
+    bound_hosts = []
+    try:
+        for host in listen_hosts:
+            try:
+                servers.append(ExclusiveThreadingHTTPServer((host, args.port), ControlRequestHandler))
+                bound_hosts.append(host)
+            except OSError as exc:
+                if host in {"127.0.0.1", "localhost"}:
+                    raise
+                print(f"NERO optional LAN host {host} unavailable; using localhost only: {exc}", flush=True)
+        listen_hosts = bound_hosts
+    except (OSError, RuntimeError) as exc:
+        for server in servers:
+            server.server_close()
+        instance_lock.release()
+        if control_page_is_healthy(url):
+            print("NERO control service is already running; opening the active control page.")
+            if not args.no_browser:
+                webbrowser.open(url)
+            return 0
+        print(f"NERO control service could not start: {exc}")
+        return 1
+    pico_gateway = PicoGateway(runtime, dict(runtime_config.get("pico_gateway", {})))
+    ControlRequestHandler.pico_gateway = pico_gateway
+    http_threads = [threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, name=f"nero-control-http-{host}", daemon=True) for server, host in zip(servers, listen_hosts)]
+    try:
+        # Start accepting static-page, health, and reset-related requests before
+        # importing the SDK, starting the PICO gateway, or attempting any
+        # hardware operation.  A gateway bind/import must never make the local
+        # control page unavailable.
+        for http_thread in http_threads:
+            http_thread.start()
+        threading.Thread(target=pico_gateway.start, name="nero-pico-gateway-bootstrap", daemon=True).start()
+        threading.Thread(target=ensure_reset_watchdog, name="nero-reset-watchdog-bootstrap", daemon=True).start()
+        threading.Thread(
+            target=runtime.initialize,
+            args=(args.config,),
+            name="nero-control-backend-bootstrap",
+            daemon=True,
+        ).start()
+        print(f"NERO control page: {url}", flush=True)
+        if not args.no_browser:
+            webbrowser.open(url)
+        while any(http_thread.is_alive() for http_thread in http_threads):
+            for http_thread in http_threads:
+                http_thread.join(timeout=0.25)
+    except KeyboardInterrupt:
+        print("Stopping control service. The arm state is not automatically reset.")
+    finally:
+        for server, http_thread in zip(servers, http_threads):
+            if http_thread.is_alive():
+                server.shutdown()
+            server.server_close()
+        pico_gateway.close()
+        runtime.close()
+        instance_lock.release()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

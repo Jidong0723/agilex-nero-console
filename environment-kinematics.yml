@@ -1,0 +1,7 @@
+name: nero-kinematics
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pinocchio=4.1.0
+  - pink=4.3.0
