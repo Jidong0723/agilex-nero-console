@@ -131,8 +131,8 @@ class AdapterRuntime:
     def pico_state(self) -> dict[str, Any]: return self.pico.snapshot()
     def pico_reset_anchor(self, body: dict[str, Any]) -> dict[str, Any]:
         return self.pico.reset_anchor(str(body.get("session_id", "")), str(body.get("client_id", "")))
-    def pico_begin_pairing(self, session_id: str, client_id: str) -> None: self.pico.begin_pairing(session_id, client_id)
-    def pico_paired(self) -> None: self.pico.paired()
+    def pico_begin_connection(self, session_id: str, client_id: str) -> None: self.pico.begin_connection(session_id, client_id)
+    def pico_connected(self) -> None: self.pico.connected()
     def pico_connection_lost(self, reason: str) -> None: self.pico.connection_lost(reason)
     def pico_disconnected(self, reason: str) -> None: self.pico.disconnected(reason)
     def _persist_pico_config(self, updates: dict[str, Any]) -> None:

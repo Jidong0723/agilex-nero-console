@@ -5,7 +5,7 @@ whether the final safe joint command is sent to the Shadow CPV plant or the
 single hardware CAN writer; it does not encode an input device.
 
 Input adapters run in the HTTP process. WebAdapter, π0.5, and PICO may retain
-device-local anchors, relative poses, camera frames, policy state, and pairing
+device-local anchors, relative poses, camera frames, and policy state
 information. Their only robot-facing output is an absolute base-frame TCP
 target sent through the OSC API.
 

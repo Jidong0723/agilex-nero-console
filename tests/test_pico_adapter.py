@@ -35,7 +35,7 @@ class Broker:
 def adapter() -> tuple[PicoInputAdapter, Broker]:
     broker = Broker(); identity = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
     value = PicoInputAdapter(broker, {"position_axis_map": identity, "orientation_axis_map": identity})
-    value.begin_pairing("osc-1", "browser"); value.paired()
+    value.begin_connection("osc-1", "browser"); value.connected()
     return value, broker
 
 
@@ -59,15 +59,14 @@ def test_pico_release_loss_and_disconnect_hold():
     assert value.snapshot()["connected"] is False
 
 
-def test_pico_socket_loss_holds_but_preserves_pairing_for_safe_reconnect():
+def test_pico_socket_loss_holds_and_waits_for_usb_reconnect():
     value, broker = adapter()
     value.anchor_begin({"position_m": [1, 2, 3], "orientation_xyzw": [0, 0, 0, 1]})
     value.connection_lost("gateway input timeout")
     snapshot = value.snapshot()
     assert broker.commands[-1]["type"] == "hold"
-    assert snapshot["state"] == "READY"
+    assert snapshot["state"] == "WAITING_FOR_USB"
     assert snapshot["connected"] is False
-    assert snapshot["paired"] is True
     assert snapshot["anchor_active"] is False
 
 
@@ -82,7 +81,7 @@ def test_pico_gripper_and_heartbeat_use_standard_osc_interface():
 def test_repeated_disconnect_after_osc_session_end_is_idempotent():
     broker = Broker()
     value = PicoInputAdapter(broker, {})
-    value.begin_pairing("osc-1", "browser"); value.paired()
+    value.begin_connection("osc-1", "browser"); value.connected()
     broker._state["session"]["state"] = "IDLE"
     value.disconnected("socket already closed")
     value.disconnected("operator disconnected again")
@@ -356,11 +355,11 @@ def test_mapping_lifecycle_is_logged_without_per_frame_diagnostics():
 
     trace = Trace()
     value = PicoInputAdapter(Broker(), {}, trace)
-    value.begin_pairing("osc-1", "browser")
+    value.begin_connection("osc-1", "browser")
     value.update_mapping("osc-1", "browser", RECOMMENDED_POSITION_FRAME_MAP, RECOMMENDED_ORIENTATION_FRAME_MAP)
     value.mapping_persisted()
     assert [event["event"] for event in trace.events if event.get("record_type") == "event"] == [
-        "adapter_mapping_loaded", "adapter_pairing_started", "adapter_mapping_updated", "adapter_mapping_persisted",
+        "adapter_mapping_loaded", "adapter_connection_started", "adapter_mapping_updated", "adapter_mapping_persisted",
     ]
 
 

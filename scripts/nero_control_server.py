@@ -46,17 +46,6 @@ WEB_ROOT = PROJECT_ROOT / "web" / "console"
 CONTROL_PYTHON = control_python(PROJECT_ROOT)
 
 
-def _local_ipv4_address() -> str:
-    """Return the IPv4 address selected by the local routing table."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-            probe.connect(("192.0.2.1", 9))
-            address = str(probe.getsockname()[0])
-            if address and not address.startswith("127."):
-                return address
-    except OSError:
-        pass
-    return ""
 _RESET_LOCK = threading.Lock()
 _RESET_PENDING = False
 
@@ -636,7 +625,7 @@ class PicoIngressDispatcher:
 
 
 class PicoGateway:
-    """Small, paired LAN ingress which never exposes the HTTP control API."""
+    """USB/ADB-only local WebSocket ingress for the PICO headset."""
 
     def __init__(self, runtime: ServiceRuntime, config: dict[str, Any]) -> None:
         self.runtime, self.config = runtime, dict(config)
@@ -645,7 +634,7 @@ class PicoGateway:
         self._send_lock = threading.RLock()
         self._server: Any | None = None
         self._thread: threading.Thread | None = None
-        self._pair: dict[str, Any] | None = None
+        self._session: dict[str, Any] | None = None
         self._connection_active = False
         self._last_input_monotonic = 0.0
         self._connection_attempts = 0
@@ -681,29 +670,6 @@ class PicoGateway:
             {"component": "pico_gateway", "server_instance_id": self.server_instance_id},
         )
 
-    def _advertised_host(self) -> str:
-        host = str(self.config.get("host", "0.0.0.0"))
-        advertised = str(self.config.get("advertise_host", "")).strip()
-        if not advertised and host in {"0.0.0.0", "", "localhost", "127.0.0.1"}:
-            advertised = (_local_ipv4_address() or "<PC-LAN-IP>")
-        return advertised or host
-
-    @staticmethod
-    def _canonical_endpoint(value: str) -> str:
-        parsed = urlparse(str(value).strip())
-        if parsed.scheme not in {"ws", "wss"} or not parsed.hostname or parsed.query or parsed.fragment:
-            return ""
-        host = parsed.hostname.lower()
-        port = parsed.port or (443 if parsed.scheme == "wss" else 80)
-        return f"{parsed.scheme.lower()}://{host}:{port}{parsed.path.rstrip('/') or '/'}"
-
-    @staticmethod
-    def _request_endpoint(connection: Any) -> tuple[str, str]:
-        request = getattr(connection, "request", None) or getattr(getattr(connection, "protocol", None), "request", None)
-        if request is None:
-            return "", ""
-        return str(getattr(request, "headers", {}).get("Host", "")).strip().lower(), str(getattr(request, "path", "") or "")
-
     def start(self) -> None:
         if not bool(self.config.get("enabled", True)):
             return
@@ -713,7 +679,7 @@ class PicoGateway:
             self.error = "websockets dependency is not installed"
             print(json.dumps({"pico_gateway_ready": False, "error": self.error}), flush=True)
             return
-        host, port = str(self.config.get("host", "0.0.0.0")), int(self.config.get("port", 8768))
+        host, port = "127.0.0.1", int(self.config.get("port", 8768))
         try:
             self._server = serve(
                 self._handle_connection, host, port,
@@ -741,16 +707,12 @@ class PicoGateway:
             self._thread.join(timeout=1.0)
         self.trace_logger.close()
 
-    def create_pairing(self, session_id: str, client_id: str) -> dict[str, Any]:
+    def start_session(self, session_id: str, client_id: str) -> dict[str, Any]:
         if self._server is None:
-            raise RuntimeError(self.error or "PICO WebSocket gateway is unavailable")
-        self.runtime.require_adapters().pico_begin_pairing(session_id, client_id)
-        code, pairing_id = f"{secrets.randbelow(1_000_000):06d}", secrets.token_urlsafe(18).rstrip("=")
-        ttl = float(self.config.get("pair_ttl_s", 120.0))
-        ws_url = f"ws://{self._advertised_host()}:{int(self.config.get('port', 8768))}/pair/{pairing_id}"
+            raise RuntimeError(self.error or "PICO USB WebSocket receiver is unavailable")
+        self.runtime.require_adapters().pico_begin_connection(session_id, client_id)
         with self._lock:
-            self._pair = {"session_id": session_id, "client_id": client_id, "code": code, "pairing_id": pairing_id,
-                          "ws_url": ws_url, "expires_monotonic": time.monotonic() + ttl, "expires_at": time.time() + ttl, "paired": False}
+            self._session = {"session_id": session_id, "client_id": client_id}
             self._connection_active = False
             self._last_input_monotonic = 0.0
             self._input_frame_receive_times_ns = []
@@ -759,24 +721,11 @@ class PicoGateway:
             self._last_input_frame_trigger = 0.0
             self._last_input_frame_tracking = False
             self._input_frame_overwrites = 0
-            self._last_connection_stage = "waiting_for_auth"
+            self._last_connection_stage = "waiting_for_usb"
             self._last_connection_error = None
         result = self.runtime.require_adapters().pico_state()
         result["gateway"] = self.status()
         return result
-
-    def resolve_pairing_url(self, code: str, base_url: str) -> dict[str, Any]:
-        with self._lock:
-            pair = dict(self._pair) if self._pair else None
-            expected = urlparse(str(pair.get("ws_url", ""))) if pair else None
-            requested = urlparse(str(base_url).strip())
-            if not pair or time.monotonic() > float(pair["expires_monotonic"]):
-                raise PermissionError("PICO pairing is missing or expired")
-            if not secrets.compare_digest(str(code).strip(), str(pair["code"])):
-                raise PermissionError("PICO pairing code is incorrect")
-            if not expected or requested.scheme != expected.scheme or requested.netloc.lower() != expected.netloc.lower() or requested.path not in {"", "/"} or requested.query or requested.fragment:
-                raise PermissionError("PICO gateway address does not match the console-generated host")
-            return {"ws_url": pair["ws_url"], "pairing_id": pair["pairing_id"], "expires_at": pair["expires_at"]}
 
     def invalidate(self) -> None:
         dispatcher = self._dispatch
@@ -784,29 +733,26 @@ class PicoGateway:
         if dispatcher is not None:
             dispatcher.close()
         with self._lock:
-            self._pair = None
+            self._session = None
             self._connection_active = False
         try:
-            self.runtime.require_adapters().pico_disconnected("PICO pairing invalidated")
+            self.runtime.require_adapters().pico_disconnected("PICO USB receiver stopped")
         except Exception:
             pass
 
     def status(self) -> dict[str, Any]:
         with self._lock:
-            pair = dict(self._pair) if self._pair else None
-            active = bool(pair and pair.get("paired"))
+            session = dict(self._session) if self._session else None
             dispatcher_snapshot = self._dispatch.snapshot() if self._dispatch is not None else {"worker_alive": False, "queue_depth": 0, "overwritten_input_frames": 0}
-            host = str(self.config.get("host", "0.0.0.0"))
-            advertised_host = self._advertised_host()
+            host = "127.0.0.1"
             result = {
                 "enabled": bool(self.config.get("enabled", True)), "ready": self._server is not None,
                 "host": host, "port": int(self.config.get("port", 8768)),
-                "ws_url": pair.get("ws_url") if pair else f"ws://{advertised_host}:{int(self.config.get('port', 8768))}",
-                "session_id": pair.get("session_id") if pair else None,
-                "pair_code": pair.get("code") if pair and not pair.get("paired") else None,
-                "pairing_id": pair.get("pairing_id") if pair else None,
-                "expires_at": pair.get("expires_at") if pair else None,
-                "paired": active, "connection_active": self._connection_active,
+                "transport": "usb_adb",
+                "ws_url": f"ws://127.0.0.1:{int(self.config.get('port', 8768))}",
+                "session_id": session.get("session_id") if session else None,
+                "connected": self._connection_active,
+                "connection_active": self._connection_active,
                 "connection_attempts": self._connection_attempts,
                 "last_connection_attempt_at": self._last_connection_attempt_at,
                 "last_client": self._last_client,
@@ -837,21 +783,12 @@ class PicoGateway:
                     "CONNECTED_CONTROL_UNAVAILABLE"
                     if self._connection_active and self._last_connection_stage == "control_unavailable"
                     else "CONNECTED" if self._connection_active
-                    else "RECONNECTING" if active else "DISCONNECTED"
+                    else "DISCONNECTED"
                 ),
                 "last_input_age_s": None if not self._last_input_monotonic else max(0.0, time.monotonic() - self._last_input_monotonic),
                 "error": self.error,
             }
             return result
-
-    def pair_svg(self) -> bytes | None:
-        status = self.status()
-        if not status.get("pair_code"):
-            return None
-        uri = f"nero-pico://pair?ws={status['ws_url']}&session={status['session_id']}&code={status['pair_code']}"
-        import qrcode
-        import qrcode.image.svg
-        return qrcode.make(uri, image_factory=qrcode.image.svg.SvgPathImage, border=1).to_string(encoding="utf-8")
 
     def _send(self, connection: Any, payload: dict[str, Any]) -> None:
         with self._send_lock:
@@ -893,8 +830,7 @@ class PicoGateway:
                                   "result": result if event == "dispatch_finished" else None})
 
     def _handle_connection(self, connection: Any) -> None:
-        paired_session: str | None = None
-        paired_pairing_id: str | None = None
+        usb_session: str | None = None
         last_sequence = 0
         client = getattr(connection, "remote_address", None)
         client_label = str(client) if client is not None else "unknown"
@@ -902,73 +838,54 @@ class PicoGateway:
             self._connection_attempts += 1
             self._last_connection_attempt_at = time.time()
             self._last_client = client_label
-            self._last_connection_stage = "waiting_for_auth"
+            self._last_connection_stage = "waiting_for_usb"
             self._last_connection_error = None
         try:
             raw = connection.recv(timeout=10)
             message = json.loads(raw)
-            self.trace_logger.append({"record_type": "event", "event": "gateway_pair_received",
+            self.trace_logger.append({"record_type": "event", "event": "usb_input_received",
                                       "monotonic_ns": time.monotonic_ns(), "remote": client_label})
-            if not isinstance(message, dict) or message.get("type") != "pair":
-                raise PermissionError("first WebSocket message must be pair")
             with self._lock:
-                pair = dict(self._pair) if self._pair else None
-                supplied_session = str(message.get("session_id", "")).strip()
-                supplied_pairing = str(message.get("pairing_id", "")).strip()
-                supplied_gateway = self._canonical_endpoint(str(message.get("gateway_url", "")))
-                expected_gateway = self._canonical_endpoint(str(pair.get("ws_url", ""))) if pair else ""
-                expected_uri = urlparse(str(pair.get("ws_url", ""))) if pair else None
-                requested_host, requested_path = self._request_endpoint(connection)
-                valid = bool(
-                    pair
-                    # A dropped headset socket may reconnect with its still
-                    # valid pairing record.  A second *simultaneous* socket
-                    # is rejected so it cannot contend for robot control.
-                    and (not pair.get("paired") or not self._connection_active)
-                    and time.monotonic() <= float(pair["expires_monotonic"])
-                    and secrets.compare_digest(str(message.get("code", "")), str(pair["code"]))
-                    and supplied_pairing == str(pair["pairing_id"])
-                    and supplied_gateway == expected_gateway
-                    and (not supplied_session or supplied_session == str(pair["session_id"]))
-                    and requested_host == str(expected_uri.netloc).lower()
-                    and requested_path == str(expected_uri.path)
-                )
-                if not valid:
-                    raise PermissionError("PICO pairing rejected: invalid code, endpoint, or session")
-                self._pair["paired"] = True
+                session = dict(self._session) if self._session else None
+                if not session:
+                    raise PermissionError("PICO USB receiver is not active; start it from the console first")
+                if self._connection_active:
+                    raise PermissionError("another PICO USB connection is already active")
                 self._connection_active = True
-                paired_session = str(pair["session_id"])
-                paired_pairing_id = str(pair["pairing_id"])
-            self.trace_logger.append({"record_type": "event", "event": "gateway_pair_accepted",
-                                      "monotonic_ns": time.monotonic_ns(), "session_id": paired_session,
-                                      "pairing_id": paired_pairing_id})
-            self.runtime.require_adapters().pico_paired()
+                usb_session = str(session["session_id"])
+            self.trace_logger.append({"record_type": "event", "event": "usb_connection_accepted",
+                                      "monotonic_ns": time.monotonic_ns(), "session_id": usb_session})
+            self.runtime.require_adapters().pico_connected()
             with self._lock:
-                self._last_connection_stage = "paired"
+                self._last_connection_stage = "connected"
             dispatcher = PicoIngressDispatcher(
                 lambda kind, payload: self.runtime.require_adapters().pico_message(kind, payload),
                 self._observe_dispatch,
                 lambda kind, sequence, result, error: self._send_control_result(connection, kind, sequence, result, error),
             )
             self._dispatch = dispatcher
-            self._send(connection, {"ok": True, "type": "paired", "session_id": paired_session,
+            self._send(connection, {"ok": True, "type": "connected", "session_id": usb_session,
                                     "server_instance_id": self.server_instance_id,
                                     "capabilities": ["input_frame", "disconnect"],
                                     "recommended_input_hz": 100,
-                                    "control_period_ms": 20})
+                                     "control_period_ms": 20})
             idle_since = time.monotonic()
+            pending_message: dict[str, Any] | None = message
             while True:
-                try:
-                    raw = connection.recv(timeout=float(self.config.get("message_timeout_s", 2.0)))
-                except TimeoutError:
-                    if time.monotonic() - idle_since >= float(self.config.get("idle_timeout_s", 30.0)):
-                        raise TimeoutError("PICO gateway idle timeout")
-                    continue
-                if len(raw.encode("utf-8")) > int(self.config.get("max_message_bytes", 4096)):
-                    raise ValueError("PICO message is too large")
-                message = json.loads(raw)
-                if not isinstance(message, dict):
-                    raise PermissionError("PICO message must be an object")
+                if pending_message is not None:
+                    message, pending_message = pending_message, None
+                else:
+                    try:
+                        raw = connection.recv(timeout=float(self.config.get("message_timeout_s", 2.0)))
+                    except TimeoutError:
+                        if time.monotonic() - idle_since >= float(self.config.get("idle_timeout_s", 30.0)):
+                            raise TimeoutError("PICO USB connection idle timeout")
+                        continue
+                    if len(raw.encode("utf-8")) > int(self.config.get("max_message_bytes", 4096)):
+                        raise ValueError("PICO message is too large")
+                    message = json.loads(raw)
+                    if not isinstance(message, dict):
+                        raise PermissionError("PICO message must be an object")
                 sequence = int(message.get("sequence", -1))
                 if sequence <= last_sequence:
                     raise PermissionError("PICO sequence is not monotonic")
@@ -1013,7 +930,7 @@ class PicoGateway:
                     self._last_input_frame_orientation = list(orientation)
                 self.trace_logger.append({"record_type": "sample", "event": "gateway_message_received",
                                           "monotonic_ns": gateway_received_ns, "pico_sequence": sequence,
-                                          "message_type": kind, "session_id": paired_session})
+                                          "message_type": kind, "session_id": usb_session})
                 payload: dict[str, Any] = {"position_m": position, "orientation_xyzw": orientation,
                                             "tracking_valid": bool(message.get("tracking_valid", True)),
                                             "grip": grip, "trigger_value": trigger_value,
@@ -1021,7 +938,7 @@ class PicoGateway:
                                             "_gateway_received_monotonic_ns": gateway_received_ns}
                 result = dispatcher.submit(kind, payload, sequence)
                 with self._lock:
-                    self._last_connection_stage = "paired"
+                    self._last_connection_stage = "connected"
                     self._last_connection_error = None
                 last_sequence = sequence
                 idle_since = time.monotonic()
@@ -1035,30 +952,23 @@ class PicoGateway:
                                           "input_frame_overwrites": result.get("overwritten_input_frames", 0) if isinstance(result, dict) else 0})
         except TimeoutError:
             with self._lock:
-                self._last_connection_stage = "auth_timeout" if not paired_session else "input_timeout"
+                self._last_connection_stage = "input_timeout"
                 self._last_connection_error = "PICO connection timed out waiting for data"
         except Exception as exc:
             with self._lock:
-                self._last_connection_stage = "rejected" if not paired_session else "runtime_error"
+                self._last_connection_stage = "rejected" if not usb_session else "runtime_error"
                 self._last_connection_error = f"{type(exc).__name__}: {exc}"
             try:
                 self._send(connection, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
             except Exception:
                 pass
         finally:
-            owns_current_pair = False
+            owns_current_session = False
             with self._lock:
-                # An obsolete or rejected socket must never tear down a newer
-                # successfully paired socket.  Only the connection that owns
-                # the current pairing record may clear gateway and adapter
-                # state. Session IDs can be reused, so compare pairing IDs.
-                if paired_pairing_id and self._pair and str(self._pair.get("pairing_id")) == paired_pairing_id:
-                    owns_current_pair = True
+                if usb_session and self._session and str(self._session.get("session_id")) == usb_session:
+                    owns_current_session = True
                     self._connection_active = False
-                    # Socket loss is a transport reconnect, not receiver stop.
-                    # The explicit console Stop button is the only invalidator.
-                    self._pair["paired"] = True
-            if owns_current_pair:
+            if owns_current_session:
                 dispatcher = self._dispatch
                 self._dispatch = None
                 if dispatcher is not None:
@@ -1068,9 +978,8 @@ class PicoGateway:
                         self._last_connection_error or "PICO input connection closed")
                 except Exception:
                     pass
-                # Keep the short-lived pairing record so a reconnecting
-                # headset can resume safely.  The adapter is explicitly put
-                # into HOLD/READY and no target is emitted here.
+                # Socket loss is safe: the adapter is put into HOLD/READY and
+                # the next USB connection may start only while the session is active.
 
 
 class ControlRequestHandler(BaseHTTPRequestHandler):
@@ -1118,19 +1027,6 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 if self.pico_gateway is not None:
                     result["gateway"] = self.pico_gateway.status()
                 return self._json_ok(result)
-            if parsed.path == "/api/adapters/pico/resolve":
-                if self.pico_gateway is None:
-                    raise RuntimeError("PICO gateway is unavailable")
-                query = parse_qs(parsed.query)
-                return self._json_ok(self.pico_gateway.resolve_pairing_url(
-                    str((query.get("code") or [""])[0]), str((query.get("ws") or [""])[0])))
-            if parsed.path == "/api/adapters/pico/pair.svg":
-                if self.pico_gateway is None:
-                    return self.send_error(HTTPStatus.NOT_FOUND, "PICO gateway is unavailable")
-                payload = self.pico_gateway.pair_svg()
-                if payload is None:
-                    return self.send_error(HTTPStatus.NOT_FOUND, "PICO pairing QR is not available")
-                return self._send_bytes(payload, "image/svg+xml")
             if parsed.path in {"/api/cameras/list", "/api/pi05/cameras/list"}:
                 return self._json_ok({"cameras": self.runtime.require_adapters().camera_devices()})
             if parsed.path in {"/api/cameras/frame/external.jpg", "/api/cameras/frame/wrist.jpg", "/api/pi05/frame/external.jpg", "/api/pi05/frame/wrist.jpg"}:
@@ -1187,10 +1083,10 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 ))
             if self.path == "/api/pi05/stop":
                 return self._json_ok(self.runtime.require_adapters().pi05_stop(str(body.get("reason", "pi05 adapter stopped"))))
-            if self.path in {"/api/adapters/pico/connect", "/api/adapters/pico/pair"}:
+            if self.path == "/api/adapters/pico/connect":
                 if self.pico_gateway is None:
-                    raise RuntimeError("PICO WebSocket gateway is unavailable")
-                return self._json_ok(self.pico_gateway.create_pairing(
+                    raise RuntimeError("PICO USB WebSocket receiver is unavailable")
+                return self._json_ok(self.pico_gateway.start_session(
                     str(body.get("session_id", "")), str(body.get("client_id", "anonymous"))))
             if self.path == "/api/adapters/pico/sensitivity":
                 return self._json_ok(self.runtime.require_adapters().pico_update_sensitivity(body))
@@ -1308,7 +1204,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Local NERO shared-control service and safety console.")
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "runtime.json")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--lan-host", default="")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
@@ -1334,14 +1229,7 @@ def main() -> int:
     except (OSError, json.JSONDecodeError) as exc:
         runtime_config = {}
         print(f"PICO gateway configuration unavailable: {exc}", flush=True)
-    lan_host = str(args.lan_host or (runtime_config.get("pico_http") or {}).get("lan_host", "")).strip()
-    if not lan_host:
-        lan_host = _local_ipv4_address()
     listen_hosts = [args.host]
-    if lan_host and lan_host not in listen_hosts:
-        listen_hosts.append(lan_host)
-    if any(host not in {"127.0.0.1", "localhost", lan_host} for host in listen_hosts):
-        raise SystemExit("Unsupported HTTP host for PICO pairing")
     servers = []
     bound_hosts = []
     try:
@@ -1352,7 +1240,7 @@ def main() -> int:
             except OSError as exc:
                 if host in {"127.0.0.1", "localhost"}:
                     raise
-                print(f"NERO optional LAN host {host} unavailable; using localhost only: {exc}", flush=True)
+                print(f"NERO optional HTTP host {host} unavailable; using localhost only: {exc}", flush=True)
         listen_hosts = bound_hosts
     except (OSError, RuntimeError) as exc:
         for server in servers:

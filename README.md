@@ -70,7 +70,7 @@ Connect the CANDO adapter and NERO CAN cable, clear the workspace, then run:
 
 Open <http://127.0.0.1:8765/>. The service binds to localhost by default. Do not expose it directly to a public or untrusted network.
 
-The checked-in configuration uses no personal LAN address. The PICO pairing page discovers the workstation's current LAN address only while the local service is running; keep any machine-specific configuration outside the repository rather than committing it.
+PICO uses USB/ADB only. After connecting the headset and enabling USB debugging, run `powershell -ExecutionPolicy Bypass -File .\scripts\pico_usb_connect.ps1`; the APK connects directly to `ws://127.0.0.1:8768`. No LAN address, pairing code, QR code, or wireless gateway is used.
 
 The first teleoperation session remains Shadow by default. Review live feedback and limits before explicitly enabling hardware control in the page.
 

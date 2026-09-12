@@ -37,6 +37,19 @@ It reports interpreter paths, dependency origins and CANDO enumeration without s
 
 ## Start
 
+## PICO USB/ADB
+
+Connect the PICO headset by USB, enable USB debugging, authorize the computer
+in the headset, and run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\pico_usb_connect.ps1
+```
+
+The script establishes `adb reverse tcp:8768 tcp:8768`. Configure the APK to
+connect to `ws://127.0.0.1:8768` and send `input_frame` as its first message.
+There is no wireless gateway, LAN address, pairing code, or QR pairing flow.
+
 ```powershell
 .\run_console.cmd
 ```

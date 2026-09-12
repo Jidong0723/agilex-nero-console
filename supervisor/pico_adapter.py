@@ -1,7 +1,7 @@
-"""PICO 4 Ultra input adapter.
+"""PICO 4 Ultra USB input adapter.
 
 This module intentionally has no robot, CAN, Pink, or Ruckig dependency.  It
-owns headset-local concepts (pairing, controller anchors and buttons) and its
+owns headset-local concepts (controller anchors and buttons) and its
 only robot-facing calls are standard OSC commands.
 """
 from __future__ import annotations
@@ -199,8 +199,8 @@ class PicoInputAdapter:
         self._orientation_calibrated_at: float | None = None
         self._pending_anchor: dict[str, Any] | None = None
         self._sequence = 0
-        self._pairing_stop = threading.Event()
-        self._pairing_thread: threading.Thread | None = None
+        self._connection_stop = threading.Event()
+        self._connection_thread: threading.Thread | None = None
         self._pose_receive_times_ns: list[int] = []
         self._last_frame_grip = False
         self._last_frame_trigger = 0.0
@@ -221,7 +221,7 @@ class PicoInputAdapter:
 
     def _empty_state(self) -> dict[str, Any]:
         return {"adapter": "pico", "state": "IDLE", "session_id": None,
-                "connected": False, "paired": False, "tracking_valid": False,
+                "connected": False, "tracking_valid": False,
                 "anchor_active": False, "last_input_age_s": None,
                 "last_error": None, "gripper_position": None,
                 "clutch_signal": False, "input_clutch": False, "input_sequence": 0,
@@ -342,7 +342,7 @@ class PicoInputAdapter:
                                           "orientation_axis_map": result["orientation_axis_map"]})
             return result
 
-    def begin_pairing(self, session_id: str, client_id: str) -> None:
+    def begin_connection(self, session_id: str, client_id: str) -> None:
         osc = self.osc.state(); session = osc.get("session") or {}
         if session.get("state") != "ACTIVE" or session.get("id") != session_id or session.get("client_id") != client_id:
             raise PermissionError("PICO requires the caller's active OSC session")
@@ -360,15 +360,15 @@ class PicoInputAdapter:
             self._orientation_calibrated_at = None
             self._sequence = int((osc.get("command") or {}).get("sequence") or 0)
             self.state = self._empty_state()
-            self.state.update({"state": "PAIRING", "session_id": session_id, "updated_at": time.time()})
+            self.state.update({"state": "WAITING_FOR_USB", "session_id": session_id, "updated_at": time.time()})
             if self.trace_logger:
-                self.trace_logger.append({"record_type": "event", "event": "adapter_pairing_started",
+                self.trace_logger.append({"record_type": "event", "event": "adapter_connection_started",
                                           "monotonic_ns": time.monotonic_ns(), "session_id": session_id,
                                           "client_id": client_id, "execution_mode": self._execution_mode})
-            self._pairing_stop.set()
-            self._pairing_stop = threading.Event()
-            self._pairing_thread = threading.Thread(target=self._pairing_heartbeat_loop, name="nero-pico-pairing-heartbeat", daemon=True)
-            self._pairing_thread.start()
+            self._connection_stop.set()
+            self._connection_stop = threading.Event()
+            self._connection_thread = threading.Thread(target=self._connection_heartbeat_loop, name="nero-pico-usb-heartbeat", daemon=True)
+            self._connection_thread.start()
 
     def update_sensitivity(self, session_id: str, client_id: str, translation_gain: Any,
                            rotation_gain: Any, hardware_high_gain_confirmed: bool = False) -> dict[str, Any]:
@@ -394,32 +394,26 @@ class PicoInputAdapter:
             return {"ok": True, "accepted": True, "translation_gain": translation,
                     "rotation_gain": rotation, "adjustable": True}
 
-    def paired(self) -> None:
+    def connected(self) -> None:
         with self.lock:
             if not self._session_id:
-                raise RuntimeError("PICO pairing has not been started")
-            self.state.update({"state": "READY", "connected": True, "paired": True, "updated_at": time.time(), "last_error": None})
+                raise RuntimeError("PICO USB connection has not been started")
+            self.state.update({"state": "READY", "connected": True, "updated_at": time.time(), "last_error": None})
             if self.trace_logger:
-                self.trace_logger.append({"record_type": "event", "event": "adapter_paired",
+                self.trace_logger.append({"record_type": "event", "event": "adapter_connected",
                                           "monotonic_ns": time.monotonic_ns(), "session_id": self._session_id})
-            self._pairing_stop.set()
+            self._connection_stop.set()
 
     def connection_lost(self, reason: str) -> None:
-        """Make socket loss visible and safe without discarding a valid pairing.
-
-        The gateway can reconnect a headset with the same short-lived pairing
-        record.  Keeping the adapter binding lets the first new Grip frame
-        resume the OSC session, but it must never retain an active anchor or
-        advertise a live PICO connection while no input socket exists.
-        """
+        """Make USB socket loss visible and safe without discarding the OSC session."""
         try:
             self.stop(reason)
         except Exception as exc:
             with self.lock:
                 self.state["last_error"] = f"{type(exc).__name__}: {exc}"
         with self.lock:
-            self.state.update({"state": "READY" if self._session_id else "IDLE",
-                               "connected": False, "paired": bool(self._session_id),
+            self.state.update({"state": "WAITING_FOR_USB" if self._session_id else "IDLE",
+                               "connected": False,
                                "anchor_active": False, "tracking_valid": False,
                                "updated_at": time.time()})
             if self.trace_logger:
@@ -427,10 +421,10 @@ class PicoInputAdapter:
                                           "monotonic_ns": time.monotonic_ns(), "reason": reason,
                                           "session_id": self._session_id})
 
-    def _pairing_heartbeat_loop(self) -> None:
-        while not self._pairing_stop.wait(1.0):
+    def _connection_heartbeat_loop(self) -> None:
+        while not self._connection_stop.wait(1.0):
             with self.lock:
-                if self.state.get("state") != "PAIRING" or not self._session_id or not self._client_id:
+                if self.state.get("state") != "WAITING_FOR_USB" or not self._session_id or not self._client_id:
                     return
                 session_id, client_id = self._session_id, self._client_id
             try:
@@ -468,7 +462,7 @@ class PicoInputAdapter:
         raise ValueError(f"unsupported PICO OSC command {kind}")
 
     def _ensure_osc_session(self) -> None:
-        """Resume OSC after FREEDRIVE without recreating receiver pairing."""
+        """Resume OSC after FREEDRIVE without recreating the USB receiver session."""
         with self.lock:
             client_id = self._client_id
             execution_mode = self._execution_mode or "shadow"
@@ -775,7 +769,7 @@ class PicoInputAdapter:
             rejected = result.get("result") if isinstance(result.get("result"), dict) else result
             if bool(rejected.get("recoverable")):
                 # A workspace/safety rejection is an input condition, not a
-                # transport failure. Keep the anchor and pairing alive so the
+                # transport failure. Keep the anchor and USB session alive so the
                 # next pose can recover when the operator moves back inside
                 # the valid workspace.
                 with self.lock:
@@ -863,7 +857,7 @@ class PicoInputAdapter:
         return self._ack("hold", result)
 
     def disconnected(self, reason: str) -> None:
-        self._pairing_stop.set()
+        self._connection_stop.set()
         try:
             self.stop(reason)
         except Exception as exc:
@@ -872,5 +866,5 @@ class PicoInputAdapter:
             self._session_id = self._client_id = None
             self._execution_mode = None
             self._hardware_high_gain_confirmed = False
-            self.state.update({"state": "IDLE", "session_id": None, "connected": False, "paired": False,
+            self.state.update({"state": "IDLE", "session_id": None, "connected": False,
                                "anchor_active": False, "updated_at": time.time()})

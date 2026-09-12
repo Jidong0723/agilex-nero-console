@@ -1,4 +1,4 @@
-"""Send a bounded 50 Hz PICO button + 6D-pose sequence to the real gateway."""
+"""Send a bounded 50 Hz PICO button + 6D-pose sequence over USB localhost."""
 from __future__ import annotations
 
 import argparse
@@ -26,10 +26,9 @@ def main() -> int:
 
     pico = get_json(f"{args.http}/api/adapters/pico/state")
     gateway = pico.get("gateway") or {}
-    code, session_id = gateway.get("pair_code"), gateway.get("session_id")
-    ws_url, pairing_id = gateway.get("ws_url"), gateway.get("pairing_id")
-    if not code or not session_id or not ws_url or not pairing_id:
-        raise RuntimeError("create PICO pairing in Console before running the simulator")
+    ws_url = gateway.get("ws_url") or args.ws
+    if not gateway.get("ready"):
+        raise RuntimeError("PICO USB receiver is not listening")
 
     period = 1.0 / args.hz
     base = [0.0, 0.0, 0.0]
@@ -38,11 +37,9 @@ def main() -> int:
     started = time.monotonic()
     signal_started = started
     with connect(ws_url if args.ws == "ws://127.0.0.1:8768" else args.ws, compression=None, open_timeout=5, close_timeout=2) as socket:
-        socket.send(json.dumps({"type": "pair", "session_id": session_id, "code": code,
-                                "pairing_id": pairing_id, "gateway_url": ws_url}))
-        paired = json.loads(socket.recv(timeout=5))
-        if not paired.get("ok"):
-            raise RuntimeError(f"pairing failed: {paired}")
+        connected = json.loads(socket.recv(timeout=5))
+        if not connected.get("ok"):
+            raise RuntimeError(f"USB connection failed: {connected}")
 
         signal_started = time.monotonic()
         deadline = signal_started
@@ -54,17 +51,10 @@ def main() -> int:
             position = [base[0], base[1] + 0.012 * math.sin(phase / 2.0), base[2] + 0.008 * math.cos(phase)]
             yaw = 0.10 * math.sin(phase)
             orientation = [0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)]
-            if tick in {0, 100}:
-                kind = "anchor_begin"
-            elif tick == 99:
-                kind = "anchor_release"  # right Grip released
-            elif tick == args.ticks - 1:
-                kind = "hold"  # left Menu safety button
-            else:
-                kind = "pose"
-            message = {"type": kind, "session_id": session_id, "sequence": sequence,
+            kind = "input_frame"
+            message = {"type": kind, "sequence": sequence,
                        "position_m": position, "orientation_xyzw": orientation,
-                       "tracking_valid": True}
+                       "tracking_valid": True, "grip": tick < 99, "trigger_value": 0.0}
             socket.send(json.dumps(message))
             reply = json.loads(socket.recv(timeout=.25))
             counts[kind] = counts.get(kind, 0) + 1

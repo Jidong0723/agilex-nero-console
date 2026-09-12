@@ -38,9 +38,9 @@ to absolute TCP targets before calling OSC.
 
 - π0.5: `GET /api/pi05/state`, `POST /api/pi05/config`, `POST /api/pi05/start`, and `POST /api/pi05/stop`.
 - Cameras: `GET /api/cameras/state`, `GET /api/cameras/list`, `POST /api/cameras/config`, `POST /api/cameras/activate`, and `POST /api/cameras/deactivate`.
-- PICO: `GET /api/adapters/pico/state`, `POST /api/adapters/pico/connect`, `GET /api/adapters/pico/resolve`, and `POST /api/adapters/pico/disconnect`. Connecting creates a six-digit code valid for 120 seconds. The PICO APK resolves the code to a one-time `ws://<PC-IP>:8768/pair/<pairing_id>` endpoint, then sends a `{"type":"pair", "code":"...", "pairing_id":"...", "gateway_url":"..."}` first message. The computer-side service has no PICO SDK dependency.
+- PICO USB/ADB: `GET /api/adapters/pico/state`, `POST /api/adapters/pico/connect`, and `POST /api/adapters/pico/disconnect`. Run `scripts/pico_usb_connect.ps1` after connecting the headset; the APK connects to `ws://127.0.0.1:8768` through `adb reverse tcp:8768 tcp:8768`. The first WebSocket message is directly an `input_frame`; no pairing code, QR code, LAN address, or `pair` message is used. The computer-side service has no PICO SDK dependency.
 
-PICO and π0.5 run in the HTTP process. PICO owns the authenticated WebSocket
+PICO and π0.5 run in the HTTP process. PICO owns the USB-forwarded WebSocket
 connection and device anchors,
 camera and policy lifecycle, and can only read OSC state, renew a session, or
 send absolute `track_tcp`, `hold`, and `gripper` commands.
