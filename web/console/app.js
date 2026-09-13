@@ -84,7 +84,7 @@
     if ($("pi05-panel")) return;
     const panel = document.createElement("section");
     panel.id = "pi05-panel"; panel.className = "pi05-panel hidden";
-    panel.innerHTML = `<div class="pi05-observation"><div class="pi05-head"><span class="pi05-index">01</span><div><strong>Observation</strong><small>π0.5 多模态输入</small></div></div><div class="pi05-cameras"><label>外部 RGB<input id="pi05-external-index" type="number" min="0" max="32" value="0"></label><label>腕部 RGB<input id="pi05-wrist-index" type="number" min="0" max="32" value="1"></label></div><div class="pi05-views"><div class="pi05-view"><span>外部视角</span><img id="pi05-external-frame" alt="外部 RGB 实时画面"><b id="pi05-external-preview">等待画面</b></div><div class="pi05-view"><span>腕部视角</span><img id="pi05-wrist-frame" alt="腕部 RGB 实时画面"><b id="pi05-wrist-preview">等待画面</b></div></div><label class="pi05-prompt">Prompt<textarea id="pi05-prompt" maxlength="500">place the fixed block into the fixed box</textarea></label></div><div class="pi05-arrow">→<small>推理中</small></div><div class="pi05-inference"><div class="pi05-head"><span class="pi05-index">02</span><div><strong>π0.5 Inference</strong><small>持续重规划</small></div></div><div class="pi05-orb">π</div><strong id="pi05-model-state">未连接</strong><div class="pi05-metrics"><span>状态<b id="pi05-run-state">IDLE</b></span><span>推理耗时<b id="pi05-inference-ms">--</b></span><span>生成序号<b id="pi05-chunk-length">0</b></span><span>执行动作<b id="pi05-executed">0</b></span></div><div class="pi05-actions"><button id="pi05-cameras" class="button" type="button">初始化相机</button><button id="pi05-start" class="button primary" type="button">启动 π0.5</button><button id="pi05-stop" class="button quiet" type="button">停止</button></div><p id="pi05-result" class="result">Action Chunk 将转换为绝对 TCP 目标，并只通过 OSC track_tcp 输出。</p></div>`;
+    panel.innerHTML = `<div class="pi05-observation"><div class="pi05-head"><span class="pi05-index">01</span><div><strong>Observation</strong><small>π0.5 多模态输入</small></div></div><div class="pi05-cameras"><label>外部 RGB<input id="pi05-external-index" type="number" min="0" max="32" value="1"></label><label>腕部 RGB<input id="pi05-wrist-index" type="number" min="0" max="32" value="2"></label></div><div class="pi05-views"><div class="pi05-view"><span>外部视角</span><img id="pi05-external-frame" alt="外部 RGB 实时画面"><b id="pi05-external-preview">等待画面</b></div><div class="pi05-view"><span>腕部视角</span><img id="pi05-wrist-frame" alt="腕部 RGB 实时画面"><b id="pi05-wrist-preview">等待画面</b></div></div><label class="pi05-prompt">Prompt<textarea id="pi05-prompt" maxlength="500">place the fixed block into the fixed box</textarea></label></div><div class="pi05-arrow">→<small>推理中</small></div><div class="pi05-inference"><div class="pi05-head"><span class="pi05-index">02</span><div><strong>π0.5 Inference</strong><small>持续重规划</small></div></div><div class="pi05-orb">π</div><strong id="pi05-model-state">未连接</strong><div class="pi05-metrics"><span>状态<b id="pi05-run-state">IDLE</b></span><span>推理耗时<b id="pi05-inference-ms">--</b></span><span>生成序号<b id="pi05-chunk-length">0</b></span><span>执行动作<b id="pi05-executed">0</b></span></div><div class="pi05-actions"><button id="pi05-cameras" class="button" type="button">初始化相机</button><button id="pi05-start" class="button primary" type="button">启动 π0.5</button><button id="pi05-stop" class="button quiet" type="button">停止</button></div><p id="pi05-result" class="result">Action Chunk 将转换为绝对 TCP 目标，并只通过 OSC track_tcp 输出。</p></div>`;
     document.querySelector(".osc-panel")?.append(panel);
     for (const id of ["pi05-external-index", "pi05-wrist-index"]) {
       const input = $(id); const select = document.createElement("select");
@@ -187,7 +187,7 @@
     if ($("dataset-panel")) return;
     const panel = document.createElement("section");
     panel.id = "dataset-panel"; panel.className = "dataset-panel";
-    panel.innerHTML = `<div class="pico-head"><span class="pi05-index">D</span><div><strong>示范数据采集</strong><small>独立记录 · 目标 20 Hz</small></div><span id="dataset-state" class="badge neutral">未采集</span></div><div class="dataset-fields"><label>任务名称<input id="dataset-task" value="red_cube_to_tray" maxlength="120"></label><label>任务描述<input id="dataset-description" value="pick up the red cube and place it in the tray" maxlength="500"></label></div><section class="dataset-source"><strong>当前采集来源</strong><div id="dataset-source-summary">正在读取当前控制源和相机状态…</div></section><section class="dataset-content"><strong>本 Episode 采集内容</strong><div id="dataset-content-summary">元数据、20 Hz 时序样本、机器人观测、目标动作与可选 PICO 输入。</div></section><div class="pico-actions"><button id="dataset-start" class="button primary" type="button">开始采集 Episode</button><button id="dataset-stop" class="button quiet" type="button">结束并保存</button><button id="dataset-failed" class="button quiet" type="button">失败并删除</button></div><div class="dataset-readout"><span>运行时间<b id="dataset-duration">0.0 s</b></span><span>帧数 / 实际频率<b id="dataset-frames">0 / 0 Hz</b></span><span>图像丢帧<b id="dataset-dropped">0</b></span><span>已写入数据<b id="dataset-bytes">0 B</b></span><span>执行模式<b id="dataset-execution-mode">--</b></span><span>保存位置<b id="dataset-path">--</b></span></div><p id="dataset-result" class="result">采集器不会配置相机或发送机器人命令。</p>`;
+    panel.innerHTML = `<div class="pico-head"><span class="pi05-index">D</span><div><strong>示范数据采集</strong><small>RGB 双频率记录 · 相机 20 Hz / 状态 15 Hz</small></div><span id="dataset-state" class="badge neutral">未采集</span></div><div class="dataset-fields"><label>任务名称<input id="dataset-task" value="red_cube_to_tray" maxlength="120"></label><label>任务描述<input id="dataset-description" value="pick up the red cube and place it in the tray" maxlength="500"></label></div><section class="dataset-source"><strong>当前采集来源</strong><div id="dataset-source-summary">正在读取当前控制源和相机状态…</div></section><section class="dataset-content"><strong>本 Episode 采集内容</strong><div id="dataset-content-summary">metadata.json、camera_frames.jsonl、robot_states.jsonl 和两路 RGB JPEG；不保存设备专用输入字段。</div></section><div class="pico-actions"><button id="dataset-start" class="button primary" type="button">开始采集 Episode</button><button id="dataset-stop" class="button quiet" type="button">结束并保存</button><button id="dataset-failed" class="button quiet" type="button">失败并删除</button></div><div class="dataset-readout"><span>运行时间<b id="dataset-duration">0.0 s</b></span><span>相机帧 / 实际频率<b id="dataset-frames">0 / 0 Hz</b></span><span>状态帧 / 实际频率<b id="dataset-state-frames">0 / 0 Hz</b></span><span>丢帧 / 重复<b id="dataset-dropped">0 / 0</b></span><span>时间戳异常<b id="dataset-timestamp-errors">0</b></span><span>已写入数据<b id="dataset-bytes">0 B</b></span><span>保存位置<b id="dataset-path">--</b></span></div><p id="dataset-result" class="result">采集器不会配置相机或发送机器人命令。</p>`;
     document.querySelector(".osc-card")?.insertAdjacentElement("afterend", panel);
   }
 
@@ -471,13 +471,13 @@
   function datasetDetails(data) { return data.recording ? data : (data.last_episode || data); }
   function datasetPreview() {
     const control_source = selectedAdapter(); const config = state.cameras?.config || {}; const sources = state.cameras?.sources || {};
-    const camera_sources = (control_source === "pi05" || control_source === "pico") ? Object.fromEntries(["external", "wrist"].map((source) => {
+    const camera_sources = Object.fromEntries(["external", "wrist"].map((source) => {
       const item = config[source] || {}; const status = sources[source] || {};
       return [source, { source, label: source === "external" ? "外部 RGB" : "腕部 RGB", folder: source === "external" ? "front" : "wrist",
         index: item.index, width: item.width, height: item.height, available: status.available === true,
         frame_available: status.frame_available === true, captured_frames: 0, dropped_frames: 0 }];
-    })) : {};
-    return { control_source, camera_sources, data_contents: { images: Object.values(camera_sources).map((camera) => ({
+    }));
+    return { control_source, camera_sources, camera_rate_hz: 20, robot_state_rate_hz: 15, data_contents: { images: Object.values(camera_sources).map((camera) => ({
       source: camera.source, label: camera.label, format: "JPEG", directory: `images/${camera.folder}`, available: camera.available,
     })) } };
   }
@@ -496,15 +496,17 @@
     const images = Array.isArray(contents.images) && contents.images.length
       ? contents.images.map((item) => `${item.label || item.source} JPEG → ${item.directory}`).join("；")
       : "无图像流（仅状态、动作和控制输入）";
-    $("dataset-content-summary").innerHTML = `<span><b>metadata.json</b>：UTF-8 JSON（任务、来源、相机快照和统计）</span><span><b>frames.jsonl</b>：UTF-8 JSON Lines，20 Hz；每行含 ISO 8601 时间、帧号、7 关节 rad、TCP、夹爪 m、目标动作与执行模式</span><span><b>PICO 输入</b>：位置 m、四元数 xyzw、Grip/Trigger；不可用时为 null</span><span><b>图像</b>：${images}</span>`;
+    $("dataset-content-summary").innerHTML = `<span><b>metadata.json</b>：任务、来源、公共 monotonic 时间轴起点和统计</span><span><b>camera_frames.jsonl</b>：相机独立 20 Hz RGB 时间戳和 JPEG 路径</span><span><b>robot_states.jsonl</b>：机械臂独立 15 Hz 的真实 observation 与实际 action</span><span><b>设备输入</b>：仅在 metadata 中记录来源，不写入策略主字段</span><span><b>图像</b>：${images}</span>`;
   }
   function renderDataset() {
     const raw = state.dataset || {}; const data = datasetDetails(raw); const recording = raw.recording === true;
     const preview = recording ? data : datasetPreview();
-    picoText("dataset-state", recording ? "采集中" : (data.status === "deleted" ? "已删除" : data.status === "completed" ? "已保存" : "未采集"));
+    picoText("dataset-state", recording ? "采集中" : (data.status === "deleted" ? "已删除" : data.status === "completed" ? "已保存" : data.status === "abnormal" ? "采集异常" : "未采集"));
     picoText("dataset-duration", `${Number(data.duration_s || 0).toFixed(1)} s`);
-    picoText("dataset-frames", `${data.frame_count ?? 0} / ${Number(data.effective_hz || 0).toFixed(1)} Hz`);
-    picoText("dataset-dropped", data.dropped_frames ?? 0); picoText("dataset-bytes", datasetBytes(data.bytes_written));
+    picoText("dataset-frames", `${data.camera_frame_count ?? 0} / ${Number(data.effective_camera_hz || 0).toFixed(1)} Hz`);
+    picoText("dataset-state-frames", `${data.robot_state_count ?? 0} / ${Number(data.effective_robot_state_hz || 0).toFixed(1)} Hz`);
+    picoText("dataset-dropped", `${data.camera_dropped_frames ?? 0} / ${data.duplicate_frames ?? 0}`);
+    picoText("dataset-timestamp-errors", data.timestamp_errors ?? 0); picoText("dataset-bytes", datasetBytes(data.bytes_written));
     picoText("dataset-execution-mode", data.execution_mode || "--");
     picoText("dataset-path", data.episode_dir || raw.dataset_root || "--");
     renderDatasetSources(preview); renderDatasetContents(preview);
@@ -512,8 +514,8 @@
     picoText("dataset-result", feedback);
     const busy = state.datasetBusy;
     $("dataset-start") && ($("dataset-start").disabled = busy || recording);
-    $("dataset-stop") && ($("dataset-stop").disabled = busy || !recording);
-    $("dataset-failed") && ($("dataset-failed").disabled = busy || !recording);
+    $("dataset-stop") && ($("dataset-stop").disabled = busy || (!recording && data.status !== "abnormal"));
+    $("dataset-failed") && ($("dataset-failed").disabled = busy || (!recording && data.status !== "abnormal"));
     ["dataset-task", "dataset-description"].forEach((id) => { if ($(id)) $(id).disabled = busy || recording; });
   }
   async function refreshDatasetState() { try { state.dataset = await api("/api/dataset/state"); renderDataset(); } catch (_) {} }
@@ -541,8 +543,8 @@
 
   function renderPi05() {
     const pi = state.pi05 || {}; const config = pi.config || {}; const cameras = config.cameras || {}; const model = config.model || {};
-    if ($("pi05-external-index") && document.activeElement !== $("pi05-external-index")) $("pi05-external-index").value = cameras.external?.index ?? 0;
-    if ($("pi05-wrist-index") && document.activeElement !== $("pi05-wrist-index")) $("pi05-wrist-index").value = cameras.wrist?.index ?? 1;
+    if ($("pi05-external-index") && document.activeElement !== $("pi05-external-index")) $("pi05-external-index").value = cameras.external?.index ?? 1;
+    if ($("pi05-wrist-index") && document.activeElement !== $("pi05-wrist-index")) $("pi05-wrist-index").value = cameras.wrist?.index ?? 2;
     if ($("pi05-prompt") && document.activeElement !== $("pi05-prompt")) $("pi05-prompt").value = model.prompt || pi.prompt || "";
     $("pi05-model-state").textContent = pi.model_state || "UNKNOWN";
     $("pi05-run-state").textContent = pi.state || "IDLE";
@@ -583,8 +585,8 @@
     try {
       const [result, cameras] = await Promise.all([api("/api/cameras/list", "GET", undefined, 12000), api("/api/cameras/state", "GET", undefined, 12000)]); state.pi05Cameras = result.cameras || []; state.cameras = cameras;
       const config = cameras.config || {}; const fill = (id, selected) => { const select = $(id); if (!select) return; select.innerHTML = state.pi05Cameras.map((camera) => `<option value="${Number(camera.index)}">${Number(camera.index)} · ${String(camera.name || "Camera")}</option>`).join("") || `<option value="${selected}">${selected} · 未检测到相机</option>`; select.value = String(selected); select.onchange = activateSharedCameras; };
-      ["pi05-external-index", "pico-external-index"].forEach((id) => fill(id, config.external?.index ?? 0));
-      ["pi05-wrist-index", "pico-wrist-index"].forEach((id) => fill(id, config.wrist?.index ?? 1));
+      ["pi05-external-index", "pico-external-index"].forEach((id) => fill(id, config.external?.index ?? 1));
+      ["pi05-wrist-index", "pico-wrist-index"].forEach((id) => fill(id, config.wrist?.index ?? 2));
     } catch (error) { const result = $("pi05-result"); if (result) result.textContent = `相机列表读取失败：${error.message}`; }
   }
 

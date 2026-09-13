@@ -65,6 +65,7 @@ class SharedCameraResource:
                     "available": self.cameras is not None,
                     "frame_available": key in self.frames,
                     "last_frame_age_ms": round((now - self.frame_times[key]) * 1000, 1) if key in self.frame_times else None,
+                    "stream_error": self.last_error,
                     "timestamp_monotonic_ns": self.frame_times_ns.get(key),
                 }
                 for key in ("external", "wrist")
@@ -220,6 +221,25 @@ class SharedCameraResource:
         import cv2
         ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 84])
         return encoded.tobytes() if ok else None
+
+    def frame_jpegs(self) -> dict[str, tuple[int, bytes]]:
+        """Atomically snapshot both current RGB frames and their timestamps."""
+        with self.lock:
+            snapshots = []
+            for source in ("external", "wrist"):
+                frame = self.frames.get(source)
+                stamp = self.frame_times_ns.get(source)
+                if frame is None or stamp is None:
+                    return {}
+                snapshots.append((source, int(stamp), frame.copy()))
+        import cv2
+        result = {}
+        for source, stamp, frame in snapshots:
+            ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 84])
+            if not ok:
+                return {}
+            result[source] = (stamp, encoded.tobytes())
+        return result
 
     def frame_timestamp(self, source: str, target_monotonic_ns: int | None = None) -> int | None:
         with self.lock:
