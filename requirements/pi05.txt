@@ -3,4 +3,4 @@ msgpack>=1.0.5
 websockets>=12.0
 opencv-python>=4.8,<4.12
 cv2-enumerate-cameras>=1.3.3
-
+pyrealsense2>=2.58,<2.59
