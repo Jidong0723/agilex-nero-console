@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import shutil
 import threading
 import time
@@ -36,6 +37,60 @@ def _number(value: Any) -> float | None:
 
 def _monotonic_ns(value: Any) -> int | None:
     return value if not isinstance(value, bool) and isinstance(value, int) and value > 0 else None
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert recorder metadata to strict JSON without leaking NaN values."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if value == value and abs(value) != float("inf") else None
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    to_list = getattr(value, "tolist", None)
+    if callable(to_list):
+        return _json_safe(to_list())
+    return str(value)
+
+
+def _pose_components(value: Any) -> tuple[list[float], list[float]] | None:
+    """Validate a recorded TCP pose before accepting it as measured feedback."""
+    if not isinstance(value, dict):
+        return None
+    position = _finite_list(value.get("position_m"), 3)
+    orientation = _finite_list(value.get("orientation_xyzw"), 4)
+    if position is None or orientation is None or sum(item * item for item in orientation) <= 1e-12:
+        return None
+    norm = math.sqrt(sum(item * item for item in orientation))
+    return position, [item / norm for item in orientation]
+
+
+def _rotvec_between(first_xyzw: Any, second_xyzw: Any) -> list[float]:
+    """Return the shortest axis-angle vector rotating ``first`` into ``second``."""
+    first = _finite_list(first_xyzw, 4)
+    second = _finite_list(second_xyzw, 4)
+    if first is None or second is None:
+        raise ValueError("rotation quaternions must contain four finite values")
+    first_norm, second_norm = math.sqrt(sum(item * item for item in first)), math.sqrt(sum(item * item for item in second))
+    if first_norm <= 1e-12 or second_norm <= 1e-12:
+        raise ValueError("rotation quaternion must be non-zero")
+    x1, y1, z1, w1 = (item / first_norm for item in first)
+    x2, y2, z2, w2 = (item / second_norm for item in second)
+    # inverse(first) * second, with the scalar made positive so the result
+    # follows the shortest angular path.
+    x = w1 * x2 - x1 * w2 - y1 * z2 + z1 * y2
+    y = w1 * y2 + x1 * z2 - y1 * w2 - z1 * x2
+    z = w1 * z2 - x1 * y2 + y1 * x2 - z1 * w2
+    w = w1 * w2 + x1 * x2 + y1 * y2 + z1 * z2
+    if w < 0.0:
+        x, y, z, w = -x, -y, -z, -w
+    vector_norm = math.sqrt(x * x + y * y + z * z)
+    if vector_norm <= 1e-12:
+        return [0.0, 0.0, 0.0]
+    angle = 2.0 * math.atan2(vector_norm, max(-1.0, min(1.0, w)))
+    return [x * angle / vector_norm, y * angle / vector_norm, z * angle / vector_norm]
 
 
 class DatasetRecorder:
