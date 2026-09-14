@@ -62,7 +62,7 @@
     "stale_timeout_s": 1.0,
     "max_hz": 90,
     "max_message_bytes": 4096,
-    "adb_executable": "adb",
+    "adb_executable": "C:\\Users\\Jidong\\AppData\\Roaming\\PICO_Developer_Center_Downloads\\cn\\adb\\platform-tools\\adb.exe",
     "auto_reconnect_usb": true,
     "usb_reconnect_interval_s": 3.0
   },

@@ -8,6 +8,7 @@ import mimetypes
 import multiprocessing
 import os
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -895,7 +896,7 @@ class PicoGateway:
             self._last_usb_reconnect_source = source
             self._last_connection_stage = "reconnecting_usb"
             self._last_connection_error = None
-        adb = str(self.config.get("adb_executable", "adb"))
+        adb = self._resolve_adb_executable()
         port = int(self.config.get("port", 8768))
         try:
             devices = subprocess.run([adb, "devices"], capture_output=True, text=True, timeout=5, check=False)
@@ -928,6 +929,29 @@ class PicoGateway:
             self._last_connection_stage = "usb_reconnect_failed"
             self._last_connection_error = message
         return {"ok": False, "message": message, "gateway": self.status()}
+
+    def _resolve_adb_executable(self) -> str:
+        """Find the one ADB installation that can own the USB reverse tunnel."""
+        configured = str(self.config.get("adb_executable", "adb"))
+        if Path(configured).is_file() or shutil.which(configured):
+            return configured
+        # A non-default value is an explicit operator choice. Do not silently
+        # substitute another SDK in that case, because ADB server ownership is
+        # machine-wide and mixing vendor SDKs can drop an existing tunnel.
+        if configured.lower() not in {"adb", "adb.exe"}:
+            return configured
+        app_data = Path(os.environ.get("APPDATA", ""))
+        candidates = [
+            app_data / "PICO_Developer_Center_Downloads" / "cn" / "adb" / "platform-tools" / "adb.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Android" / "Sdk" / "platform-tools" / "adb.exe",
+        ]
+        tuanjie_root = Path("C:/Program Files/Tuanjie/Hub/Editor")
+        if tuanjie_root.is_dir():
+            candidates.extend(tuanjie_root.glob("*/Editor/Data/PlaybackEngines/AndroidPlayer/SDK/platform-tools/adb.exe"))
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+        return configured
 
     def _send_control_result(self, connection: Any, kind: str, sequence: int, result: Any, error: str | None) -> None:
         data = dict(result) if isinstance(result, dict) else {}

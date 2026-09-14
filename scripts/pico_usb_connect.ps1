@@ -5,6 +5,19 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if ($Adb -in @("adb", "adb.exe") -and -not (Get-Command $Adb -ErrorAction SilentlyContinue)) {
+  $candidates = @(
+    (Join-Path $env:APPDATA "PICO_Developer_Center_Downloads\cn\adb\platform-tools\adb.exe"),
+    (Join-Path $env:LOCALAPPDATA "Android\Sdk\platform-tools\adb.exe")
+  )
+  $tuanjie = "C:\Program Files\Tuanjie\Hub\Editor"
+  if (Test-Path -LiteralPath $tuanjie) {
+    $candidates += Get-ChildItem -LiteralPath $tuanjie -Filter adb.exe -Recurse -ErrorAction SilentlyContinue | ForEach-Object FullName
+  }
+  $found = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+  if ($found) { $Adb = $found }
+}
+
 try {
   & $Adb version *> $null
 } catch {
