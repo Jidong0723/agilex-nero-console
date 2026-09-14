@@ -808,6 +808,33 @@ class TransportOwnerEpochTests(unittest.TestCase):
 
 
 class OscRxParallelTests(unittest.TestCase):
+    def test_samples_after_drains_each_producer_revision_once(self) -> None:
+        class RxPort:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def read_cached_feedback(self) -> dict[str, Any]:
+                self.calls += 1
+                now = time.monotonic_ns()
+                return {"joint_angles_rad": [float(self.calls)] * 7,
+                        "joint_velocity_rad_s": [0.0] * 7,
+                        "sdk_joint_timestamp": self.calls,
+                        "received_at_monotonic_ns": now}
+
+        rx = _OscFeedbackReceiver(RxPort(), 100.0)
+        try:
+            rx.start()
+            rx.wait_for_revision_after(4, 0.5)
+            rows = rx.samples_after(0, 0.0)
+            revisions = [row["revision"] for row in rows]
+            self.assertGreaterEqual(len(revisions), 5)
+            self.assertEqual(revisions, list(range(revisions[0], revisions[-1] + 1)))
+            following = rx.samples_after(revisions[-1], 0.1)
+            self.assertTrue(following)
+            self.assertEqual(following[0]["revision"], revisions[-1] + 1)
+        finally:
+            self.assertTrue(rx.close())
+
     def test_rx_progresses_while_p2_transaction_blocks(self) -> None:
         class RxPort:
             def __init__(self) -> None:
@@ -883,6 +910,32 @@ class OscRxParallelTests(unittest.TestCase):
             self.assertEqual(retained["revision"], sample["revision"])
             self.assertIn("RX cache unavailable", retained["last_error"])
             self.assertTrue(retained["running"])
+        finally:
+            self.assertTrue(rx.close())
+
+    def test_dataset_alignment_history_advances_when_sdk_timestamp_is_static(self) -> None:
+        class StaticTimestampRxPort:
+            def read_cached_feedback(self) -> dict[str, Any]:
+                return {
+                    "joint_angles_rad": [0.25] * 7,
+                    "joint_velocity_rad_s": [0.0] * 7,
+                    "sdk_joint_timestamp": 7,
+                    "received_at_monotonic_ns": time.monotonic_ns(),
+                }
+
+        rx = _OscFeedbackReceiver(StaticTimestampRxPort(), 100.0)
+        try:
+            rx.start()
+            first = rx.wait_for_revision_after(0, 0.5)
+            first_alignment = int(first["alignment_monotonic_ns"])
+            time.sleep(0.04)
+            target = time.perf_counter_ns()
+            aligned = rx.nearest(target, 0.05)
+            self.assertIsNotNone(aligned)
+            self.assertGreater(int(aligned["alignment_monotonic_ns"]), first_alignment)
+            self.assertLess(float(aligned["alignment_error_s"]), 0.02)
+            # Motion safety still sees the original SDK-fresh timestamp.
+            self.assertEqual(aligned["fresh_received_at_monotonic_ns"], first["fresh_received_at_monotonic_ns"])
         finally:
             self.assertTrue(rx.close())
 

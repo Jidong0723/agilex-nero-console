@@ -1111,6 +1111,8 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 return self._json_ok(self.runtime.require_adapters().camera_state())
             if parsed.path == "/api/dataset/state":
                 return self._json_ok(self.runtime.require_adapters().dataset_state())
+            if parsed.path == "/api/dataset/feedback":
+                return self._json_ok(self.broker.osc_sensor_sample(time.perf_counter_ns(), 0.0))
             if parsed.path == "/api/dataset/episodes":
                 return self._json_ok(self.runtime.require_adapters().dataset_episodes())
             if parsed.path == "/api/adapters/pico/state":

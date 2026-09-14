@@ -58,6 +58,7 @@ class _OscFeedbackReceiver:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._sample: dict[str, Any] | None = None
+        self._history: deque[dict[str, Any]] = deque(maxlen=512)
         self._revision = 0
         self._last_sdk_timestamp: Any = None
         self._last_fresh_received_ns: int | None = None
@@ -96,6 +97,48 @@ class _OscFeedbackReceiver:
         with self._lock:
             return self._revision
 
+    def nearest(self, target_monotonic_ns: int, wait_s: float = 0.0) -> dict[str, Any] | None:
+        """Return the hardware sample nearest an image timestamp.
+
+        A short wait allows the first feedback sample after exposure to enter
+        the history, which is essential for unbiased nearest-neighbour
+        alignment between independent camera and CAN clocks.
+        """
+        deadline = time.monotonic() + max(0.0, float(wait_s))
+        while True:
+            with self._lock:
+                history = list(self._history)
+                has_future = any(int(item["alignment_monotonic_ns"]) >= int(target_monotonic_ns) for item in history)
+                if history and (has_future or time.monotonic() >= deadline):
+                    sample = dict(min(history, key=lambda item: abs(int(item["alignment_monotonic_ns"]) - int(target_monotonic_ns))))
+                    sample["joints"] = list(sample["joints"])
+                    sample["velocities"] = list(sample["velocities"])
+                    latest_ns = int(history[-1]["alignment_monotonic_ns"])
+                    sample["latest_feedback_age_s"] = max(0.0, (time.perf_counter_ns() - latest_ns) / 1e9)
+                    sample["alignment_error_s"] = abs(int(sample["alignment_monotonic_ns"]) - int(target_monotonic_ns)) / 1e9
+                    return sample
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.001)
+
+    def samples_after(self, revision: int, wait_s: float = 0.0, max_items: int = 128) -> list[dict[str, Any]]:
+        """Return every retained producer sample after ``revision`` in order."""
+        deadline = time.monotonic() + max(0.0, float(wait_s))
+        while True:
+            with self._lock:
+                rows = [item for item in self._history if int(item["revision"]) > int(revision)]
+                if rows:
+                    result = []
+                    for item in rows[:max(1, int(max_items))]:
+                        sample = dict(item)
+                        sample["joints"] = list(sample["joints"])
+                        sample["velocities"] = list(sample["velocities"])
+                        result.append(sample)
+                    return result
+            if time.monotonic() >= deadline:
+                return []
+            time.sleep(0.001)
+
     def wait_for_revision_after(self, revision: int, timeout_s: float) -> dict[str, Any]:
         deadline = time.monotonic() + max(0.001, float(timeout_s))
         while time.monotonic() < deadline:
@@ -112,6 +155,7 @@ class _OscFeedbackReceiver:
                 requested_ns = time.monotonic_ns()
                 row = self._source.read_cached_feedback()
                 received_ns = int(row.get("received_at_monotonic_ns") or time.monotonic_ns())
+                alignment_ns = time.perf_counter_ns()
                 joints = list(row.get("joint_angles_rad") or [])
                 velocities = list(row.get("joint_velocity_rad_s") or [])
                 if len(joints) == 7 and len(velocities) == 7 and all(value is not None for value in velocities):
@@ -124,7 +168,7 @@ class _OscFeedbackReceiver:
                         self._last_fresh_received_ns = received_ns
                     with self._lock:
                         self._revision += 1
-                        self._sample = {
+                        sample = {
                             "revision": self._revision,
                             "joints": [float(value) for value in joints],
                             "velocities": [float(value) for value in velocities],
@@ -132,11 +176,19 @@ class _OscFeedbackReceiver:
                             "joint_feedback_hz": row.get("joint_feedback_hz"),
                             "sdk_timestamp_advanced": advanced,
                             "fresh_received_at_monotonic_ns": self._last_fresh_received_ns,
+                            # The SDK timestamp may advance only when cached
+                            # joint content changes. For dataset association,
+                            # timestamp when this read-only cache snapshot was
+                            # observed; retain fresh_received separately for
+                            # the motion-safety watchdog.
+                            "alignment_monotonic_ns": alignment_ns,
                             "monotonic_ns": self._last_fresh_received_ns,
                             "requested_monotonic_ns": requested_ns,
                             "received_monotonic_ns": received_ns,
                             "read_duration_s": max(0.0, (received_ns - requested_ns) / 1e9),
                         }
+                        self._sample = sample
+                        self._history.append(dict(sample))
                         self._last_error = None
             except Exception as exc:
                 with self._lock:
@@ -1231,6 +1283,7 @@ class _OperationalSpaceServo:
                 initial_sample_ns = time.monotonic_ns()
                 self.execution_sample = {
                     "sample_id": 0,
+                    "feedback_revision": int(feedback.get("revision", 0)) if execution_mode != "shadow" else 0,
                     "target_generation": self.target_generation,
                     "sample_monotonic_ns": initial_sample_ns,
                     "solver_finished_monotonic_ns": initial_sample_ns,
@@ -1863,6 +1916,7 @@ class _OperationalSpaceServo:
                     with self.lock:
                         self.execution_sample = {
                             "sample_id": sample_id,
+                            "feedback_revision": int((feedback or {}).get("revision", 0)),
                             "target_generation": target_generation,
                             "sample_monotonic_ns": int(pink.get("joint_state_monotonic_ns") or now_ns),
                             "solver_finished_monotonic_ns": solver_finished_ns,
@@ -2150,6 +2204,10 @@ class OscRuntime:
         return self._receiver.close()
 
     def rx_snapshot(self) -> dict[str, Any] | None: return self._receiver.snapshot()
+    def rx_sample_nearest(self, target_monotonic_ns: int, wait_s: float = 0.0) -> dict[str, Any] | None:
+        return self._receiver.nearest(target_monotonic_ns, wait_s)
+    def rx_samples_after(self, revision: int, wait_s: float = 0.0, max_items: int = 128) -> list[dict[str, Any]]:
+        return self._receiver.samples_after(revision, wait_s, max_items)
 
     def wait_for_rx_after(self, revision: int, timeout_s: float) -> dict[str, Any]:
         return self._receiver.wait_for_revision_after(revision, timeout_s)
