@@ -70,7 +70,7 @@ Connect the CANDO adapter and NERO CAN cable, clear the workspace, then run:
 
 Open <http://127.0.0.1:8765/>. The service binds to localhost by default. Do not expose it directly to a public or untrusted network.
 
-PICO uses USB/ADB only. After connecting the headset and enabling USB debugging, run `powershell -ExecutionPolicy Bypass -File .\scripts\pico_usb_connect.ps1`; the APK connects directly to `ws://127.0.0.1:8768`. No LAN address, pairing code, QR code, or wireless gateway is used.
+PICO uses USB/ADB only. After connecting the headset and enabling USB debugging, run `powershell -ExecutionPolicy Bypass -File .\scripts\pico_usb_connect.ps1`; the APK connects directly to `ws://127.0.0.1:8768`. No LAN address, pairing code, QR code, or wireless gateway is used. If USB is unplugged and reinserted, keep the PICO receiver running: the service retries `adb reverse` automatically, or use **重新连接 PICO USB** in the page to retry immediately. The next headset connection is safe/HOLD until a fresh Grip press establishes an anchor.
 
 The first teleoperation session remains Shadow by default. Review live feedback and limits before explicitly enabling hardware control in the page.
 

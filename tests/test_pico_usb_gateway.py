@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import threading
 import unittest
+from unittest.mock import patch
 
 from scripts.nero_control_server import PicoGateway
 
@@ -58,6 +61,25 @@ class _Connection:
     def send(self, payload: str) -> None:
         self.sent.append(json.loads(payload))
 
+    def close(self, *args, **kwargs) -> None:
+        self.closed = True
+
+
+class _BlockingConnection(_Connection):
+    def __init__(self) -> None:
+        super().__init__([_frame()])
+        self.closed = False
+        self.received_first_frame = threading.Event()
+
+    def recv(self, timeout: float | None = None) -> str:
+        if self.messages:
+            value = super().recv(timeout)
+            self.received_first_frame.set()
+            return value
+        while not self.closed:
+            threading.Event().wait(0.005)
+        raise ConnectionAbortedError("connection closed")
+
 
 def _frame(sequence: int = 1) -> dict:
     return {"type": "input_frame", "sequence": sequence, "position_m": [0, 0, 0],
@@ -68,7 +90,8 @@ def _frame(sequence: int = 1) -> dict:
 class PicoUsbGatewayTests(unittest.TestCase):
     def _gateway(self, runtime: _Runtime) -> PicoGateway:
         gateway = PicoGateway(runtime, {"host": "0.0.0.0", "port": 8768,
-                                        "idle_timeout_s": 0.05, "message_timeout_s": 0.01})
+                                        "idle_timeout_s": 0.05, "message_timeout_s": 0.01,
+                                        "adb_executable": "adb-not-installed-for-tests"})
         gateway._server = _Server()
         gateway.start_session("osc-1", "browser")
         return gateway
@@ -108,3 +131,49 @@ class PicoUsbGatewayTests(unittest.TestCase):
         self.assertEqual(status["ws_url"], "ws://127.0.0.1:8768")
         self.assertNotIn("pair_code", status)
         self.assertNotIn("pairing_id", status)
+
+    def test_repeat_start_for_same_session_is_idempotent(self) -> None:
+        runtime = _Runtime()
+        gateway = self._gateway(runtime)
+        try:
+            gateway.start_session("osc-1", "browser")
+            self.assertEqual([event for event in runtime.adapter.events if event[0] == "start"], [("start", "osc-1", "browser")])
+        finally:
+            gateway.close()
+
+    def test_replacing_session_closes_old_socket_without_losing_new_session(self) -> None:
+        runtime = _Runtime()
+        gateway = self._gateway(runtime)
+        connection = _BlockingConnection()
+        worker = threading.Thread(target=gateway._handle_connection, args=(connection,))
+        worker.start()
+        self.assertTrue(connection.received_first_frame.wait(1.0))
+        gateway.start_session("osc-2", "browser")
+        worker.join(1.0)
+        try:
+            self.assertFalse(worker.is_alive())
+            self.assertTrue(connection.closed)
+            self.assertEqual(gateway.status()["session_id"], "osc-2")
+            self.assertFalse(any(event[0] == "lost" for event in runtime.adapter.events))
+        finally:
+            gateway.close()
+
+    def test_reconnect_usb_reports_success_and_device_errors(self) -> None:
+        runtime = _Runtime()
+        gateway = self._gateway(runtime)
+        good = [
+            subprocess.CompletedProcess(["adb", "devices"], 0, "List of devices attached\npico\tdevice\n", ""),
+            subprocess.CompletedProcess(["adb", "reverse"], 0, "", ""),
+            subprocess.CompletedProcess(["adb", "reverse", "--list"], 0, "pico tcp:8768 tcp:8768\n", ""),
+        ]
+        try:
+            with patch("scripts.nero_control_server.subprocess.run", side_effect=good):
+                result = gateway.reconnect_usb(source="test")
+            self.assertTrue(result["ok"])
+            self.assertEqual(gateway.status()["connection_stage"], "waiting_for_headset")
+            with patch("scripts.nero_control_server.subprocess.run", return_value=subprocess.CompletedProcess(["adb", "devices"], 0, "List of devices attached\n", "")):
+                result = gateway.reconnect_usb(source="test")
+            self.assertFalse(result["ok"])
+            self.assertIn("no authorized PICO", result["message"])
+        finally:
+            gateway.close()

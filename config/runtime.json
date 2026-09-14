@@ -61,7 +61,10 @@
     "idle_timeout_s": 30.0,
     "stale_timeout_s": 1.0,
     "max_hz": 90,
-    "max_message_bytes": 4096
+    "max_message_bytes": 4096,
+    "adb_executable": "adb",
+    "auto_reconnect_usb": true,
+    "usb_reconnect_interval_s": 3.0
   },
   "pico_adapter": {
     "mapping_verified": false,

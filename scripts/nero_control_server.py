@@ -634,8 +634,13 @@ class PicoGateway:
         self._send_lock = threading.RLock()
         self._server: Any | None = None
         self._thread: threading.Thread | None = None
+        self._usb_monitor_thread: threading.Thread | None = None
+        self._usb_monitor_stop = threading.Event()
         self._session: dict[str, Any] | None = None
         self._connection_active = False
+        self._connection_generation = 0
+        self._active_connection: Any | None = None
+        self._open_connections: dict[int, Any] = {}
         self._last_input_monotonic = 0.0
         self._connection_attempts = 0
         self._last_connection_attempt_at: float | None = None
@@ -663,6 +668,10 @@ class PicoGateway:
         self._last_dispatch_error: str | None = None
         self._dispatch_started_ns: int | None = None
         self._dispatch: PicoIngressDispatcher | None = None
+        self._last_usb_reconnect_at: float | None = None
+        self._last_usb_reconnect_error: str | None = None
+        self._last_usb_reconnect_source: str | None = None
+        self._last_usb_reconnect_attempt_monotonic = 0.0
         self.error: str | None = None
         trace_dir = PROJECT_ROOT / "runtime" / "logs" / "pico"
         self.trace_logger = AsyncJsonlTraceLogger(
@@ -692,11 +701,24 @@ class PicoGateway:
             return
         self._thread = threading.Thread(target=self._server.serve_forever, name="nero-pico-gateway", daemon=True)
         self._thread.start()
+        if bool(self.config.get("auto_reconnect_usb", True)):
+            self._usb_monitor_stop.clear()
+            self._usb_monitor_thread = threading.Thread(target=self._usb_monitor_loop, name="nero-pico-usb-monitor", daemon=True)
+            self._usb_monitor_thread.start()
         print(json.dumps({"pico_gateway_ready": True, "host": host, "port": port}), flush=True)
 
     def close(self) -> None:
-        dispatcher = self._dispatch
-        self._dispatch = None
+        self._usb_monitor_stop.set()
+        if self._usb_monitor_thread and self._usb_monitor_thread is not threading.current_thread():
+            self._usb_monitor_thread.join(timeout=1.0)
+        with self._lock:
+            self._connection_generation += 1
+            connections, dispatcher = list(self._open_connections.values()), self._dispatch
+            self._open_connections.clear()
+            self._active_connection, self._dispatch = None, None
+            self._connection_active = False
+        for connection in connections:
+            self._close_connection(connection, "PICO receiver shutting down")
         if dispatcher is not None:
             dispatcher.close()
         server = self._server
@@ -710,6 +732,17 @@ class PicoGateway:
     def start_session(self, session_id: str, client_id: str) -> dict[str, Any]:
         if self._server is None:
             raise RuntimeError(self.error or "PICO USB WebSocket receiver is unavailable")
+        if not session_id:
+            raise ValueError("an active OSC session is required for PICO USB control")
+        with self._lock:
+            same_session = bool(self._session and self._session.get("session_id") == session_id and self._session.get("client_id") == client_id)
+        if same_session:
+            # Repeated page clicks must not reset the adapter or orphan a live
+            # WebSocket. The monitor (and the manual reconnect endpoint) can
+            # restore ADB forwarding while this logical session stays intact.
+            return self._state_result()
+
+        self._detach_active_connection("PICO USB session replaced")
         self.runtime.require_adapters().pico_begin_connection(session_id, client_id)
         with self._lock:
             self._session = {"session_id": session_id, "client_id": client_id}
@@ -723,18 +756,24 @@ class PicoGateway:
             self._input_frame_overwrites = 0
             self._last_connection_stage = "waiting_for_usb"
             self._last_connection_error = None
-        result = self.runtime.require_adapters().pico_state()
-        result["gateway"] = self.status()
-        return result
+        # Do one immediate attempt; further attempts are handled by the
+        # monitor so a physical USB replug can recover without page reload.
+        self.reconnect_usb(source="session_start")
+        return self._state_result()
 
     def invalidate(self) -> None:
-        dispatcher = self._dispatch
-        self._dispatch = None
-        if dispatcher is not None:
-            dispatcher.close()
         with self._lock:
+            self._connection_generation += 1
+            connections, dispatcher = list(self._open_connections.values()), self._dispatch
+            self._open_connections.clear()
+            self._active_connection, self._dispatch = None, None
             self._session = None
             self._connection_active = False
+            self._last_connection_stage = "idle"
+        for connection in connections:
+            self._close_connection(connection, "PICO receiver stopped")
+        if dispatcher is not None:
+            dispatcher.close()
         try:
             self.runtime.require_adapters().pico_disconnected("PICO USB receiver stopped")
         except Exception:
@@ -758,6 +797,11 @@ class PicoGateway:
                 "last_client": self._last_client,
                 "connection_stage": self._last_connection_stage,
                 "last_connection_error": self._last_connection_error,
+                "auto_reconnect_usb": bool(self.config.get("auto_reconnect_usb", True)),
+                "usb_reconnect_interval_s": float(self.config.get("usb_reconnect_interval_s", 3.0)),
+                "last_usb_reconnect_at": self._last_usb_reconnect_at,
+                "last_usb_reconnect_error": self._last_usb_reconnect_error,
+                "last_usb_reconnect_source": self._last_usb_reconnect_source,
                 "last_message_type": self._last_message_type,
                 "last_message_sequence": self._last_message_sequence,
                 "received_count": self._received_count,
@@ -793,6 +837,97 @@ class PicoGateway:
     def _send(self, connection: Any, payload: dict[str, Any]) -> None:
         with self._send_lock:
             connection.send(json.dumps(payload, ensure_ascii=False))
+
+    def _close_connection(self, connection: Any | None, reason: str) -> None:
+        if connection is None:
+            return
+        try:
+            connection.close(code=1000, reason=reason)
+        except TypeError:
+            try:
+                connection.close()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _detach_active_connection(self, reason: str) -> None:
+        with self._lock:
+            self._connection_generation += 1
+            connections, dispatcher = list(self._open_connections.values()), self._dispatch
+            self._open_connections.clear()
+            self._active_connection, self._dispatch = None, None
+            self._connection_active = False
+        for connection in connections:
+            self._close_connection(connection, reason)
+        if dispatcher is not None:
+            dispatcher.close()
+
+    def _state_result(self) -> dict[str, Any]:
+        result = self.runtime.require_adapters().pico_state()
+        result["gateway"] = self.status()
+        return result
+
+    def _usb_monitor_loop(self) -> None:
+        while not self._usb_monitor_stop.wait(0.25):
+            try:
+                self._attempt_usb_reconnect_if_due()
+            except Exception as exc:
+                # ADB availability must never stop the local input receiver.
+                with self._lock:
+                    self._last_usb_reconnect_error = f"{type(exc).__name__}: {exc}"
+
+    def _attempt_usb_reconnect_if_due(self) -> bool:
+        with self._lock:
+            due = (time.monotonic() - self._last_usb_reconnect_attempt_monotonic) >= float(self.config.get("usb_reconnect_interval_s", 3.0))
+            needed = self._session is not None and not self._connection_active
+        if not needed or not due:
+            return False
+        self.reconnect_usb(source="automatic")
+        return True
+
+    def reconnect_usb(self, *, source: str = "manual") -> dict[str, Any]:
+        """Restore ADB reverse after USB hotplug without replacing the session."""
+        with self._lock:
+            if self._session is None:
+                raise RuntimeError("start the PICO receiver before reconnecting USB")
+            self._last_usb_reconnect_attempt_monotonic = time.monotonic()
+            self._last_usb_reconnect_source = source
+            self._last_connection_stage = "reconnecting_usb"
+            self._last_connection_error = None
+        adb = str(self.config.get("adb_executable", "adb"))
+        port = int(self.config.get("port", 8768))
+        try:
+            devices = subprocess.run([adb, "devices"], capture_output=True, text=True, timeout=5, check=False)
+            if devices.returncode != 0:
+                raise RuntimeError((devices.stderr or devices.stdout or "adb devices failed").strip())
+            online = [line.split()[0] for line in devices.stdout.splitlines()[1:] if len(line.split()) >= 2 and line.split()[1] == "device"]
+            if len(online) != 1:
+                if not online:
+                    raise RuntimeError("no authorized PICO USB device; reconnect it and allow USB debugging")
+                raise RuntimeError(f"expected exactly one authorized ADB device, found {len(online)}")
+            reverse = subprocess.run([adb, "reverse", f"tcp:{port}", f"tcp:{port}"], capture_output=True, text=True, timeout=5, check=False)
+            if reverse.returncode != 0:
+                raise RuntimeError((reverse.stderr or reverse.stdout or "adb reverse failed").strip())
+            listing = subprocess.run([adb, "reverse", "--list"], capture_output=True, text=True, timeout=5, check=False)
+            if listing.returncode != 0 or f"tcp:{port}" not in listing.stdout:
+                raise RuntimeError(f"ADB forwarding tcp:{port} could not be verified")
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            message = "adb was not found; install Android Platform Tools and add adb to PATH" if isinstance(exc, FileNotFoundError) else "adb command timed out"
+        except RuntimeError as exc:
+            message = str(exc)
+        else:
+            with self._lock:
+                self._last_usb_reconnect_at = time.time()
+                self._last_usb_reconnect_error = None
+                if not self._connection_active:
+                    self._last_connection_stage = "waiting_for_headset"
+            return {"ok": True, "message": f"ADB reverse is ready; APK should connect ws://127.0.0.1:{port}", "gateway": self.status()}
+        with self._lock:
+            self._last_usb_reconnect_error = message
+            self._last_connection_stage = "usb_reconnect_failed"
+            self._last_connection_error = message
+        return {"ok": False, "message": message, "gateway": self.status()}
 
     def _send_control_result(self, connection: Any, kind: str, sequence: int, result: Any, error: str | None) -> None:
         data = dict(result) if isinstance(result, dict) else {}
@@ -831,10 +966,13 @@ class PicoGateway:
 
     def _handle_connection(self, connection: Any) -> None:
         usb_session: str | None = None
+        connection_generation: int | None = None
+        dispatcher: PicoIngressDispatcher | None = None
         last_sequence = 0
         client = getattr(connection, "remote_address", None)
         client_label = str(client) if client is not None else "unknown"
         with self._lock:
+            self._open_connections[id(connection)] = connection
             self._connection_attempts += 1
             self._last_connection_attempt_at = time.time()
             self._last_client = client_label
@@ -851,7 +989,10 @@ class PicoGateway:
                     raise PermissionError("PICO USB receiver is not active; start it from the console first")
                 if self._connection_active:
                     raise PermissionError("another PICO USB connection is already active")
+                self._connection_generation += 1
+                connection_generation = self._connection_generation
                 self._connection_active = True
+                self._active_connection = connection
                 usb_session = str(session["session_id"])
             self.trace_logger.append({"record_type": "event", "event": "usb_connection_accepted",
                                       "monotonic_ns": time.monotonic_ns(), "session_id": usb_session})
@@ -863,7 +1004,12 @@ class PicoGateway:
                 self._observe_dispatch,
                 lambda kind, sequence, result, error: self._send_control_result(connection, kind, sequence, result, error),
             )
-            self._dispatch = dispatcher
+            with self._lock:
+                # invalidate()/start_session() may have closed this socket
+                # while the adapter callback was being created.
+                if self._active_connection is not connection or self._connection_generation != connection_generation:
+                    raise ConnectionAbortedError("PICO connection was superseded")
+                self._dispatch = dispatcher
             self._send(connection, {"ok": True, "type": "connected", "session_id": usb_session,
                                     "server_instance_id": self.server_instance_id,
                                     "capabilities": ["input_frame", "disconnect"],
@@ -952,27 +1098,30 @@ class PicoGateway:
                                           "input_frame_overwrites": result.get("overwritten_input_frames", 0) if isinstance(result, dict) else 0})
         except TimeoutError:
             with self._lock:
-                self._last_connection_stage = "input_timeout"
-                self._last_connection_error = "PICO connection timed out waiting for data"
+                if connection_generation is None or self._active_connection is connection:
+                    self._last_connection_stage = "input_timeout"
+                    self._last_connection_error = "PICO connection timed out waiting for data"
         except Exception as exc:
             with self._lock:
-                self._last_connection_stage = "rejected" if not usb_session else "runtime_error"
-                self._last_connection_error = f"{type(exc).__name__}: {exc}"
+                if connection_generation is None or self._active_connection is connection:
+                    self._last_connection_stage = "rejected" if not usb_session else "runtime_error"
+                    self._last_connection_error = f"{type(exc).__name__}: {exc}"
             try:
                 self._send(connection, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
             except Exception:
                 pass
         finally:
-            owns_current_session = False
+            owns_current_connection = False
             with self._lock:
-                if usb_session and self._session and str(self._session.get("session_id")) == usb_session:
-                    owns_current_session = True
+                self._open_connections.pop(id(connection), None)
+                if self._active_connection is connection and self._connection_generation == connection_generation:
+                    owns_current_connection = True
+                    self._active_connection = None
+                    self._dispatch = None
                     self._connection_active = False
-            if owns_current_session:
-                dispatcher = self._dispatch
-                self._dispatch = None
-                if dispatcher is not None:
-                    dispatcher.close()
+            if dispatcher is not None:
+                dispatcher.close()
+            if owns_current_connection:
                 try:
                     self.runtime.require_adapters().pico_connection_lost(
                         self._last_connection_error or "PICO input connection closed")
@@ -1088,6 +1237,13 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     raise RuntimeError("PICO USB WebSocket receiver is unavailable")
                 return self._json_ok(self.pico_gateway.start_session(
                     str(body.get("session_id", "")), str(body.get("client_id", "anonymous"))))
+            if self.path == "/api/adapters/pico/reconnect-usb":
+                if self.pico_gateway is None:
+                    raise RuntimeError("PICO USB WebSocket receiver is unavailable")
+                result = self.pico_gateway._state_result()
+                result["usb_reconnect"] = self.pico_gateway.reconnect_usb(source="manual")
+                result["gateway"] = self.pico_gateway.status()
+                return self._json_ok(result)
             if self.path == "/api/adapters/pico/sensitivity":
                 return self._json_ok(self.runtime.require_adapters().pico_update_sensitivity(body))
             if self.path == "/api/adapters/pico/mapping":

@@ -155,6 +155,7 @@
     panel.id = "pico-panel"; panel.className = "pico-panel hidden";
     panel.innerHTML = `<div class="pico-head"><span class="pi05-index">P</span><div><strong>PICO 4 Ultra · USB</strong><small>通过 USB/ADB 端口转发连接</small></div><span id="pico-state" class="badge neutral">IDLE</span></div><section class="pico-camera-resource"><strong>公共相机观测</strong><div class="pi05-cameras"><label>外部 RGB<select id="pico-external-index"></select></label><label>腕部 RGB<select id="pico-wrist-index"></select></label></div><div class="pi05-views"><div class="pi05-view"><span>外部视角</span><img id="pico-external-frame"><b>等待画面</b></div><div class="pi05-view"><span>腕部视角</span><img id="pico-wrist-frame"><b>等待画面</b></div></div></section><div class="pico-usb"><div><strong>USB/ADB 接收通道</strong><p id="pico-url">ws://127.0.0.1:8768</p><small>先运行 scripts\\pico_usb_connect.ps1，再让 APK 直接连接此地址。</small><small id="pico-diagnostic">ADB 诊断：等待启动</small></div></div><div class="pico-status"><span>连接 <b id="pico-connected">未连接</b></span><span>追踪 <b id="pico-tracking">--</b></span><span>控制起点 <b id="pico-anchor">--</b></span><span>夹爪 <b id="pico-gripper">--</b></span></div><div class="pico-received-pose"><strong>接收到的 PICO 信号</strong><div class="pico-received-grid"><span>Grip<b id="pico-clutch-signal">--</b></span><span>输入序号<b id="pico-input-sequence">--</b></span><span>Pose 接收<b id="pico-pose-rate">--</b></span><span>位姿年龄<b id="pico-pose-age">--</b></span><span>原始 Trigger<b id="pico-raw-trigger">--</b></span><span>网关覆盖<b id="pico-frame-overwrites">--</b></span></div><code id="pico-pose-position">XYZ --</code><code id="pico-pose-quaternion">Q --</code><code id="pico-pose-mapped-quaternion">映射后 Q --</code></div><div class="pico-target-pose"><strong>最后传输到机械臂的目标 TCP</strong><div class="pico-received-grid"><span>发送状态<b id="pico-target-status">--</b></span><span>OSC序号<b id="pico-target-sequence">--</b></span><span>目标年龄<b id="pico-target-age">--</b></span><span>目标来源<b id="pico-target-mode">--</b></span></div><code id="pico-target-position">XYZ --</code><code id="pico-target-quaternion">Q --</code><code id="pico-preview-quaternion">实时预览 Q --</code></div><div class="pico-controls"><strong>怎么控制</strong><p>按住右手 Grip：移动机械臂；右手 Trigger：开合夹爪；左手 Menu：立即停止。松开 Grip、追踪丢失或断开连接时自动 HOLD。</p><div class="pico-sensitivity"><strong>运动增益</strong><label>平移 <output id="pico-translation-gain-value">100%</output><input id="pico-translation-gain" type="range" min="0.25" max="1" step="0.05" value="1"></label><label>旋转 <output id="pico-rotation-gain-value">100%</output><input id="pico-rotation-gain" type="range" min="0.25" max="1" step="0.05" value="1"></label><small id="pico-sensitivity-status">松开 Grip 后可调整；设置将保存为默认值。</small></div><div class="pico-frame-mapping"><strong>空间坐标/旋转校正矩阵</strong><div class="pico-axis-map-grid"><div><strong>位置映射</strong><label>X ← <select id="pico-position-axis-x"></select></label><label>Y ← <select id="pico-position-axis-y"></select></label><label>Z ← <select id="pico-position-axis-z"></select></label></div><div><strong>旋转映射</strong><label>X ← <select id="pico-orientation-axis-x"></select></label><label>Y ← <select id="pico-orientation-axis-y"></select></label><label>Z ← <select id="pico-orientation-axis-z"></select></label></div></div><button id="pico-mapping-default" class="button quiet" type="button">恢复推荐矩阵</button><button id="pico-mapping-apply" class="button" type="button">应用并保存矩阵</button><small id="pico-mapping-status">等待 PICO 状态</small></div><div class="pico-signal-diagnostics"><strong>实时信号链路</strong><div class="pico-received-grid"><span>最后消息<b id="pico-last-message">--</b></span><span>信号年龄<b id="pico-signal-age">--</b></span><span>执行队列<b id="pico-dispatch-queue">--</b></span><span>丢弃位姿<b id="pico-dropped-pose">--</b></span></div><small id="pico-signal-status">等待 PICO 信号</small></div></div><div class="pico-actions"><button id="pico-start" class="button primary" type="button">启动 PICO USB 接收器</button><button id="pico-stop" class="button quiet" type="button">停止 PICO 接收器</button><button id="pico-rebase" class="button quiet" type="button">重置初始位置</button></div><p id="pico-result" class="result">PICO APK 通过 USB/ADB 连接；首条消息直接发送 input_frame。</p>`;
     document.querySelector(".osc-panel")?.append(panel);
+    panel.querySelector("#pico-stop")?.insertAdjacentHTML("beforebegin", `<button id="pico-reconnect" class="button" type="button">重新连接 PICO USB</button>`);
     panel.querySelector(".pico-camera-resource .pi05-cameras")?.insertAdjacentHTML("afterend", `<div class="camera-power"><span id="camera-power-pico">相机状态：检查中</span><button id="camera-open-pico" class="button" type="button">打开相机</button><button id="camera-close-pico" class="button quiet" type="button">关闭相机</button></div>`);
     panel.querySelector(".pico-signal-diagnostics")?.insertAdjacentHTML("afterend", `<details class="pico-advanced-diagnostics"><summary>高级诊断 <small>传输时序、姿态映射与校正</small></summary><div class="pico-advanced-grid"><section><strong>传输链路</strong><div class="pico-received-grid"><span>网关序号<b id="pico-gateway-sequence">--</b></span><span>Adapter 序号<b id="pico-adapter-sequence">--</b></span><span>收包间隔<b id="pico-receive-gap">--</b></span><span>ACK 耗时<b id="pico-ack-time">--</b></span><span>执行耗时<b id="pico-dispatch-time">--</b></span><span>序号跳跃<b id="pico-sequence-gaps">--</b></span></div><small id="pico-protocol-note">输入帧合并位姿、Grip 和 Trigger；只保留最新位姿。</small></section><section><strong>姿态映射</strong><code id="pico-pose-rotation">原始旋转角 XYZ --</code><code id="pico-pose-mapped-rotation">映射后旋转角 XYZ --</code><code id="pico-target-rotation">目标旋转角 XYZ --</code><code id="pico-preview-rotation">预览旋转角 XYZ --</code><code id="pico-orientation-calibration">姿态校正：--</code><code id="pico-orientation-correction">R_mapping --</code><small id="pico-preview-command-state">发送许可：--</small></section></div></details>`);
     const advanced = panel.querySelector(".pico-advanced-diagnostics .pico-advanced-grid");
@@ -343,20 +344,22 @@
     $("pico-result").textContent = !gatewayReady
       ? `PICO 接收器未就绪：${gatewayError}。请检查控制台进程和端口 8768。`
       : pico.last_error || gateway.error || (gateway.connection_active ? "PICO USB 已连接；按住右手 Grip 开始定义 Anchor。" : "运行 pico_usb_connect.ps1 后，让 APK 连接 127.0.0.1:8768。 ");
+    const reconnectState = gateway.last_usb_reconnect_error ? `ADB恢复失败：${gateway.last_usb_reconnect_error}` : gateway.last_usb_reconnect_at ? `ADB转发已恢复（${gateway.last_usb_reconnect_source || "自动"}）` : "等待 ADB 转发";
     const diagnostic = gatewayReady
-      ? `连接尝试 ${gateway.connection_attempts || 0} 次 · ${gateway.connection_stage || "idle"}${gateway.last_client && gateway.last_client !== "unknown" ? ` · ${gateway.last_client}` : ""}${gateway.last_connection_error ? ` · ${gateway.last_connection_error}` : ""}`
+      ? `连接尝试 ${gateway.connection_attempts || 0} 次 · ${gateway.connection_stage || "idle"}${gateway.last_client && gateway.last_client !== "unknown" ? ` · ${gateway.last_client}` : ""}${gateway.last_connection_error ? ` · ${gateway.last_connection_error}` : ""} · ${reconnectState}`
       : `USB 诊断：${gatewayError}`;
     const diagnosticNode = $("pico-result");
     if (diagnosticNode && gatewayReady) diagnosticNode.title = diagnostic;
     const diagnosticText = $("pico-diagnostic");
     if (diagnosticText) diagnosticText.textContent = diagnostic;
     renderPicoDetails(pico, gateway);
-    $("pico-start").disabled = gatewayConnected || session().state === "ACTIVE" && selectedAdapter() !== "pico";
+    $("pico-start").disabled = Boolean(gateway.session_id) || session().state === "ACTIVE" && selectedAdapter() !== "pico";
     $("pico-stop").disabled = !gateway.session_id && pico.state === "IDLE";
+    if ($("pico-reconnect")) $("pico-reconnect").disabled = !gateway.session_id || gatewayConnected;
     $("pico-start").textContent = "启动 PICO 接收器";
     $("pico-stop").textContent = "停止 PICO 接收器";
     if (!gatewayReady && !gateway.error && gateway.enabled !== false) $("pico-result").textContent = "PICO 接收器正在启动，等待 8768 端口监听。";
-    if (gatewayReady && !pico.last_error && !gateway.error) $("pico-result").textContent = gateway.connection_active ? "APK 已通过 USB 连接。按住右手 Grip 后再移动手柄，即可控制机械臂。" : "请运行 pico_usb_connect.ps1，并让 APK 连接 127.0.0.1:8768。";
+    if (gatewayReady && !pico.last_error && !gateway.error) $("pico-result").textContent = gateway.connection_active ? "APK 已通过 USB 连接。按住右手 Grip 后再移动手柄，即可控制机械臂。" : gateway.last_usb_reconnect_error ? `USB 热插拔恢复失败：${gateway.last_usb_reconnect_error}` : "等待 PICO USB 连接；服务会自动恢复 ADB 转发，也可点击“重新连接 PICO USB”。";
   }
 
   const PICO_AXIS_OPTIONS = ["x", "-x", "y", "-y", "z", "-z"];
@@ -535,6 +538,17 @@
   async function stopPico() {
     try { state.pico = await api("/api/adapters/pico/disconnect", "POST", { reason: "Console disconnected PICO" }); state.osc = (await api("/api/osc/session/stop", "POST", { reason: "PICO Adapter disconnected" })).state; render(); }
     catch (error) { phase(`PICO 断开失败：${error.message}`, true); }
+  }
+
+  async function reconnectPicoUsb() {
+    $("pico-reconnect").disabled = true; phase("正在恢复 PICO USB/ADB 转发…");
+    try {
+      state.pico = await api("/api/adapters/pico/reconnect-usb", "POST", {}, 10000);
+      const result = state.pico.usb_reconnect || {};
+      phase(result.ok ? "PICO USB 转发已恢复，等待头显自动重连。" : `PICO USB 恢复失败：${result.message || "未知错误"}`, !result.ok);
+      render();
+    } catch (error) { phase(`PICO USB 恢复失败：${error.message}`, true); }
+    finally { renderPico(); }
   }
 
   function renderPi05() {
@@ -1439,6 +1453,7 @@
   $("pi05-start")?.addEventListener("click", startPi05);
   $("pi05-stop")?.addEventListener("click", stopPi05);
   $("pico-start")?.addEventListener("click", startPico);
+  $("pico-reconnect")?.addEventListener("click", reconnectPicoUsb);
   $("pico-stop")?.addEventListener("click", stopPico);
   $("pico-rebase")?.addEventListener("click", resetPicoAnchor);
   $("pico-translation-gain")?.addEventListener("input", () => renderPicoSensitivity(state.pico || {}));
