@@ -16,6 +16,7 @@ __pycache__/
 .DS_Store
 Thumbs.db
 *.log
+Log/
 *.pid
 .coverage
 htmlcov/

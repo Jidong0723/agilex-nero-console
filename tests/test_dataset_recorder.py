@@ -1,73 +1,117 @@
-from __future__ import annotations
-import json, tempfile, time, unittest
+import json
+import tempfile
+import time
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
-import cv2
-import numpy as np
+
 from supervisor.dataset_recorder import DatasetRecorder
+
+
+class CameraStub:
+    def __init__(self, ready=True, frozen=False):
+        self.ready = ready
+        self.frozen = frozen
+        self.last = time.monotonic_ns()
+
+    def snapshot(self):
+        status = {"available": self.ready, "frame_available": self.ready, "last_frame_age_ms": 0 if self.ready else None}
+        return {"ready": self.ready, "config": {"external": {"index": 1, "width": 640, "height": 480}, "wrist": {"index": 2, "width": 640, "height": 480}}, "sources": {"external": status, "wrist": status}}
+
+    def frame_timestamp(self, source):
+        if not self.ready:
+            return None
+        if not self.frozen:
+            self.last = max(self.last + 1, time.monotonic_ns())
+        return self.last
+
+    def frame_jpeg(self, source, timestamp):
+        return b"jpeg-" + source.encode()
 
 
 class DatasetRecorderTests(unittest.TestCase):
     def setUp(self):
-        self.frames = {"external": np.full((480, 640, 3), 30, np.uint8), "wrist": np.full((480, 640, 3), 80, np.uint8)}
-        self.command = None
-        def camera_frame(source, target):
-            return (time.monotonic_ns(), self.frames[source].copy()) if source in self.frames else None
-        self.cameras = SimpleNamespace(dataset_frame=camera_frame, snapshot=lambda: {"ready": True, "config": {"model_width": 224, "model_height": 224, "external": {"index": 2, "width": 640, "height": 480}, "wrist": {"index": 3, "width": 640, "height": 480}}, "sources": {key: {"available": True, "frame_available": True, "preview_size": [224, 224], "dataset_size": [640, 480]} for key in ("external", "wrist")}})
-        def osc_state():
-            now = time.monotonic_ns()
-            command = {"final_joint_target_rad": None, "sent_monotonic_ns": None} if self.command is None else {"final_joint_target_rad": self.command, "sent_monotonic_ns": now}
-            return {"execution": {}, "transport": {"hardware_feedback": {"joint_angles_rad": [1] * 7, "received_monotonic_ns": now}}, "command": command, "diagnostics": {}, "gripper": {"width_m": .05}}
-        self.osc, self.pico = SimpleNamespace(state=osc_state), SimpleNamespace(snapshot=lambda: {"connected": False})
+        self.cameras = CameraStub()
+        self.osc = SimpleNamespace(state=lambda: {
+            "transport": {"hardware_feedback": {"joint_angles_rad": [1, 2, 3, 4, 5, 6, 7], "received_monotonic_ns": time.monotonic_ns(), "gripper_width_m": 0.05}},
+            "command": {"final_joint_target_rad": [1, 2, 3, 4, 5, 6, 7], "sent_monotonic_ns": time.monotonic_ns(), "gripper_target_width_m": 0.04},
+        })
 
-    def _record(self, source="pico", duration=.24):
-        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
-        recorder = DatasetRecorder(self.osc, self.cameras, self.pico, Path(self.temp.name), sample_hz=20)
-        recorder.start({"task": "test", "control_source": source}); time.sleep(duration)
-        return recorder.stop()
+    def test_completed_episode_writes_separate_rgb_streams(self):
+        with tempfile.TemporaryDirectory() as folder:
+            recorder = DatasetRecorder(self.osc, self.cameras, None, Path(folder))
+            state = recorder.start({"task": "test_task", "description": "test", "control_source": "pico"})
+            self.assertTrue(state["recording"])
+            self.assertEqual(state["operator_device"], "pico_4_ultra")
+            time.sleep(0.2)
+            result = recorder.stop("completed")
+            episode = Path(result["episode_dir"])
+            metadata = json.loads((episode / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["status"], "completed")
+            self.assertTrue((episode / "camera_frames.jsonl").read_text(encoding="utf-8").splitlines())
+            self.assertTrue((episode / "robot_states.jsonl").read_text(encoding="utf-8").splitlines())
+            self.assertTrue((episode / "images" / "front" / "000000.jpg").exists())
+            self.assertTrue((episode / "images" / "wrist" / "000000.jpg").exists())
+            self.assertEqual(metadata["camera_rate_hz"], 20.0)
+            self.assertEqual(metadata["robot_state_rate_hz"], 15.0)
+            self.assertEqual(metadata["data_contents"]["images"], "RGB JPEG only")
 
-    @staticmethod
-    def _rows(result):
-        return [json.loads(line) for line in (Path(result["episode_dir"]) / "frames.jsonl").read_text(encoding="utf-8").splitlines()]
+    def test_failed_episode_is_deleted_and_path_cannot_escape_root(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            recorder = DatasetRecorder(self.osc, self.cameras, None, root)
+            recorder.start({"task": "test_task", "control_source": "pico"})
+            time.sleep(0.08)
+            episode = Path(recorder.state()["episode_dir"])
+            recorder.stop("failed")
+            self.assertFalse(episode.exists())
+            with self.assertRaises(RuntimeError):
+                recorder._assert_episode_path(root.parent / "outside")
 
-    def test_native_size_and_unconnected_pico_metadata(self):
-        result = self._record(); rows = self._rows(result); episode = Path(result["episode_dir"])
-        self.assertGreater(result["frame_count"], 0)
-        self.assertEqual((result["operator_device"], result["operator_connection"]), (None, "not_connected"))
-        self.assertEqual(cv2.imread(str(episode / rows[0]["observation"]["images"]["front"])).shape[:2], (480, 640))
-        metadata = json.loads((episode / "metadata.json").read_text(encoding="utf-8"))
-        self.assertEqual(metadata["requested_control_source"], "pico")
-        self.assertEqual(metadata["camera_sources"]["external"]["preview_width"], 224)
-        self.assertEqual(metadata["camera_sources"]["external"]["saved_width"], 640)
+    def test_camera_not_ready_is_recorded_and_does_not_stop_episode(self):
+        with tempfile.TemporaryDirectory() as folder:
+            recorder = DatasetRecorder(self.osc, CameraStub(ready=False), None, Path(folder))
+            recorder.start({"task": "camera_missing", "control_source": "web"})
+            time.sleep(0.08)
+            live = recorder.state()
+            self.assertTrue(live["recording"])
+            result = recorder.stop("completed")
+            episode = Path(result["episode_dir"])
+            self.assertTrue((episode / "collection_events.jsonl").read_text(encoding="utf-8").strip())
+            self.assertIn("camera_unavailable_at_start", (episode / "metadata.json").read_text(encoding="utf-8"))
 
-    def test_idle_and_active_control_context(self):
-        idle = self._record(); self.assertEqual(self._rows(idle)[0]["control_context"], None)
-        self.setUp(); self.command = [1] * 7
-        active = self._record(); self.assertEqual(self._rows(active)[0]["control_context"]["joint_target_rad"], self.command)
+    def test_repeated_camera_timestamp_is_marked_and_episode_continues(self):
+        with tempfile.TemporaryDirectory() as folder:
+            recorder = DatasetRecorder(self.osc, CameraStub(frozen=True), None, Path(folder))
+            recorder.start({"task": "duplicate", "control_source": "pico"})
+            time.sleep(0.35)
+            result = recorder.stop("completed")
+            self.assertEqual(result["status"], "completed")
+            self.assertGreater(result["camera_dropped_frames"], 0)
+            self.assertGreater(result["event_count"], 0)
 
-    def test_duplicate_frame_is_not_written_twice(self):
-        stamp = time.monotonic_ns(); self.cameras.dataset_frame = lambda source, target: (stamp, self.frames[source].copy())
-        result = self._record()
-        self.assertEqual(result["frame_count"], 1)
-        self.assertGreater(result["camera_sources"]["external"]["duplicate_or_stale_frames"], 0)
+    def test_missing_action_does_not_stop_camera_stream(self):
+        with tempfile.TemporaryDirectory() as folder:
+            osc = SimpleNamespace(state=lambda: {
+                "transport": {"hardware_feedback": {
+                    "joint_angles_rad": [1, 2, 3, 4, 5, 6, 7],
+                    "received_monotonic_ns": time.monotonic_ns(),
+                }},
+                "command": {},
+            })
+            recorder = DatasetRecorder(osc, self.cameras, None, Path(folder))
+            recorder.start({"task": "camera_only", "control_source": "web"})
+            time.sleep(0.22)
+            live = recorder.state()
+            self.assertTrue(live["recording"])
+            self.assertTrue(live["waiting_for_action"])
+            result = recorder.stop("completed")
+            self.assertGreaterEqual(result["camera_frame_count"], 3)
+            self.assertGreater(result["robot_state_count"], 0)
+            self.assertEqual(result["valid_robot_state_count"], 0)
+            self.assertGreater(result["state_invalid_events"], 0)
+            self.assertEqual(result["status"], "completed")
 
-    def test_partial_camera_and_invalid_feedback(self):
-        self.frames.pop("wrist"); result = self._record(); row = self._rows(result)[0]
-        self.assertIn("front", row["observation"]["images"]); self.assertIn("wrist", row["observation"]["missing_image_sources"])
-        self.setUp(); self.osc = SimpleNamespace(state=lambda: {"transport": {"hardware_feedback": {"joint_angles_rad": [1] * 7, "received_monotonic_ns": []}}})
-        result = self._record(); self.assertEqual(result["frame_count"], 0); self.assertIn("feedback_timestamp_invalid", result["rejection_reasons"])
 
-    def test_web_episode_and_deletion(self):
-        result = self._record("web"); self.assertEqual(result["camera_sources"], {}); self.assertEqual(self._rows(result)[0]["observation"]["images"], {})
-        self.setUp(); folder = tempfile.TemporaryDirectory(); self.addCleanup(folder.cleanup)
-        recorder = DatasetRecorder(self.osc, self.cameras, self.pico, Path(folder.name)); recorder.start({"task": "test", "control_source": "pico"}); path = Path(recorder.state()["episode_dir"]); recorder.stop("failed"); self.assertFalse(path.exists())
-
-    def test_full_encoding_queue_is_reported_without_blocking(self):
-        folder = tempfile.TemporaryDirectory(); self.addCleanup(folder.cleanup)
-        recorder = DatasetRecorder(self.osc, self.cameras, self.pico, Path(folder.name), sample_hz=20)
-        recorder._MAX_PENDING = 0
-        recorder.start({"task": "test", "control_source": "pico"}); time.sleep(.12)
-        result = recorder.stop()
-        self.assertEqual(result["frame_count"], 0)
-        self.assertGreater(result["backpressure_drops"], 0)
-        self.assertIn("jpeg_queue_full", result["rejection_reasons"])
+if __name__ == "__main__":
+    unittest.main()
