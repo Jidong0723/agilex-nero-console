@@ -197,6 +197,7 @@ class PicoInputAdapter:
         self._orientation_correction: list[float] = [0.0, 0.0, 0.0, 1.0]
         self._orientation_calibration_status = "DIRECT_MAPPING"
         self._orientation_calibrated_at: float | None = None
+        self._anchor_generation = 0
         self._pending_anchor: dict[str, Any] | None = None
         self._sequence = 0
         self._connection_stop = threading.Event()
@@ -236,7 +237,9 @@ class PicoInputAdapter:
                 "last_target_pose": None, "last_target_status": "NONE",
                 "target_rotation_degrees": [0.0, 0.0, 0.0],
                 "last_target_osc_sequence": None, "last_target_sent_at": None,
-                "target_pose_mode": "ABSOLUTE_DIRECT",
+                # Targets are expressed in the robot base frame, but are
+                # calculated from deltas relative to the Grip anchor.
+                "target_pose_mode": "RELATIVE_ANCHORED",
                 "orientation_tracking_mode": "RELATIVE_ANCHORED",
                 "orientation_command_enabled": False,
                 "orientation_calibration_status": "DIRECT_MAPPING",
@@ -244,6 +247,7 @@ class PicoInputAdapter:
                 "orientation_correction_matrix": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                 "anchor_tcp_source": None,
                 "orientation_calibrated_at": None,
+                "anchor_generation": 0,
                 "input_pose_age_ms": None, "last_pose_timing_ms": None,
                 "pose_rx_hz": None, "pose_received_count": 0,
                 "updated_at": time.time()}
@@ -358,6 +362,7 @@ class PicoInputAdapter:
             self._orientation_calibration_status = "DIRECT_MAPPING"
             self._orientation_calibrated_at = None
             self._orientation_calibrated_at = None
+            self._anchor_generation = 0
             self._sequence = int((osc.get("command") or {}).get("sequence") or 0)
             self.state = self._empty_state()
             self.state.update({"state": "WAITING_FOR_USB", "session_id": session_id, "updated_at": time.time()})
@@ -607,7 +612,8 @@ class PicoInputAdapter:
                 result.update({"event": "grip_press_pending", "input_frame_sequence": sequence})
                 return result
             result = self.pose({**frame, "clutch": True})
-            result.update({"event": "grip_press", "input_frame_sequence": sequence})
+            result.update({"event": "grip_press", "input_frame_sequence": sequence,
+                           "anchor_generation": anchor["anchor_generation"]})
         elif grip:
             result = self.pose({**frame, "clutch": True})
         else:
@@ -652,6 +658,7 @@ class PicoInputAdapter:
                     "message": "等待机械臂位姿，无法初始化位置锚点"}
         with self.lock:
             self._pending_anchor = None
+            self._anchor_generation += 1
             self._anchor_controller = {"position_m": position, "orientation_xyzw": orientation}
             self._anchor_tcp = {"position_m": _vector(tcp.get("position_m"), 3, "TCP position"), "orientation_xyzw": _normalise(_vector(tcp.get("orientation_xyzw"), 4, "TCP orientation"))}
             mapped_anchor_position = _map(self._position_axis_map, position, self._translation_gain)
@@ -672,13 +679,16 @@ class PicoInputAdapter:
                                "orientation_correction_xyzw": list(self._orientation_correction),
                                "orientation_correction_matrix": _quaternion_to_matrix(self._orientation_correction),
                                "anchor_tcp_source": tcp_source,
-                                "orientation_calibrated_at": self._orientation_calibrated_at})
+                               "orientation_calibrated_at": self._orientation_calibrated_at,
+                               "anchor_generation": self._anchor_generation})
             if self.trace_logger:
                 self.trace_logger.append({"record_type": "event", "event": "anchor_begin",
-                                          "monotonic_ns": time.monotonic_ns(), "pico_sequence": int(pose.get("_pico_sequence") or 0)})
+                                          "monotonic_ns": time.monotonic_ns(), "pico_sequence": int(pose.get("_pico_sequence") or 0),
+                                          "anchor_generation": self._anchor_generation})
             return {"ok": True, "type": "anchor_begin", "anchor_active": True,
                     "orientation_tracking_mode": "RELATIVE_ANCHORED",
                     "anchor_tcp_source": tcp_source,
+                    "anchor_generation": self._anchor_generation,
                     "orientation_correction_xyzw": list(self._orientation_correction),
                     "orientation_correction_matrix": _quaternion_to_matrix(self._orientation_correction),
                     "calibrated_at": self._orientation_calibrated_at}

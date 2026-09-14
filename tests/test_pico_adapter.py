@@ -122,7 +122,7 @@ def test_pico_snapshot_exposes_transmitted_base_frame_target_pose():
     assert snapshot["last_target_status"] == "ACCEPTED"
     assert snapshot["last_target_pose"] == target
     assert snapshot["last_target_age_ms"] is not None
-    assert snapshot["target_pose_mode"] == "ABSOLUTE_DIRECT"
+    assert snapshot["target_pose_mode"] == "RELATIVE_ANCHORED"
 
 
 def test_pico_frame_mapping_can_be_changed_only_when_not_anchored():
@@ -370,13 +370,17 @@ def test_input_frame_edges_anchor_release_and_trigger_are_server_side():
     assert first["anchor_active"] is False
     pressed = value.input_frame({**base, "grip": True, "trigger_value": 0.5, "_pico_sequence": 2})
     assert pressed["event"] == "grip_press"
+    assert pressed["anchor_generation"] == 1
     assert value.snapshot()["anchor_active"] is True
+    assert value.snapshot()["anchor_generation"] == 1
     assert any(item["type"] == "gripper" for item in broker.commands)
     released = value.input_frame({**base, "grip": False, "trigger_value": 0.5, "_pico_sequence": 3})
     assert released["event"] == "grip_release"
     assert value.snapshot()["clutch_signal"] is False
     assert value.snapshot()["anchor_active"] is False
     assert broker.commands[-1]["type"] == "hold"
+    pressed_again = value.input_frame({**base, "grip": True, "trigger_value": 0.5, "_pico_sequence": 4})
+    assert pressed_again["anchor_generation"] == 2
 
 
 def test_tracking_loss_requests_hold_once_until_valid_tracking_returns():
