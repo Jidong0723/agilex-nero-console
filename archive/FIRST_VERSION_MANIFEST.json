@@ -1,0 +1,7 @@
+{
+  "archive_name": "agilex-nero-console-master.zip",
+  "schema": "nero.console.first-version-archive.v1",
+  "sha256": "641F72BFCE1E523771E68C13A3E786CE5A52424125DE755C15E11E9E4A1CECB0",
+  "archive_root": "agilex-nero-console-master/",
+  "restore_policy": "restore to a new empty directory; never overwrite the active console"
+}

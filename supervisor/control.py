@@ -154,6 +154,10 @@ class OperationalSpaceController:
 
     def __init__(self, config: Path | str | dict[str, Any], robot: NeroRobot | None = None) -> None:
         backend = robot or NeroRobot(config)
+        # Dataset reads the SDK receive cache directly. The aggregate status
+        # monitor intentionally pauses during hardware tracking, so its
+        # gripper snapshot can be absent or frozen for an entire episode.
+        self._dataset_read_gripper = backend.read_gripper
         config_data = backend.config
         safety_config = config_data.get("safety", {})
         self.allow_electronic_emergency_stop = bool(
@@ -1157,11 +1161,20 @@ class OperationalSpaceController:
             "execution": {
                 "mode": execution_mode,
                 "sample_id": execution_sample.get("sample_id"),
+                # Stable cross-stream identifiers used by the demonstration
+                # recorder to join feedback, Pink, Ruckig and the dispatched
+                # CPV sample without relying on wall-clock proximity alone.
+                "control_sample_id": execution_sample.get("sample_id"),
+                "feedback_revision": execution_sample.get("feedback_revision"),
+                "target_generation": execution_sample.get("target_generation", servo.get("target_generation")),
+                "motion_epoch": raw_diagnostics.get("motion_epoch", (session or {}).get("motion_epoch")),
                 "sample_monotonic_ns": execution_sample.get("sample_monotonic_ns"),
                 "commanded_joint_state_rad": commanded_joints,
                 "observed_joint_state_rad": observed_joints,
                 "measured_joint_state_rad": measured_joints,
                 "estimated_joint_state_rad": estimated_joints,
+                "joint_velocity_rad_s": execution_sample.get("joint_velocity_rad_s"),
+                "measured_joint_velocity_rad_s": execution_sample.get("measured_joint_velocity_rad_s"),
                 "joint_target_error": joint_error,
                 "observed_source": "simulated_cpv_feedback" if shadow else "measured_can_feedback" if active_session else "none",
                 "output_count": raw_diagnostics.get("output_count", 0),
@@ -1194,6 +1207,67 @@ class OperationalSpaceController:
             "authority": self.authority_status(snapshot.get("control")),
             "active_action": snapshot.get("active_action"),
         }
+
+    def osc_sensor_sample(self, target_monotonic_ns: int, wait_s: float = 0.0) -> dict[str, Any] | None:
+        """Read-only CAN feedback nearest a camera timestamp."""
+        sample = self._osc.rx_sample_nearest(int(target_monotonic_ns), float(wait_s))
+        if not sample:
+            return None
+        return self._decorate_osc_sensor_samples([sample])[0]
+
+    def osc_sensor_samples_after(self, revision: int, wait_s: float = 0.0,
+                                 max_items: int = 128) -> list[dict[str, Any]]:
+        """Drain the OSC feedback producer history without polling aliasing."""
+        samples = self._osc.rx_samples_after(int(revision), float(wait_s), int(max_items))
+        return self._decorate_osc_sensor_samples(samples)
+
+    def _decorate_osc_sensor_samples(self, samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not samples:
+            return []
+        with self._status_lock:
+            cached = self._status_cache
+        snapshot = dict(cached[1]) if cached is not None else {}
+        servo = dict(self._osc.status())
+        execution = dict(servo.get("execution_sample") or {})
+        diagnostics = dict(servo.get("diagnostics") or {})
+        last_result = dict(servo.get("last_result") or {})
+        gripper_target_width = (snapshot.get("active_action") or {}).get("width_m")
+        if gripper_target_width is None:
+            gripper_target_width = (snapshot.get("gripper") or {}).get("target_width_m")
+        common = {
+            "gripper_width_m": (snapshot.get("gripper") or {}).get("width_m"),
+            "control_sample_id": execution.get("sample_id"),
+            "target_generation": execution.get("target_generation", servo.get("target_generation")),
+            "motion_epoch": diagnostics.get("motion_epoch", (servo.get("session") or {}).get("motion_epoch")),
+            "pink": last_result.get("solver"),
+            "ruckig": diagnostics.get("ruckig"),
+            "applied_joint_velocity_rad_s": (servo.get("last_dispatched") or {}).get("velocity_rad_s"),
+            "output_status": (servo.get("last_dispatched") or {}).get("status"),
+            "measured_tcp_pose": execution.get("measured_tcp_pose"),
+            "target_tcp_pose": (servo.get("command") or {}).get("target_pose"),
+            "gripper_target_width_m": gripper_target_width,
+        }
+        try:
+            gripper_feedback = self._dataset_read_gripper()
+            common["gripper_width_m"] = (gripper_feedback.get("width_m") if isinstance(gripper_feedback, dict)
+                                         else gripper_feedback.width_m)
+            common["gripper_observed_monotonic_ns"] = time.perf_counter_ns()
+            common["gripper_feedback_source"] = "sdk_receive_cache"
+        except Exception as exc:
+            common["gripper_width_m"] = None
+            common["gripper_feedback_error"] = f"{type(exc).__name__}: {exc}"
+        return [{
+            "feedback_revision": sample.get("revision"),
+            "joint_position_rad": sample.get("joints"),
+            "joint_velocity_rad_s": sample.get("velocities"),
+            "feedback_monotonic_ns": sample.get("alignment_monotonic_ns"),
+            "sdk_fresh_monotonic_ns": sample.get("fresh_received_at_monotonic_ns"),
+            "sdk_joint_timestamp": sample.get("sdk_joint_timestamp"),
+            "joint_feedback_hz": sample.get("joint_feedback_hz"),
+            "alignment_error_s": sample.get("alignment_error_s"),
+            "latest_feedback_age_s": sample.get("latest_feedback_age_s"),
+            **common,
+        } for sample in samples]
 
     def osc_calibrate_readonly_hardware(self, sample_count: int = 50) -> dict[str, Any]:
         """Persist only the feedback-latency portion measurable without motion."""

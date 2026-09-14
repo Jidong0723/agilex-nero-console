@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from supervisor.camera_resource import SharedCameraResource
-from supervisor.dataset_recorder import DatasetRecorder
+from supervisor.tcp_vla_dataset_recorder import TcpVlaDatasetRecorder
+from motion.osc import KinematicsClient
 from supervisor.logging import AsyncJsonlTraceLogger
 from supervisor.pi05_adapter import Pi05InputAdapter
 from supervisor.pico_adapter import PicoInputAdapter
@@ -23,6 +24,8 @@ class OscClientPort(Protocol):
     """The complete robot-facing surface available to input adapters."""
 
     def state(self) -> dict[str, Any]: ...
+    def sensor_sample(self, target_monotonic_ns: int, wait_s: float = 0.0) -> dict[str, Any] | None: ...
+    def sensor_samples_after(self, revision: int, wait_s: float = 0.0, max_items: int = 128) -> list[dict[str, Any]]: ...
     def start_session(self, client_id: str, execution_mode: str) -> dict[str, Any]: ...
     def heartbeat(self, client_id: str, session_id: str) -> dict[str, Any]: ...
     def track_tcp(self, session_id: str, client_id: str, sequence: int, target_pose: dict[str, Any]) -> dict[str, Any]: ...
@@ -39,6 +42,12 @@ class OscClient:
 
     def state(self) -> dict[str, Any]:
         return self._broker.osc_state()
+
+    def sensor_sample(self, target_monotonic_ns: int, wait_s: float = 0.0) -> dict[str, Any] | None:
+        return self._broker.osc_sensor_sample(int(target_monotonic_ns), float(wait_s))
+
+    def sensor_samples_after(self, revision: int, wait_s: float = 0.0, max_items: int = 128) -> list[dict[str, Any]]:
+        return self._broker.osc_sensor_samples_after(int(revision), float(wait_s), int(max_items))
 
     def start_session(self, client_id: str, execution_mode: str) -> dict[str, Any]:
         return self._broker.osc_start(client_id, execution_mode)
@@ -87,12 +96,32 @@ class AdapterRuntime:
             {"component": "pico_adapter"},
         )
         self.pico = PicoInputAdapter(self.osc, dict(runtime_config.get("pico_adapter") or {}), self.pico_trace_logger)
-        self.dataset = DatasetRecorder(self.osc, self.cameras, self.pico, project_root.parent / "dataset")
+        dataset_config = dict(runtime_config.get("dataset") or {})
+        osc_config = json.loads((project_root / "config" / "osc.json").read_text(encoding="utf-8-sig"))
+        self.dataset_fk = KinematicsClient(project_root, osc_config)
+        self.dataset = TcpVlaDatasetRecorder(
+            self.osc,
+            self.cameras,
+            self.pico,
+            project_root.parent / "dataset",
+            fk_client=self.dataset_fk,
+            sample_hz=float(dataset_config.get("sample_hz", 15.0)),
+            raw_camera_hz=float(dataset_config.get("raw_camera_hz", 20.0)),
+            raw_robot_state_hz=float(dataset_config.get("raw_robot_state_hz", 50.0)),
+            raw_jpeg_quality=int(dataset_config.get("raw_jpeg_quality", 95)),
+            camera_sync_limit_s=float(dataset_config.get("camera_sync_limit_s", 0.020)),
+            feedback_age_limit_s=float(dataset_config.get("feedback_age_limit_s", 0.020)),
+            training_camera_alignment_limit_s=float(dataset_config.get("training_camera_alignment_limit_s", 0.030)),
+            training_robot_bracket_limit_s=float(dataset_config.get("training_robot_bracket_limit_s", 0.035)),
+            gripper_closed_width_m=float(dataset_config.get("gripper_closed_width_m", 0.010)),
+            gripper_open_width_m=float(dataset_config.get("gripper_open_width_m", 0.095)),
+        )
 
     def close(self) -> None:
         with self._lock:
             self.pi05.close()
             self.dataset.close()
+            self.dataset_fk.close()
             self.pico.disconnected("adapter runtime shutdown")
             self.pico_trace_logger.close()
             self.cameras.close()
