@@ -6,7 +6,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from scripts.nero_control_server import PicoGateway
+from scripts.nero_control_server import PicoGateway, _unity_euler_zxy_degrees
 
 
 class _Adapter:
@@ -88,6 +88,13 @@ def _frame(sequence: int = 1) -> dict:
 
 
 class PicoUsbGatewayTests(unittest.TestCase):
+    def test_unity_zxy_euler_decomposition_uses_unity_display_order(self) -> None:
+        # A pure X turn exposes the order unambiguously and should use the
+        # headset's 0–360 degree display range, rather than an axis-angle.
+        half = 2.0 ** -0.5
+        self.assertEqual(_unity_euler_zxy_degrees([half, 0.0, 0.0, half]), [90.0, 0.0, 0.0])
+        self.assertEqual(_unity_euler_zxy_degrees([0.0, 0.0, -half, half]), [0.0, 0.0, 270.0])
+
     def _gateway(self, runtime: _Runtime) -> PicoGateway:
         gateway = PicoGateway(runtime, {"host": "0.0.0.0", "port": 8768,
                                         "idle_timeout_s": 0.05, "message_timeout_s": 0.01,
@@ -107,6 +114,19 @@ class PicoUsbGatewayTests(unittest.TestCase):
         self.assertEqual(connection.sent[0]["type"], "connected")
         self.assertEqual(gateway._received_count, 1)
         self.assertIn(("message", "input_frame", 1), runtime.adapter.events)
+
+    def test_unity_euler_diagnostics_are_retained_without_entering_control_payload(self) -> None:
+        runtime = _Runtime()
+        gateway = self._gateway(runtime)
+        frame = _frame()
+        frame["euler_degrees"] = [359.5, 1.25, 180.0]
+        connection = _Connection([frame])
+        try:
+            gateway._handle_connection(connection)
+            self.assertEqual(gateway.status()["input_frame_euler_degrees"], [359.5, 1.25, 180.0])
+            self.assertEqual(gateway.status()["input_frame_unity_euler_from_quaternion_degrees"], [0.0, 0.0, 0.0])
+        finally:
+            gateway.close()
 
     def test_pair_message_is_not_a_valid_first_message(self) -> None:
         runtime = _Runtime()

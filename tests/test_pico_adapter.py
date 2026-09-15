@@ -104,13 +104,43 @@ def test_pico_recommended_frame_map_keeps_simulated_axes_consistent():
     value, broker = adapter()
     value.update_mapping("osc-1", "browser", RECOMMENDED_POSITION_FRAME_MAP, RECOMMENDED_ORIENTATION_FRAME_MAP)
     value.anchor_begin({"position_m": [1, 2, 3], "orientation_xyzw": [0, 0, 0, 1]})
-    for raw, expected_delta in [([1.1, 2.0, 3.0], [-0.1, 0.0, 0.0]),
+    for raw, expected_delta in [([1.1, 2.0, 3.0], [0.0, 0.1, 0.0]),
                                 ([1.0, 2.1, 3.0], [0.0, 0.0, 0.1]),
-                                ([1.0, 2.0, 3.1], [0.0, -0.1, 0.0])]:
+                                ([1.0, 2.0, 3.1], [-0.1, 0.0, 0.0])]:
         value.pose({"position_m": raw, "orientation_xyzw": [0, 0, 0, 1], "tracking_valid": True})
         actual = broker.commands[-1]["payload"]["target_pose"]["position_m"]
         expected = [0.1 + expected_delta[0], 0.2 + expected_delta[1], 0.3 + expected_delta[2]]
         assert all(math.isclose(a, b, abs_tol=1e-9) for a, b in zip(actual, expected))
+
+
+def test_pico_confirmed_axis_map_keeps_tcp_orientation_fixed_during_translation():
+    """A translation-only PICO sample must never alter the commanded wrist pose."""
+    value, broker = adapter()
+    value.update_mapping("osc-1", "browser", RECOMMENDED_POSITION_FRAME_MAP, RECOMMENDED_ORIENTATION_FRAME_MAP)
+    anchor_orientation = [0.0, math.sin(math.radians(20) / 2), 0.0, math.cos(math.radians(20) / 2)]
+    broker._state["execution"]["measured_tcp_pose"]["orientation_xyzw"] = anchor_orientation
+    anchor = {"position_m": [1.0, 2.0, 3.0], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]}
+    value.anchor_begin(anchor)
+    for position in ([1.1, 2.0, 3.0], [1.0, 2.1, 3.0], [1.0, 2.0, 3.1]):
+        value.pose({"position_m": position, "orientation_xyzw": anchor["orientation_xyzw"], "tracking_valid": True})
+        target_orientation = broker.commands[-1]["payload"]["target_pose"]["orientation_xyzw"]
+        assert abs(sum(a * b for a, b in zip(target_orientation, anchor_orientation))) > 1.0 - 1e-9
+        snapshot = value.snapshot()
+        assert snapshot["input_rotation_from_anchor_degrees"] == [0.0, 0.0, 0.0]
+        assert snapshot["target_rotation_from_anchor_degrees"] == [0.0, 0.0, 0.0]
+
+
+def test_pico_relative_pose_diagnostics_do_not_couple_position_into_orientation():
+    """One PICO axis of translation changes only the corresponding mapped Δp."""
+    value, _ = adapter()
+    value.update_mapping("osc-1", "browser", RECOMMENDED_POSITION_FRAME_MAP, RECOMMENDED_ORIENTATION_FRAME_MAP)
+    value.anchor_begin({"position_m": [1.0, 2.0, 3.0], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]})
+    value.pose({"position_m": [1.1, 2.0, 3.0], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0], "tracking_valid": True})
+    snapshot = value.snapshot()
+    assert snapshot["input_translation_from_anchor_m"] == [0.10000000000000009, 0.0, 0.0]
+    assert all(math.isclose(actual, expected, abs_tol=1e-9) for actual, expected in zip(snapshot["mapped_translation_from_anchor_m"], [0.0, 0.1, 0.0]))
+    assert snapshot["input_rotation_from_anchor_degrees"] == [0.0, 0.0, 0.0]
+    assert snapshot["target_rotation_from_anchor_degrees"] == [0.0, 0.0, 0.0]
 
 
 def test_pico_snapshot_exposes_transmitted_base_frame_target_pose():
@@ -125,7 +155,7 @@ def test_pico_snapshot_exposes_transmitted_base_frame_target_pose():
     assert snapshot["target_pose_mode"] == "RELATIVE_ANCHORED"
 
 
-def test_pico_frame_mapping_can_be_changed_only_when_not_anchored():
+def test_pico_frame_mapping_can_be_changed_while_anchored():
     value, _ = adapter()
     identity = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
     changed = value.update_mapping("osc-1", "browser", identity, identity, True)
@@ -137,6 +167,33 @@ def test_pico_frame_mapping_can_be_changed_only_when_not_anchored():
     changed_while_tracking = value.update_mapping("osc-1", "browser", RECOMMENDED_POSITION_FRAME_MAP, RECOMMENDED_ORIENTATION_FRAME_MAP)
     assert changed_while_tracking["accepted"] is True
     assert changed_while_tracking["applied_while_tracking"] is True
+
+
+def test_online_mapping_change_reanchors_orientation_without_tcp_jump():
+    """Changing C while Grip is held must preserve the current TCP pose."""
+    value, broker = adapter()
+    tcp_angle = math.radians(30) / 2
+    hand_angle = math.radians(40) / 2
+    tcp_orientation = [0, math.sin(tcp_angle), 0, math.cos(tcp_angle)]
+    hand_orientation = [0, 0, math.sin(hand_angle), math.cos(hand_angle)]
+    broker._state["execution"]["measured_tcp_pose"]["orientation_xyzw"] = tcp_orientation
+    pose = {"position_m": [1, 2, 3], "orientation_xyzw": hand_orientation,
+            "tracking_valid": True}
+    value.anchor_begin(pose)
+    value.pose(pose)
+    before = broker.commands[-1]["payload"]["target_pose"]
+
+    changed = value.update_mapping("osc-1", "browser",
+                                   RECOMMENDED_POSITION_FRAME_MAP,
+                                   RECOMMENDED_ORIENTATION_FRAME_MAP)
+    assert changed["accepted"] is True
+    value.pose(pose)
+    after = broker.commands[-1]["payload"]["target_pose"]
+
+    assert all(math.isclose(actual, expected, abs_tol=1e-9)
+               for actual, expected in zip(after["position_m"], before["position_m"]))
+    assert abs(sum(a * b for a, b in zip(after["orientation_xyzw"], before["orientation_xyzw"]))) > 1.0 - 1e-9
+    assert all(abs(angle) < 1e-9 for angle in value.snapshot()["target_rotation_from_anchor_degrees"])
 
 
 def test_pico_frame_mapping_change_is_used_by_absolute_orientation_output():
@@ -151,6 +208,28 @@ def test_pico_frame_mapping_change_is_used_by_absolute_orientation_output():
     output = broker.commands[-1]["payload"]["target_pose"]["orientation_xyzw"]
     expected = [0, math.sin(angle / 2), 0, math.cos(angle / 2)]
     assert abs(sum(a * b for a, b in zip(output, expected))) > 1.0 - 1e-6
+
+
+def test_pico_relative_rotation_is_applied_about_tcp_local_axis():
+    """A controller delta right-multiplies a rotated TCP anchor, so its axis follows the tool."""
+    value, broker = adapter()
+    half_z = math.radians(90) / 2
+    tcp_anchor = [0, 0, math.sin(half_z), math.cos(half_z)]
+    broker._state["execution"]["measured_tcp_pose"]["orientation_xyzw"] = tcp_anchor
+    value.anchor_begin({"position_m": [1, 2, 3], "orientation_xyzw": [0, 0, 0, 1]})
+
+    half_x = math.radians(20) / 2
+    controller_local_x = [math.sin(half_x), 0, 0, math.cos(half_x)]
+    value.pose({"position_m": [1, 2, 3], "orientation_xyzw": controller_local_x,
+                "tracking_valid": True})
+    actual = broker.commands[-1]["payload"]["target_pose"]["orientation_xyzw"]
+
+    s, c = math.sin(half_z), math.cos(half_z)
+    sx, cx = math.sin(half_x), math.cos(half_x)
+    expected_local = [c * sx, s * sx, s * cx, c * cx]  # tcp_anchor * controller_local_x
+    base_axis_left_product = [c * sx, -s * sx, s * cx, c * cx]
+    assert abs(sum(a * b for a, b in zip(actual, expected_local))) > 1.0 - 1e-6
+    assert abs(sum(a * b for a, b in zip(actual, base_axis_left_product))) < 0.999
 
 
 def test_pico_orientation_anchor_preserves_current_tcp_without_jump():
@@ -205,6 +284,44 @@ def test_pico_rotation_gain_attenuates_relative_rotation_from_anchor():
     target = broker.commands[-1]["payload"]["target_pose"]["orientation_xyzw"]
     assert math.isclose(abs(target[2]), math.sin(math.radians(20) / 2), abs_tol=1e-6)
     assert math.isclose(abs(target[3]), math.cos(math.radians(20) / 2), abs_tol=1e-6)
+
+
+def test_pico_rotation_gain_is_continuous_when_crossing_180_degrees():
+    value, broker = adapter()
+    assert value.update_sensitivity("osc-1", "browser", 1.0, 0.9)["accepted"] is True
+    value.anchor_begin({"position_m": [1, 2, 3], "orientation_xyzw": [0, 0, 0, 1]})
+
+    def z_rotation(degrees: float) -> list[float]:
+        half_angle = math.radians(degrees) / 2
+        return [0.0, 0.0, math.sin(half_angle), math.cos(half_angle)]
+
+    value.pose({"position_m": [1, 2, 3], "orientation_xyzw": z_rotation(179.9), "tracking_valid": True})
+    before = broker.commands[-1]["payload"]["target_pose"]["orientation_xyzw"]
+    value.pose({"position_m": [1, 2, 3], "orientation_xyzw": z_rotation(180.1), "tracking_valid": True})
+    after = broker.commands[-1]["payload"]["target_pose"]["orientation_xyzw"]
+
+    # The physical target change is the 0.2-degree controller increment
+    # scaled by 0.9, rather than a roughly 36-degree shortest-path jump.
+    dot = min(1.0, abs(sum(a * b for a, b in zip(before, after))))
+    assert math.degrees(2 * math.acos(dot)) < 0.25
+
+
+def test_pico_rotation_gain_continues_through_a_full_turn():
+    value, broker = adapter()
+    assert value.update_sensitivity("osc-1", "browser", 1.0, 0.9)["accepted"] is True
+    value.anchor_begin({"position_m": [1, 2, 3], "orientation_xyzw": [0, 0, 0, 1]})
+
+    targets = []
+    for degrees in (0.0, 90.0, 180.0, 270.0, 360.0):
+        half_angle = math.radians(degrees) / 2
+        value.pose({"position_m": [1, 2, 3],
+                    "orientation_xyzw": [0.0, 0.0, math.sin(half_angle), math.cos(half_angle)],
+                    "tracking_valid": True})
+        targets.append(broker.commands[-1]["payload"]["target_pose"]["orientation_xyzw"])
+
+    for previous, current in zip(targets, targets[1:]):
+        dot = min(1.0, abs(sum(a * b for a, b in zip(previous, current))))
+        assert math.isclose(math.degrees(2 * math.acos(dot)), 81.0, abs_tol=1e-6)
 
 
 def test_pico_sensitivity_rejects_values_outside_attenuation_range():
@@ -345,7 +462,7 @@ def test_mapping_persistence_marks_saved_custom_mapping_and_keeps_recommendation
     assert result["persisted"] is True
     assert persisted["pico_adapter"]["mapping_verified"] is False
     assert persisted["pico_adapter"]["position_axis_map"] == [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
-    assert RECOMMENDED_POSITION_FRAME_MAP == [[-1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]
+    assert RECOMMENDED_POSITION_FRAME_MAP == [[0.0, 0.0, -1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
 
 
 def test_mapping_lifecycle_is_logged_without_per_frame_diagnostics():

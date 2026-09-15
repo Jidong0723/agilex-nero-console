@@ -51,6 +51,43 @@ _RESET_LOCK = threading.Lock()
 _RESET_PENDING = False
 
 
+def _unity_euler_zxy_degrees(orientation_xyzw: list[float]) -> list[float]:
+    """Decompose a Unity quaternion into its displayed Z → X → Y Euler angles.
+
+    Unity's ``Quaternion.eulerAngles`` is a *display* convention, not a
+    rotation vector: it uses the matrix composition ``Ry(y) Rx(x) Rz(z)`` and
+    normalizes each returned component to [0, 360).  Keep this diagnostic here
+    beside ingress so the browser derives its value from the exact quaternion
+    that entered the control path.
+    """
+    x, y, z, w = (float(value) for value in orientation_xyzw)
+    magnitude = math.sqrt(x * x + y * y + z * z + w * w)
+    if not math.isfinite(magnitude) or magnitude < 1e-12:
+        raise ValueError("orientation_xyzw must be a non-zero finite quaternion")
+    x, y, z, w = x / magnitude, y / magnitude, z / magnitude, w / magnitude
+
+    # Relevant entries of R = Ry(y) Rx(x) Rz(z), expanded from the quaternion.
+    r00 = 1.0 - 2.0 * (y * y + z * z)
+    r02 = 2.0 * (x * z + y * w)
+    r10 = 2.0 * (x * y + z * w)
+    r11 = 1.0 - 2.0 * (x * x + z * z)
+    r12 = 2.0 * (y * z - x * w)
+    r20 = 2.0 * (x * z - y * w)
+    r22 = 1.0 - 2.0 * (x * x + y * y)
+
+    x_angle = math.asin(max(-1.0, min(1.0, -r12)))
+    # At X = ±90° Y and Z are coupled.  Unity must select one valid member of
+    # that family; choosing Z = 0 makes the diagnostic deterministic.
+    if abs(math.cos(x_angle)) < 1e-7:
+        y_angle = math.atan2(-r20, r00)
+        z_angle = 0.0
+    else:
+        y_angle = math.atan2(r02, r22)
+        z_angle = math.atan2(r10, r11)
+
+    return [math.degrees(angle) % 360.0 for angle in (x_angle, y_angle, z_angle)]
+
+
 class ControlServiceUnavailable(RuntimeError):
     """The web console is up, but its robot-control backend is not ready."""
 
@@ -661,6 +698,11 @@ class PicoGateway:
         self._last_input_frame_tracking = False
         self._last_input_frame_position = [0.0, 0.0, 0.0]
         self._last_input_frame_orientation = [0.0, 0.0, 0.0, 1.0]
+        # Diagnostic only. The control path always consumes the quaternion;
+        # Unity Euler angles are retained solely to show the same 0–360°
+        # readout that the headset displays.
+        self._last_input_frame_euler_degrees: list[float] | None = None
+        self._last_input_frame_unity_euler_from_quaternion_degrees = [0.0, 0.0, 0.0]
         self._input_frame_overwrites = 0
         self._last_ack_processing_ms: float | None = None
         self._last_dispatch_type: str | None = None
@@ -815,6 +857,8 @@ class PicoGateway:
                 "input_frame_tracking_valid": self._last_input_frame_tracking,
                 "input_frame_position_m": list(self._last_input_frame_position),
                 "input_frame_orientation_xyzw": list(self._last_input_frame_orientation),
+                "input_frame_unity_euler_from_quaternion_degrees": list(self._last_input_frame_unity_euler_from_quaternion_degrees),
+                "input_frame_euler_degrees": list(self._last_input_frame_euler_degrees) if self._last_input_frame_euler_degrees is not None else None,
                 "input_frame_overwrites": dispatcher_snapshot.get("overwritten_input_frames", self._input_frame_overwrites),
                 "last_ack_processing_ms": self._last_ack_processing_ms,
                 "last_signal_age_ms": None if self._last_receive_monotonic_ns is None else max(0.0, (time.monotonic_ns() - self._last_receive_monotonic_ns) / 1e6),
@@ -1074,12 +1118,19 @@ class PicoGateway:
                     break
                 position = message.get("position_m")
                 orientation = message.get("orientation_xyzw")
+                euler_degrees = message.get("euler_degrees")
                 grip = bool(message.get("grip", False))
                 trigger_value = float(message.get("trigger_value", 0.0))
                 if not isinstance(position, list) or len(position) != 3:
                     raise ValueError("input_frame.position_m must contain 3 values")
                 if not isinstance(orientation, list) or len(orientation) != 4:
                     raise ValueError("input_frame.orientation_xyzw must contain 4 values")
+                if euler_degrees is not None:
+                    if not isinstance(euler_degrees, list) or len(euler_degrees) != 3:
+                        raise ValueError("input_frame.euler_degrees must contain 3 values when present")
+                    euler_degrees = [float(value) for value in euler_degrees]
+                    if not all(math.isfinite(value) for value in euler_degrees):
+                        raise ValueError("input_frame.euler_degrees must contain finite values")
                 if not math.isfinite(trigger_value) or trigger_value < 0.0 or trigger_value > 1.0:
                     raise ValueError("input_frame.trigger_value must be between 0 and 1")
                 gateway_received_ns = time.monotonic_ns()
@@ -1098,6 +1149,8 @@ class PicoGateway:
                     self._last_input_frame_tracking = bool(message.get("tracking_valid", True))
                     self._last_input_frame_position = list(position)
                     self._last_input_frame_orientation = list(orientation)
+                    self._last_input_frame_unity_euler_from_quaternion_degrees = _unity_euler_zxy_degrees(orientation)
+                    self._last_input_frame_euler_degrees = list(euler_degrees) if euler_degrees is not None else None
                 self.trace_logger.append({"record_type": "sample", "event": "gateway_message_received",
                                           "monotonic_ns": gateway_received_ns, "pico_sequence": sequence,
                                           "message_type": kind, "session_id": usb_session})

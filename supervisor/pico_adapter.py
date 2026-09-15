@@ -45,11 +45,14 @@ def _map(matrix: list[list[float]], value: list[float], gain: float) -> list[flo
     return [gain * sum(float(row[index]) * value[index] for index in range(3)) for row in matrix]
 
 
-# Physical-arm verified PICO-to-NERO frame mappings.  Position and
-# orientation intentionally use separate matrices; they are not interchangeable
-# defaults even though both are orthonormal axis maps.
-RECOMMENDED_POSITION_FRAME_MAP = [[-1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]
-RECOMMENDED_ORIENTATION_FRAME_MAP = [[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]
+# PICO tracking axes are confirmed by the operator as +X right, +Y up, and
+# +Z forward. NERO base-frame jogging is +Y right, +Z up, and -X forward.
+#
+# Use the same basis conversion for position and controller orientation.  A
+# pose is one rigid transform; separate, undocumented maps can make the TCP
+# translate in a plausible direction while wrist rotations use another frame.
+RECOMMENDED_POSITION_FRAME_MAP = [[0.0, 0.0, -1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+RECOMMENDED_ORIENTATION_FRAME_MAP = RECOMMENDED_POSITION_FRAME_MAP
 # Compatibility alias for callers that historically used the position map.
 DEFAULT_FRAME_MAP = RECOMMENDED_POSITION_FRAME_MAP
 
@@ -150,7 +153,8 @@ def _map_absolute_orientation(matrix: tuple[tuple[float, ...], ...], q: list[flo
     return _matrix_to_quaternion(mapped)
 
 
-def _rotation_degrees(q: list[float]) -> list[float]:
+def _axis_angle_degrees(q: list[float]) -> list[float]:
+    """Return a shortest axis-angle vector in degrees, not Euler XYZ angles."""
     return [value * 180.0 / math.pi for value in _rotation_vector(q)]
 
 
@@ -195,6 +199,11 @@ class PicoInputAdapter:
         self._anchor_tcp: dict[str, list[float]] | None = None
         self._absolute_position_offset: list[float] | None = None
         self._orientation_correction: list[float] = [0.0, 0.0, 0.0, 1.0]
+        # The gain is applied to each high-rate local rotation increment, not
+        # to one shortest-path rotation from the Grip anchor.  This preserves
+        # continuity when a held controller passes 180° or completes a turn.
+        self._previous_mapped_controller_orientation: list[float] | None = None
+        self._attenuated_relative_orientation = [0.0, 0.0, 0.0, 1.0]
         self._orientation_calibration_status = "DIRECT_MAPPING"
         self._orientation_calibrated_at: float | None = None
         self._anchor_generation = 0
@@ -245,6 +254,14 @@ class PicoInputAdapter:
                 "orientation_calibration_status": "DIRECT_MAPPING",
                 "orientation_correction_xyzw": [0.0, 0.0, 0.0, 1.0],
                 "orientation_correction_matrix": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                # These deltas are measured from the Grip anchor.  They make
+                # the input-to-TCP relation inspectable without interpreting
+                # absolute Euler angles, which are not a reliable way to
+                # compare two 3-D orientations.
+                "input_translation_from_anchor_m": [0.0, 0.0, 0.0],
+                "mapped_translation_from_anchor_m": [0.0, 0.0, 0.0],
+                "input_rotation_from_anchor_degrees": [0.0, 0.0, 0.0],
+                "target_rotation_from_anchor_degrees": [0.0, 0.0, 0.0],
                 "anchor_tcp_source": None,
                 "orientation_calibrated_at": None,
                 "anchor_generation": 0,
@@ -294,10 +311,14 @@ class PicoInputAdapter:
                 raise PermissionError("只有当前控制台/PICO 会话所有者可以修改坐标矩阵")
             was_tracking = bool(self.state.get("anchor_active"))
             if was_tracking and self._anchor_tcp and self._anchor_controller:
-                # Rebase the position offset against the current TCP reference
-                # before replacing C_p. This makes an online matrix edit take
-                # effect without producing a position jump at the edit frame.
+                # Rebase both position and orientation against the current TCP
+                # reference before replacing the maps.  The hand can be held
+                # still while this happens; the next frame must therefore
+                # reproduce the current TCP pose rather than rotate the wrist.
                 current_position = list(self.state.get("input_position_m") or self._anchor_controller["position_m"])
+                current_orientation = _normalise(_vector(
+                    self.state.get("input_orientation_xyzw") or self._anchor_controller["orientation_xyzw"],
+                    4, "controller orientation"))
                 osc_state = self.osc.state()
                 execution_tcp = (osc_state.get("execution") or {}).get("measured_tcp_pose")
                 command_tcp = (osc_state.get("command") or {}).get("target_tcp")
@@ -305,11 +326,24 @@ class PicoInputAdapter:
                 if not isinstance(tcp_reference, dict):
                     tcp_reference = self._anchor_tcp
                 current_tcp = _vector(tcp_reference.get("position_m"), 3, "TCP position")
-                # Keep the current physical point as the new zero so changing
-                # the matrix cannot make the arm jump at the edit frame.
+                current_tcp_orientation = _normalise(_vector(
+                    tcp_reference.get("orientation_xyzw"), 4, "TCP orientation"))
+                # Keep the current physical pose as the new zero so changing
+                # either map cannot make the arm jump at the edit frame.
                 self._anchor_controller["position_m"] = current_position
+                self._anchor_controller["orientation_xyzw"] = current_orientation
                 self._anchor_tcp["position_m"] = current_tcp
-                self._absolute_position_offset = list(current_tcp)
+                self._anchor_tcp["orientation_xyzw"] = current_tcp_orientation
+                mapped_current_position = _map(position_map, current_position, self._translation_gain)
+                self._absolute_position_offset = [
+                    current_tcp[index] - mapped_current_position[index] for index in range(3)
+                ]
+                mapped_controller_orientation = _map_absolute_orientation(orientation_map, current_orientation)
+                self._orientation_correction = _normalise(_multiply(
+                    current_tcp_orientation, _inverse(mapped_controller_orientation)))
+                self._previous_mapped_controller_orientation = list(mapped_controller_orientation)
+                self._attenuated_relative_orientation = [0.0, 0.0, 0.0, 1.0]
+                self._orientation_calibrated_at = time.time()
             self._position_axis_map = position_map
             self._orientation_axis_map = orientation_map
             self.config["position_axis_map"] = [list(row) for row in position_map]
@@ -318,7 +352,10 @@ class PicoInputAdapter:
             self._mapping_persisted = False
             self._mapping_source = "runtime_memory"
             self.state.update({"updated_at": time.time(), "mapping_applied_while_tracking": was_tracking,
-                               "last_error": None})
+                               "last_error": None,
+                               "orientation_correction_xyzw": list(self._orientation_correction),
+                               "orientation_correction_matrix": _quaternion_to_matrix(self._orientation_correction),
+                               "orientation_calibrated_at": self._orientation_calibrated_at})
             result = {"ok": True, "accepted": True, "mapping_verified": self.config["mapping_verified"],
                     "persisted": False,
                     "applied_while_tracking": was_tracking,
@@ -359,6 +396,8 @@ class PicoInputAdapter:
             self._anchor_controller = self._anchor_tcp = None
             self._absolute_position_offset = None
             self._orientation_correction = [0.0, 0.0, 0.0, 1.0]
+            self._previous_mapped_controller_orientation = None
+            self._attenuated_relative_orientation = [0.0, 0.0, 0.0, 1.0]
             self._orientation_calibration_status = "DIRECT_MAPPING"
             self._orientation_calibrated_at = None
             self._orientation_calibrated_at = None
@@ -513,11 +552,11 @@ class PicoInputAdapter:
         with self.lock:
             self.state.update({"tracking_valid": bool(pose.get("tracking_valid", True)), "updated_at": time.time(), "last_error": None,
                                "input_position_m": position, "input_orientation_xyzw": orientation,
-                               "input_rotation_degrees": _rotation_degrees(orientation),
+                               "input_rotation_degrees": _axis_angle_degrees(orientation),
                                "mapped_input_orientation_xyzw": _map_absolute_orientation(self._orientation_axis_map, orientation),
-                               "mapped_input_rotation_degrees": _rotation_degrees(_map_absolute_orientation(self._orientation_axis_map, orientation)),
+                               "mapped_input_rotation_degrees": _axis_angle_degrees(_map_absolute_orientation(self._orientation_axis_map, orientation)),
                                "absolute_orientation_preview_xyzw": _map_absolute_orientation(self._orientation_axis_map, orientation),
-                               "absolute_orientation_preview_degrees": _rotation_degrees(_map_absolute_orientation(self._orientation_axis_map, orientation)),
+                               "absolute_orientation_preview_degrees": _axis_angle_degrees(_map_absolute_orientation(self._orientation_axis_map, orientation)),
                                "orientation_command_enabled": bool(pose.get("clutch", self.state.get("clutch_signal", False))),
                                "input_clutch": bool(pose.get("clutch", False)),
                                "input_sequence": int(pose.get("_pico_sequence") or 0),
@@ -566,11 +605,11 @@ class PicoInputAdapter:
                 "input_grip": grip, "input_trigger_value": trigger,
                 "input_clutch": grip, "input_sequence": sequence,
                 "input_position_m": position, "input_orientation_xyzw": orientation,
-                "input_rotation_degrees": _rotation_degrees(orientation),
+                "input_rotation_degrees": _axis_angle_degrees(orientation),
                 "mapped_input_orientation_xyzw": list(mapped_orientation),
-                "mapped_input_rotation_degrees": _rotation_degrees(mapped_orientation),
+                "mapped_input_rotation_degrees": _axis_angle_degrees(mapped_orientation),
                 "absolute_orientation_preview_xyzw": list(mapped_orientation),
-                "absolute_orientation_preview_degrees": _rotation_degrees(mapped_orientation),
+                "absolute_orientation_preview_degrees": _axis_angle_degrees(mapped_orientation),
                 "orientation_command_enabled": grip,
                 "tracking_valid": tracking_valid, "updated_at": time.time(),
                 "input_received_monotonic_ns": int(frame.get("_gateway_received_monotonic_ns") or time.monotonic_ns()),
@@ -666,12 +705,14 @@ class PicoInputAdapter:
             mapped_anchor_orientation = _map_absolute_orientation(self._orientation_axis_map, orientation)
             self._orientation_correction = _normalise(_multiply(
                 self._anchor_tcp["orientation_xyzw"], _inverse(mapped_anchor_orientation)))
+            self._previous_mapped_controller_orientation = list(mapped_anchor_orientation)
+            self._attenuated_relative_orientation = [0.0, 0.0, 0.0, 1.0]
             self._orientation_calibration_status = "RELATIVE_ANCHORED"
             self._orientation_calibrated_at = time.time()
             self.state.update({"state": "TRACKING", "anchor_active": True, "tracking_valid": True, "updated_at": time.time(), "last_error": None,
                                "clutch_signal": bool(activate_clutch), "input_clutch": bool(activate_clutch),
                                "input_position_m": position, "input_orientation_xyzw": orientation,
-                               "input_rotation_degrees": _rotation_degrees(orientation),
+                               "input_rotation_degrees": _axis_angle_degrees(orientation),
                                "input_sequence": int(pose.get("_pico_sequence") or 0),
                                "input_received_monotonic_ns": time.monotonic_ns(),
                                "orientation_tracking_mode": "RELATIVE_ANCHORED",
@@ -720,11 +761,11 @@ class PicoInputAdapter:
         with self.lock:
             mapped_orientation = _map_absolute_orientation(self._orientation_axis_map, orientation)
             self.state.update({"input_position_m": position, "input_orientation_xyzw": orientation,
-                               "input_rotation_degrees": _rotation_degrees(orientation),
+                               "input_rotation_degrees": _axis_angle_degrees(orientation),
                                "mapped_input_orientation_xyzw": list(mapped_orientation),
-                               "mapped_input_rotation_degrees": _rotation_degrees(mapped_orientation),
+                               "mapped_input_rotation_degrees": _axis_angle_degrees(mapped_orientation),
                                "absolute_orientation_preview_xyzw": list(mapped_orientation),
-                               "absolute_orientation_preview_degrees": _rotation_degrees(mapped_orientation),
+                               "absolute_orientation_preview_degrees": _axis_angle_degrees(mapped_orientation),
                                "input_clutch": bool(pose.get("clutch", self.state.get("clutch_signal", False))),
                                "input_sequence": pico_sequence,
                                "input_received_monotonic_ns": gateway_received_ns})
@@ -744,22 +785,50 @@ class PicoInputAdapter:
                 "position_m": list(self._anchor_tcp["position_m"]),
                 "orientation_xyzw": list(self._anchor_tcp["orientation_xyzw"]),
             }
-        anchor_controller_position = list(self._anchor_controller["position_m"])
-        anchor_controller_orientation = list(self._anchor_controller["orientation_xyzw"])
+            anchor_controller_position = list(self._anchor_controller["position_m"])
+            anchor_controller_orientation = list(self._anchor_controller["orientation_xyzw"])
+            position_axis_map = [list(row) for row in self._position_axis_map]
+            orientation_axis_map = [list(row) for row in self._orientation_axis_map]
+            translation_gain = self._translation_gain
+            rotation_gain = self._rotation_gain
+            absolute_position_offset = list(self._absolute_position_offset or [0.0, 0.0, 0.0])
+            # A first sample after an older session has no prior increment. It
+            # starts at the anchor instead of treating the entire orientation
+            # as one potentially discontinuous shortest-path rotation.
+            previous_mapped_orientation = list(
+                self._previous_mapped_controller_orientation or mapped_orientation)
+            accumulated_relative_orientation = list(self._attenuated_relative_orientation)
         # Preserve the original relative position mapping: the configured
         # matrix maps PICO tracking coordinates directly into the robot frame.
-        mapped_position = _map(self._position_axis_map, position, self._translation_gain)
-        orientation_correction = list(self._orientation_correction)
-        mapped_anchor_orientation = _map_absolute_orientation(self._orientation_axis_map, anchor_controller_orientation)
+        mapped_position = _map(position_axis_map, position, translation_gain)
+        input_translation_from_anchor = [position[index] - anchor_controller_position[index] for index in range(3)]
+        mapped_translation_from_anchor = _map(position_axis_map, input_translation_from_anchor, translation_gain)
+        mapped_anchor_orientation = _map_absolute_orientation(orientation_axis_map, anchor_controller_orientation)
         relative_orientation = _normalise(_multiply(_inverse(mapped_anchor_orientation), mapped_orientation))
-        attenuated_orientation = _attenuate_relative_rotation(relative_orientation, self._rotation_gain)
-        mapped_q = _normalise(_multiply(orientation_correction, _multiply(mapped_anchor_orientation, attenuated_orientation)))
-        target = {"position_m": [self._absolute_position_offset[index] + mapped_position[index] for index in range(3)],
+        # Attenuate a single high-rate local increment, then accumulate it in
+        # TCP-local order. Scaling one anchor-relative shortest-path rotation
+        # makes its axis flip at 180 degrees when gain < 1; incremental
+        # composition remains continuous and permits turns beyond one circle.
+        frame_relative_orientation = _normalise(_multiply(
+            _inverse(previous_mapped_orientation), mapped_orientation))
+        attenuated_frame_orientation = _attenuate_relative_rotation(
+            frame_relative_orientation, rotation_gain)
+        attenuated_orientation = _normalise(_multiply(
+            accumulated_relative_orientation, attenuated_frame_orientation))
+        mapped_q = _normalise(_multiply(anchor_tcp["orientation_xyzw"], attenuated_orientation))
+        target = {"position_m": [absolute_position_offset[index] + mapped_position[index] for index in range(3)],
                   "orientation_xyzw": mapped_q}
+        target_rotation_from_anchor = _normalise(_multiply(_inverse(anchor_tcp["orientation_xyzw"]), mapped_q))
         with self.lock:
+            self._previous_mapped_controller_orientation = list(mapped_orientation)
+            self._attenuated_relative_orientation = list(attenuated_orientation)
             self.state.update({"mapped_input_orientation_xyzw": list(mapped_q),
-                               "mapped_input_rotation_degrees": _rotation_degrees(mapped_q),
-                               "target_rotation_degrees": _rotation_degrees(mapped_q),
+                               "mapped_input_rotation_degrees": _axis_angle_degrees(mapped_q),
+                               "target_rotation_degrees": _axis_angle_degrees(mapped_q),
+                               "input_translation_from_anchor_m": input_translation_from_anchor,
+                               "mapped_translation_from_anchor_m": mapped_translation_from_anchor,
+                               "input_rotation_from_anchor_degrees": _axis_angle_degrees(relative_orientation),
+                               "target_rotation_from_anchor_degrees": _axis_angle_degrees(target_rotation_from_anchor),
                                "orientation_command_enabled": True,
                                "last_target_pose": copy.deepcopy(target), "last_target_status": "SUBMITTING",
                                "last_target_sent_at": time.time()})
@@ -774,7 +843,10 @@ class PicoInputAdapter:
             self.trace_logger.append({"record_type": "sample", "event": "adapter_osc_return",
                                       "monotonic_ns": osc_submit_finished_ns, "pico_sequence": pico_sequence,
                                       "osc_sequence": result.get("result", {}).get("accepted_sequence") if isinstance(result.get("result"), dict) else result.get("accepted_sequence"),
-                                      "ok": result.get("ok"), "recoverable": result.get("recoverable", False)})
+                                      "ok": result.get("ok"), "recoverable": result.get("recoverable", False),
+                                      "input_translation_from_anchor_m": input_translation_from_anchor,
+                                      "input_rotation_from_anchor_degrees": _axis_angle_degrees(relative_orientation),
+                                      "target_pose": target})
         if not result.get("ok"):
             rejected = result.get("result") if isinstance(result.get("result"), dict) else result
             if bool(rejected.get("recoverable")):
@@ -847,6 +919,8 @@ class PicoInputAdapter:
             self._anchor_controller = self._anchor_tcp = None
             self._absolute_position_offset = None
             self._orientation_correction = [0.0, 0.0, 0.0, 1.0]
+            self._previous_mapped_controller_orientation = None
+            self._attenuated_relative_orientation = [0.0, 0.0, 0.0, 1.0]
             self._orientation_calibration_status = "DIRECT_MAPPING"
             self._orientation_calibrated_at = None
             self._pending_anchor = None

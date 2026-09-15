@@ -45,6 +45,16 @@ connection and device anchors,
 camera and policy lifecycle, and can only read OSC state, renew a session, or
 send absolute `track_tcp`, `hold`, and `gripper` commands.
 
+### PICO input-frame coordinate contract
+
+`input_frame.position_m` and `input_frame.orientation_xyzw` use the PICO
+tracking frame (`+X` right, `+Y` up, `+Z` forward; quaternion order `xyzw`).
+The adapter converts it to the NERO base frame with
+`[[0, 0, -1], [1, 0, 0], [0, 1, 0]]`: PICO right maps to NERO `+Y`, up to
+NERO `+Z`, and forward to NERO `-X`. The same frame conversion is applied to
+position and orientation. A held Grip establishes a relative pose anchor, so
+a position-only input frame keeps the commanded TCP orientation unchanged.
+
 ## Operator actions
 
 `POST /api/actions`, `/api/safety/hold`, `/api/safety/freedrive`,
