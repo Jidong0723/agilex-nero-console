@@ -844,21 +844,77 @@ class PicoInputAdapter:
                                       "monotonic_ns": osc_submit_finished_ns, "pico_sequence": pico_sequence,
                                       "osc_sequence": result.get("result", {}).get("accepted_sequence") if isinstance(result.get("result"), dict) else result.get("accepted_sequence"),
                                       "ok": result.get("ok"), "recoverable": result.get("recoverable", False),
+                                      # Keep each coordinate-system boundary in
+                                      # the trace.  These values are also exposed
+                                      # by snapshot(), but recording them beside
+                                      # the OSC acknowledgement makes a field
+                                      # diagnosis unambiguous: raw PICO Δp,
+                                      # mapped base-frame Δp, then submitted TCP.
+                                      "input_position_m": position,
                                       "input_translation_from_anchor_m": input_translation_from_anchor,
+                                      "mapped_translation_from_anchor_m": mapped_translation_from_anchor,
                                       "input_rotation_from_anchor_degrees": _axis_angle_degrees(relative_orientation),
+                                      "target_rotation_from_anchor_degrees": _axis_angle_degrees(target_rotation_from_anchor),
                                       "target_pose": target})
         if not result.get("ok"):
             rejected = result.get("result") if isinstance(result.get("result"), dict) else result
             if bool(rejected.get("recoverable")):
-                # A workspace/safety rejection is an input condition, not a
-                # transport failure. Keep the anchor and USB session alive so the
-                # next pose can recover when the operator moves back inside
-                # the valid workspace.
+                # Match the web joystick's recovery contract: OSC returns its
+                # last safe absolute target after a workspace rejection. Make
+                # the current controller pose the new zero at that safe target,
+                # so the operator can move inward immediately instead of first
+                # undoing an arbitrarily large rejected overshoot.
+                safe_target = rejected.get("safe_target_pose")
+                safe_position: list[float] | None = None
+                safe_orientation: list[float] | None = None
+                if isinstance(safe_target, dict):
+                    try:
+                        safe_position = _vector(safe_target.get("position_m"), 3, "safe TCP position")
+                        safe_orientation = _normalise(_vector(
+                            safe_target.get("orientation_xyzw"), 4, "safe TCP orientation"))
+                    except (TypeError, ValueError):
+                        safe_position = safe_orientation = None
                 with self.lock:
+                    if safe_position is not None and safe_orientation is not None:
+                        self._anchor_generation += 1
+                        self._anchor_controller = {
+                            "position_m": list(position),
+                            "orientation_xyzw": list(orientation),
+                        }
+                        self._anchor_tcp = {
+                            "position_m": list(safe_position),
+                            "orientation_xyzw": list(safe_orientation),
+                        }
+                        mapped_safe_anchor_position = _map(
+                            self._position_axis_map, position, self._translation_gain)
+                        self._absolute_position_offset = [
+                            safe_position[index] - mapped_safe_anchor_position[index]
+                            for index in range(3)
+                        ]
+                        mapped_safe_anchor_orientation = _map_absolute_orientation(
+                            self._orientation_axis_map, orientation)
+                        self._orientation_correction = _normalise(_multiply(
+                            safe_orientation, _inverse(mapped_safe_anchor_orientation)))
+                        self._previous_mapped_controller_orientation = list(
+                            mapped_safe_anchor_orientation)
+                        self._attenuated_relative_orientation = [0.0, 0.0, 0.0, 1.0]
+                        self._orientation_calibration_status = "RELATIVE_REANCHORED_AT_LIMIT"
+                        self._orientation_calibrated_at = time.time()
                     self.state.update({
                         "state": "TRACKING_LIMITED",
                         "tracking_valid": True,
                         "last_error": str(rejected.get("reason", "target rejected")),
+                        "last_target_pose": copy.deepcopy(safe_target) if safe_position is not None else copy.deepcopy(target),
+                        "last_target_status": "LIMITED_REANCHORED" if safe_position is not None else "REJECTED",
+                        "input_translation_from_anchor_m": [0.0, 0.0, 0.0] if safe_position is not None else input_translation_from_anchor,
+                        "mapped_translation_from_anchor_m": [0.0, 0.0, 0.0] if safe_position is not None else mapped_translation_from_anchor,
+                        "input_rotation_from_anchor_degrees": [0.0, 0.0, 0.0] if safe_position is not None else _axis_angle_degrees(relative_orientation),
+                        "target_rotation_from_anchor_degrees": [0.0, 0.0, 0.0] if safe_position is not None else _axis_angle_degrees(target_rotation_from_anchor),
+                        "orientation_calibration_status": self._orientation_calibration_status,
+                        "orientation_correction_xyzw": list(self._orientation_correction),
+                        "orientation_correction_matrix": _quaternion_to_matrix(self._orientation_correction),
+                        "orientation_calibrated_at": self._orientation_calibrated_at,
+                        "anchor_generation": self._anchor_generation,
                         "updated_at": time.time(),
                     })
                 return {
@@ -867,8 +923,9 @@ class PicoInputAdapter:
                     "accepted": False,
                     "recoverable": True,
                     "reason": str(rejected.get("reason", "target rejected")),
-                    "message": "目标超出当前安全工作空间，请向反方向移动",
-                    "safe_target_pose": rejected.get("safe_target_pose"),
+                    "message": "目标超出当前安全工作空间；已在最后安全位姿重新建立控制起点，请向反方向移动",
+                    "safe_target_pose": safe_target,
+                    "reanchored_at_safe_target": safe_position is not None,
                 }
             raise RuntimeError(f"OSC rejected PICO target: {result}")
         timing = {

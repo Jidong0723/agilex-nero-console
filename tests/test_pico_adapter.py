@@ -130,6 +130,23 @@ def test_pico_confirmed_axis_map_keeps_tcp_orientation_fixed_during_translation(
         assert snapshot["target_rotation_from_anchor_degrees"] == [0.0, 0.0, 0.0]
 
 
+def test_pico_rotation_only_keeps_tcp_position_fixed():
+    """Orientation tracking and translation tracking are independent channels."""
+    value, broker = adapter()
+    anchor_position = [1.0, 2.0, 3.0]
+    value.anchor_begin({"position_m": anchor_position,
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]})
+
+    for degrees in (20.0, 45.0, 90.0):
+        half_angle = math.radians(degrees) / 2
+        value.pose({"position_m": anchor_position,
+                    "orientation_xyzw": [0.0, math.sin(half_angle), 0.0, math.cos(half_angle)],
+                    "tracking_valid": True})
+        target = broker.commands[-1]["payload"]["target_pose"]
+        assert all(math.isclose(actual, expected, abs_tol=1e-9)
+                   for actual, expected in zip(target["position_m"], [0.1, 0.2, 0.3]))
+
+
 def test_pico_relative_pose_diagnostics_do_not_couple_position_into_orientation():
     """One PICO axis of translation changes only the corresponding mapped Δp."""
     value, _ = adapter()
@@ -141,6 +158,59 @@ def test_pico_relative_pose_diagnostics_do_not_couple_position_into_orientation(
     assert all(math.isclose(actual, expected, abs_tol=1e-9) for actual, expected in zip(snapshot["mapped_translation_from_anchor_m"], [0.0, 0.1, 0.0]))
     assert snapshot["input_rotation_from_anchor_degrees"] == [0.0, 0.0, 0.0]
     assert snapshot["target_rotation_from_anchor_degrees"] == [0.0, 0.0, 0.0]
+
+
+def test_pico_workspace_rejection_reanchors_at_last_safe_target():
+    """A rejected overshoot must not leave PICO trapped outside the workspace."""
+    class RejectOnceBroker(Broker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reject_next = True
+            self.safe_target = {
+                "position_m": [0.2, 0.25, 0.35],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            }
+
+        def track_tcp(self, session_id, client_id, sequence, target_pose):
+            self.commands.append({"session_id": session_id, "client_id": client_id,
+                                  "sequence": sequence, "type": "track_tcp",
+                                  "payload": {"target_pose": target_pose}})
+            if self.reject_next:
+                self.reject_next = False
+                return {"ok": False, "result": {
+                    "accepted": False,
+                    "recoverable": True,
+                    "reason": "OSC target is outside the configured workspace",
+                    "safe_target_pose": self.safe_target,
+                }}
+            return {"ok": True, "result": {"accepted": True}}
+
+    broker = RejectOnceBroker()
+    identity = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+    value = PicoInputAdapter(broker, {
+        "position_axis_map": identity,
+        "orientation_axis_map": identity,
+    })
+    value.begin_connection("osc-1", "browser")
+    value.connected()
+    value.anchor_begin({"position_m": [1.0, 2.0, 3.0],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]})
+
+    rejected_pose = {"position_m": [1.8, 2.0, 3.0],
+                     "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                     "tracking_valid": True}
+    result = value.pose(rejected_pose)
+    assert result["accepted"] is False
+    assert result["reanchored_at_safe_target"] is True
+    assert value.snapshot()["last_target_status"] == "LIMITED_REANCHORED"
+
+    # Keeping the controller at the rejected pose now reproduces the last
+    # safe TCP target, exactly like the browser joystick's safe re-anchor.
+    value.pose(rejected_pose)
+    recovered = broker.commands[-1]["payload"]["target_pose"]
+    assert all(math.isclose(actual, expected, abs_tol=1e-9)
+               for actual, expected in zip(recovered["position_m"], broker.safe_target["position_m"]))
+    assert value.snapshot()["state"] == "TRACKING"
 
 
 def test_pico_snapshot_exposes_transmitted_base_frame_target_pose():

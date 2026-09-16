@@ -1153,7 +1153,19 @@ class PicoGateway:
                     self._last_input_frame_euler_degrees = list(euler_degrees) if euler_degrees is not None else None
                 self.trace_logger.append({"record_type": "sample", "event": "gateway_message_received",
                                           "monotonic_ns": gateway_received_ns, "pico_sequence": sequence,
-                                          "message_type": kind, "session_id": usb_session})
+                                          "message_type": kind, "session_id": usb_session,
+                                          # Preserve the exact frame at the
+                                          # first boundary.  Together with the
+                                          # adapter trace this distinguishes a
+                                          # genuine PICO device-origin motion
+                                          # during a wrist turn from an
+                                          # accidental software coupling.
+                                          "position_m": position,
+                                          "orientation_xyzw": orientation,
+                                          "unity_euler_from_quaternion_degrees": _unity_euler_zxy_degrees(orientation),
+                                          "tracking_valid": bool(message.get("tracking_valid", True)),
+                                          "grip": grip,
+                                          "trigger_value": trigger_value})
                 payload: dict[str, Any] = {"position_m": position, "orientation_xyzw": orientation,
                                             "tracking_valid": bool(message.get("tracking_valid", True)),
                                             "grip": grip, "trigger_value": trigger_value,
