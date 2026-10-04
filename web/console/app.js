@@ -11,7 +11,7 @@
       if (label) {
         label.firstChild.textContent = "控制模式";
         const inputLabel = document.createElement("label");
-        inputLabel.innerHTML = '控制方式<select id="input-adapter"><option value="web">网页摇杆</option><option value="pi05">π0.5 自动控制</option><option value="pico">PICO 4 Ultra 手柄遥控</option></select>';
+        inputLabel.innerHTML = '控制方式<select id="input-adapter"><option value="web">网页摇杆</option><option value="pi05">AutoDL云端推理</option><option value="pico">PICO 4 Ultra 手柄遥控</option></select>';
         label.parentElement?.insertBefore(inputLabel, label.nextSibling);
       }
     }
@@ -85,7 +85,7 @@
     if ($("pi05-panel")) return;
     const panel = document.createElement("section");
     panel.id = "pi05-panel"; panel.className = "pi05-panel hidden";
-    panel.innerHTML = `<div class="pi05-observation"><div class="pi05-head"><span class="pi05-index">01</span><div><strong>Observation</strong><small>π0.5 多模态输入</small></div></div><div class="pi05-cameras"><label>外部 RGB<input id="pi05-external-index" type="number" min="0" max="32" value="0"></label><label>腕部 RGB<input id="pi05-wrist-index" type="number" min="0" max="32" value="1"></label></div><div class="pi05-views"><div class="pi05-view"><span>外部视角</span><img id="pi05-external-frame" alt="外部 RGB 实时画面"><b id="pi05-external-preview">等待画面</b></div><div class="pi05-view"><span>腕部视角</span><img id="pi05-wrist-frame" alt="腕部 RGB 实时画面"><b id="pi05-wrist-preview">等待画面</b></div></div><label class="pi05-prompt">Prompt<textarea id="pi05-prompt" maxlength="500">place the fixed block into the fixed box</textarea></label></div><div class="pi05-arrow">→<small>推理中</small></div><div class="pi05-inference"><div class="pi05-head"><span class="pi05-index">02</span><div><strong>π0.5 Inference</strong><small>持续重规划</small></div></div><div class="pi05-orb">π</div><strong id="pi05-model-state">未连接</strong><div class="pi05-metrics"><span>状态<b id="pi05-run-state">IDLE</b></span><span>推理耗时<b id="pi05-inference-ms">--</b></span><span>生成序号<b id="pi05-chunk-length">0</b></span><span>执行动作<b id="pi05-executed">0</b></span></div><div class="pi05-actions"><button id="pi05-cameras" class="button" type="button">初始化相机</button><button id="pi05-start" class="button primary" type="button">启动 π0.5</button><button id="pi05-stop" class="button quiet" type="button">停止</button></div><p id="pi05-result" class="result">Action Chunk 将转换为绝对 TCP 目标，并只通过 OSC track_tcp 输出。</p></div>`;
+    panel.innerHTML = `<div class="pi05-observation"><div class="pi05-head"><span class="pi05-index">01</span><div><strong>观测输入</strong><small>NERO 双 RGB + 8D 状态</small></div></div><div class="pi05-cameras"><label>外部 RGB<input id="pi05-external-index" type="number" min="0" max="32" value="0"></label><label>腕部 RGB<input id="pi05-wrist-index" type="number" min="0" max="32" value="1"></label></div><div class="pi05-views"><div class="pi05-view"><span>外部视角</span><img id="pi05-external-frame" alt="外部 RGB 实时画面"><b id="pi05-external-preview">等待画面</b></div><div class="pi05-view"><span>腕部视角</span><img id="pi05-wrist-frame" alt="腕部 RGB 实时画面"><b id="pi05-wrist-preview">等待画面</b></div></div><div class="pi05-prompt"><label for="pi05-prompt">任务指令</label><textarea id="pi05-prompt" maxlength="500">place the fixed block into the fixed box</textarea><div class="pi05-prompt-footer"><small id="pi05-active-prompt" class="pi05-active-prompt">当前已提交：等待服务状态</small><button id="pi05-prompt-save" class="button" type="button">保存任务文本</button></div></div></div><div class="pi05-arrow">→<small>云端推理</small></div><div class="pi05-inference"><div class="pi05-head"><span class="pi05-index">02</span><div><strong>AutoDL云端推理</strong><small>Nero Chunk 起点相对动作</small></div></div><strong id="pi05-model-state">未连接</strong><div class="pi05-scale"><label for="pi05-action-scale">动作 Δ 缩放 <output id="pi05-action-scale-value">1.00×</output></label><input id="pi05-action-scale" type="range" min="0" max="1" step="0.05" value="1"><small>仅缩放位置/旋转增量；夹爪比例不变</small></div><div class="pi05-metrics"><span>状态<b id="pi05-run-state">IDLE</b></span><span>推理耗时<b id="pi05-inference-ms">--</b></span><span>Chunk 序号<b id="pi05-chunk-length">0</b></span><span>已执行行<b id="pi05-executed">0</b></span></div><div class="pi05-actions"><button id="pi05-cameras" class="button" type="button">初始化相机</button><button id="pi05-start" class="button primary" type="button">启动 AutoDL云端推理</button><button id="pi05-stop" class="button quiet" type="button">停止</button></div><p id="pi05-result" class="result">Nero Action Chunk 将解码为绝对 TCP 目标，并只通过 OSC track_tcp 输出。</p></div>`;
     document.querySelector(".osc-panel")?.append(panel);
     for (const id of ["pi05-external-index", "pi05-wrist-index"]) {
       const input = $(id); const select = document.createElement("select");
@@ -95,26 +95,16 @@
     panel.querySelector(".pi05-cameras")?.insertAdjacentHTML("afterend", `<div class="camera-power"><span id="camera-power-pi05">相机状态：检查中</span><button id="camera-open-pi05" class="button" type="button">打开相机</button><button id="camera-close-pi05" class="button quiet" type="button">关闭相机</button></div>`);
     panel.insertAdjacentHTML("afterbegin", `<section class="pi05-connection"><div class="pi05-connection-title"><span>02 · 连接状态</span><small id="pi05-connection-message">正在检测 SSH 与 OpenPI 连接</small></div><div class="pi05-connection-nodes"><article id="pi05-connection-ssh"></article><i>→</i><article id="pi05-connection-policy"></article></div><details class="pi05-help"><summary>连接帮助 <small>启动顺序与可复制命令</small></summary><div></div></details></section>`);
     const help = panel.querySelector(".pi05-help");
-    help.innerHTML = `<summary><span>连接帮助</span><small>启动顺序与可复制命令</small></summary><div class="help-content"><article class="help-step"><div class="help-title"><b>1</b><strong>启动 NERO 控制服务</strong></div><p>确认 NERO 已通电、CANDO USB-CAN 已连接，且没有其他程序占用设备。</p><div class="command"><code>..\\neroAgilex-control-console\\run_console.cmd</code><button type="button" data-copy="..\\neroAgilex-control-console\\run_console.cmd">复制</button></div><p>打开 <a href="http://127.0.0.1:8765/" target="_blank" rel="noopener">127.0.0.1:8765</a>，确认持续显示最新 7 轴反馈。若显示 HTTP 502，通常是未通电、USB-CAN/驱动未连接、设备被占用或控制服务环境异常；先恢复有效反馈，第一个绿灯才会亮起。</p></article><article class="help-step"><div class="help-title"><b>2</b><strong>建立 SSH 本地转发</strong></div><p>在新的 PowerShell 窗口执行，将下方占位符替换为云平台提供的 SSH 信息：</p><div class="command"><code>ssh -t \`\n  -o LogLevel=QUIET \`\n  -o ServerAliveInterval=15 \`\n  -o ServerAliveCountMax=3 \`\n  -L 8000:127.0.0.1:8000 \`\n  -p &lt;ssh-port&gt; \`\n  &lt;user&gt;@&lt;remote-host&gt;</code></div><p>实例地址、端口或密码请使用你当前云平台提供的信息。本机验证：<code>Test-NetConnection 127.0.0.1 -Port 8000</code>；看到 <code>TcpTestSucceeded : True</code> 即隧道已建立。</p></article><article class="help-step"><div class="help-title"><b>3</b><strong>启动 π0.5 policy server</strong></div><p>在远程终端进入你的 policy server 目录并保持终端运行：</p><div class="command"><code>cd &lt;policy-server-directory&gt;\nexport PATH=&quot;$HOME/.local/bin:$PATH&quot;\nexport BOTO_CONFIG=&quot;$HOME/.boto&quot;\nuv run --frozen --no-sync scripts/serve_policy.py --env LIBERO</code></div><p>SSH 仅转发端口，不会自动启动 policy server。</p></article><div class="help-ready"><strong>4. 刷新面板</strong><span>保持控制服务、SSH 隧道和 policy server 都在运行，刷新 <a href="http://127.0.0.1:8765/" target="_blank" rel="noopener">127.0.0.1:8765</a>。正常顺序：NERO 控制服务 → SSH 本地转发 → π0.5 WebSocket，三个状态均为绿色。</span></div></div>`;
-    // The control service is already running when this card is shown. Keep
-    // this help focused on the two remote-connection steps only.
-    help.querySelector(".help-step")?.remove();
-    help.querySelector(".help-ready")?.remove();
-    help.querySelectorAll(".help-step").forEach((step, index) => {
-      const number = step.querySelector(".help-title b");
-      if (number) number.textContent = String(index + 1);
-    });
-    const policyStep = help.querySelectorAll(".help-step")[1];
-    policyStep?.querySelector("p")?.replaceChildren("在第 1 步登录后的远程终端执行，并保持终端运行：");
+    help.innerHTML = `<summary><span>连接帮助</span><small>启动顺序与可复制命令</small></summary><div class="help-content"><article class="help-step"><div class="help-title"><b>1</b><strong>建立 SSH 本地转发</strong></div><p>在本机 PowerShell 中执行，并把占位符替换为云平台提供的 SSH 信息：</p><div class="command"><code>ssh \`\n  -o LogLevel=QUIET \`\n  -o ServerAliveInterval=15 \`\n  -o ServerAliveCountMax=3 \`\n  -N \`\n  -L 8000:127.0.0.1:8000 \`\n  -p &lt;ssh-port&gt; \`\n  &lt;user&gt;@&lt;remote-host&gt;</code></div><p>保持该窗口运行。本机验证：<code>Test-NetConnection 127.0.0.1 -Port 8000</code>；看到 <code>TcpTestSucceeded : True</code> 即隧道已建立。</p></article><article class="help-step"><div class="help-title"><b>2</b><strong>启动 AutoDL OpenPI policy server</strong></div><p>在 AutoDL 实例的 OpenPI 项目目录执行。端口必须放在 <code>policy:checkpoint</code> 子命令之前；请用训练时的配置名和要加载的 checkpoint 路径替换占位符：</p><div class="command"><code>cd &lt;openpi-project-directory&gt;\n\nexport PATH=&quot;$HOME/.local/bin:$PATH&quot;\nexport BOTO_CONFIG=&quot;$HOME/.boto&quot;\n\nuv run --frozen --no-sync scripts/serve_policy.py \\\n  --port &lt;policy-port&gt; \\\n  policy:checkpoint \\\n  --policy.config=&lt;training-config-name&gt; \\\n  --policy.dir=&lt;checkpoint-directory&gt;</code></div><p>保持该进程运行；SSH 隧道只负责把本机端口转发至这项服务，不会自动启动 policy server。</p></article></div>`;
     help.querySelectorAll("[data-copy]").forEach((button) => button.addEventListener("click", async () => { await navigator.clipboard.writeText(button.dataset.copy || ""); const original = button.textContent; button.textContent = "已复制"; setTimeout(() => { button.textContent = original; }, 1200); }));
-    panel.querySelector(".pi05-inference")?.insertAdjacentHTML("beforeend", `<div class="pi05-chunk"><span>Action Chunk（首步）</span><code id="pi05-action-first">等待推理结果</code></div>`);
+    panel.querySelector(".pi05-inference")?.insertAdjacentHTML("beforeend", `<div class="pi05-chunk"><span>Nero Chunk 首行目标</span><code id="pi05-action-first">等待推理结果</code><code id="pi05-chunk-base">起点 TCP --</code><small id="pi05-rejection">--</small><small id="pi05-websocket-diagnostic">WebSocket：等待连接诊断</small></div>`);
     const actionControls = panel.querySelector(".pi05-actions");
     actionControls.className = "pi05-adapter-actions";
     panel.append(actionControls);
     panel.querySelector(".pi05-inference .pi05-index").textContent = "03";
-    $("pi05-start").textContent = "接入 π0.5";
-    $("pi05-stop").textContent = "断开 π0.5";
-    // π0.5 follows the same compact input-adapter rhythm as the WebAdapter:
+    $("pi05-start").textContent = "接入 AutoDL云端推理";
+    $("pi05-stop").textContent = "断开 AutoDL云端推理";
+    // AutoDL follows the same compact input-adapter rhythm as the WebAdapter:
     // input first, diagnostics beside it, connection and actions below.
     const observation = panel.querySelector(".pi05-observation");
     const inference = panel.querySelector(".pi05-inference");
@@ -129,13 +119,16 @@
     });
     inference?.querySelector(".pi05-index")?.remove();
     $("pi05-cameras")?.remove();
-    if (prompt) prompt.firstChild.textContent = "Prompt";
+    if (prompt) {
+      prompt.querySelector("label")?.replaceChildren("Prompt");
+    }
     const inferenceTitle = inference?.querySelector(".pi05-head strong");
-    if (inferenceTitle) inferenceTitle.textContent = "π0.5 自动控制";
+    if (inferenceTitle) inferenceTitle.textContent = "AutoDL云端推理";
     const inferenceHint = inference?.querySelector(".pi05-head small");
-    if (inferenceHint) inferenceHint.textContent = "根据相机画面生成下一步动作";
+    if (inferenceHint) inferenceHint.textContent = "Nero Chunk · checkpoint 6000";
     const chunkTitle = chunk?.querySelector("span");
-    if (chunkTitle) chunkTitle.textContent = "Action Chunk";
+    if (chunkTitle) chunkTitle.textContent = "Nero Chunk";
+    chunk?.insertAdjacentHTML("beforeend", '<div class="pi05-action-chunk"><span>Action Chunk · 前 5 行（原始 Δ）</span><pre id="pi05-action-chunk-rows">等待推理结果</pre></div>');
     const inferenceStack = document.createElement("div");
     inferenceStack.className = "pi05-inference-stack";
     if (inference) inferenceStack.append(inference);
@@ -145,8 +138,8 @@
     if (observation) row.append(observation);
     row.append(inferenceStack);
     panel.replaceChildren(row, connection, actionControls);
-    $("pi05-start").textContent = "开始自动控制";
-    $("pi05-stop").textContent = "停止自动控制";
+    $("pi05-start").textContent = "开始 AutoDL云端推理";
+    $("pi05-stop").textContent = "停止 AutoDL云端推理";
     [".sticks", ".intent-readout", ".keyboard-map", ".session-actions", "#pico-connection"].forEach((selector) => document.querySelector(selector)?.setAttribute("data-web-adapter", ""));
   }
 
@@ -330,8 +323,7 @@
     $("pi05-panel")?.classList.toggle("hidden", !pi);
     $("pico-panel")?.classList.toggle("hidden", !pico);
     const note = document.querySelector(".osc-panel .section-note");
-    if (note) note.textContent = pi ? "π0.5 将双相机观测与 OSC 状态送入 OpenPI，并把 Action Chunk 转换为绝对 TCP 目标。" : pico ? "PICO Adapter 在 OSC 外部处理 Anchor，并只向 OSC 发送绝对 TCP 目标。" : "WebAdapter 将网页摇杆增量转换为基座系绝对 TCP 目标，并接入 OSC。";
-    if (note) note.textContent = pi ? "π0.5 会查看两路相机画面，自动生成并执行下一步机械臂动作。" : pico ? "用 PICO 手柄遥控机械臂：按住右手 Grip 才会移动，松开即停止。" : "用网页摇杆控制机械臂；系统会自动把摇杆动作变成机械臂末端的目标位置。";
+    if (note) note.textContent = pi ? "AutoDL云端推理会查看两路相机画面，按起点相对 Nero Chunk 自动生成并执行下一步机械臂动作。" : pico ? "用 PICO 手柄遥控机械臂：按住右手 Grip 才会移动，松开即停止。" : "用网页摇杆控制机械臂；系统会自动把摇杆动作变成机械臂末端的目标位置。";
     if (pi || pico) {
       void loadSharedCameras();
       if (!state.cameras?.ready) void activateSharedCameras();
@@ -503,7 +495,7 @@
     finally { state.picoMappingBusy = false; render(); }
   }
   async function resetPicoAnchor() { try { state.pico = await api("/api/adapters/pico/rebase", "POST", { session_id: session().id, client_id: clientId }); render(); } catch (error) { phase(`PICO 重置失败：${error.message}`, true); } }
-  const datasetSourceLabel = (source) => ({ web: "网页摇杆", pi05: "π0.5", pico: "PICO 4 Ultra" }[source] || "网页摇杆");
+  const datasetSourceLabel = (source) => ({ web: "网页摇杆", pi05: "AutoDL云端推理", pico: "PICO 4 Ultra" }[source] || "网页摇杆");
   const datasetBytes = (value) => {
     const bytes = Math.max(0, Number(value) || 0); const units = ["B", "KB", "MB", "GB"]; let index = 0; let size = bytes;
     while (size >= 1024 && index < units.length - 1) { size /= 1024; index += 1; }
@@ -597,30 +589,64 @@
     const pi = state.pi05 || {}; const config = pi.config || {}; const cameras = config.cameras || {}; const model = config.model || {};
     if ($("pi05-external-index") && document.activeElement !== $("pi05-external-index")) $("pi05-external-index").value = cameras.external?.index ?? 0;
     if ($("pi05-wrist-index") && document.activeElement !== $("pi05-wrist-index")) $("pi05-wrist-index").value = cameras.wrist?.index ?? 1;
-    if ($("pi05-prompt") && document.activeElement !== $("pi05-prompt")) $("pi05-prompt").value = model.prompt || pi.prompt || "";
+    const promptInput = $("pi05-prompt");
+    const serverPrompt = model.prompt || pi.prompt || "";
+    // Periodic telemetry refreshes must never overwrite a task the operator
+    // has typed but not yet received an explicit save confirmation for.
+    if (promptInput && !state.pi05PromptDirty && !state.pi05PromptSaving && document.activeElement !== promptInput) promptInput.value = serverPrompt;
+    const actionDeltaScale = Number(config.execution?.action_delta_scale ?? 1);
+    if ($("pi05-action-scale") && document.activeElement !== $("pi05-action-scale")) $("pi05-action-scale").value = String(actionDeltaScale);
+    if ($("pi05-action-scale-value")) $("pi05-action-scale-value").textContent = `${actionDeltaScale.toFixed(2)}×`;
+    const submittedPrompt = String(pi.prompt || model.prompt || "").trim();
+    const submittedPromptView = $("pi05-active-prompt");
+    if (submittedPromptView) submittedPromptView.textContent = submittedPrompt ? `当前已提交给 AutoDL：${submittedPrompt}` : "当前已提交给 AutoDL：--";
     $("pi05-model-state").textContent = pi.model_state || "UNKNOWN";
     $("pi05-run-state").textContent = pi.state || "IDLE";
     $("pi05-inference-ms").textContent = Number.isFinite(Number(pi.inference_ms)) ? `${Number(pi.inference_ms).toFixed(0)} ms` : "--";
     $("pi05-chunk-length").textContent = String(pi.chunk_sequence || 0);
     $("pi05-executed").textContent = String(pi.executed_steps || 0);
-    const firstAction = Array.isArray(pi.action_chunk) && Array.isArray(pi.action_chunk[0]) ? pi.action_chunk[0] : null;
-    $("pi05-action-first").textContent = firstAction ? `[${firstAction.map((value) => Number(value).toFixed(3)).join(", ")}]` : "等待推理结果";
-    const result = $("pi05-result"); if (result) result.textContent = pi.last_error || "";
+    const firstTarget = pi.decoded_first_target;
+    $("pi05-action-first").textContent = firstTarget ? `P [${firstTarget.position_m.map((value) => Number(value).toFixed(3)).join(", ")}] · Q [${firstTarget.orientation_xyzw.map((value) => Number(value).toFixed(3)).join(", ")}]` : "等待推理结果";
+    const base = pi.inference_base_tcp;
+    $("pi05-chunk-base").textContent = base ? `起点 P [${base.position_m.map((value) => Number(value).toFixed(3)).join(", ")}]` : "起点 TCP --";
+    const gripDiagnostic = pi.gripper_ratio_diagnostic;
+    const boundaryMessage = gripDiagnostic?.status === "boundary_normalized"
+      ? `夹爪比例边界归一化：第 ${Number(gripDiagnostic.action_index) + 1} 行 ${Number(gripDiagnostic.raw_ratio).toFixed(6)} → ${Number(gripDiagnostic.command_ratio).toFixed(3)}（容差 ±${Number(gripDiagnostic.tolerance).toFixed(4)}）`
+      : "";
+    $("pi05-rejection").textContent = pi.last_rejection || boundaryMessage;
+    const chunkRows = $("pi05-action-chunk-rows");
+    if (chunkRows) {
+      const rows = Array.isArray(pi.action_chunk) ? pi.action_chunk.slice(0, 5) : [];
+      chunkRows.textContent = rows.length ? rows.map((row, index) => {
+        if (!Array.isArray(row) || row.length !== 7) return `${String(index).padStart(2, "0")}  无效动作行`;
+        const values = row.map((value) => Number(value));
+        return `${String(index).padStart(2, "0")}  Δp [${values.slice(0, 3).map((v) => v.toFixed(4)).join(", ")}]  Δr [${values.slice(3, 6).map((v) => v.toFixed(4)).join(", ")}]  g ${values[6].toFixed(3)}`;
+      }).join("\n") : "等待推理结果";
+    }
+    const diagnostics = pi.websocket_diagnostics || {};
+    const diagnosticView = $("pi05-websocket-diagnostic");
+    if (diagnosticView) {
+      const last = diagnostics.last_event || "等待连接诊断";
+      const input = diagnostics.last_input;
+      const frameText = input ? ` · RGB ${input.external_rgb} / ${input.wrist_rgb} · state ${input.state}` : "";
+      diagnosticView.textContent = `WebSocket：连接 ${diagnostics.connect_successes || 0}/${diagnostics.connect_attempts || 0} · 断开 ${diagnostics.disconnects || 0} · Ping失败 ${diagnostics.ping_failures || 0} · 推理失败 ${diagnostics.inference_failures || 0} · ${last}${frameText}`;
+    }
+    const result = $("pi05-result"); if (result) result.textContent = pi.last_error || state.pi05PromptNotice || "";
     $("pi05-external-preview").textContent = pi.camera_ready ? "模型输入 224 × 224 RGB" : "等待画面";
     $("pi05-wrist-preview").textContent = pi.camera_ready ? "模型输入 224 × 224 RGB" : "等待画面";
     refreshPi05Frames();
     if ($("pi05-cameras")) $("pi05-cameras").disabled = pi.state === "RUNNING";
     $("pi05-start").disabled = pi.execution_enabled === true || !pi.camera_ready;
     $("pi05-stop").disabled = pi.execution_enabled !== true;
-    $("pi05-start").textContent = "开始自动控制";
-    $("pi05-stop").textContent = "停止自动控制";
+    $("pi05-start").textContent = "开始 AutoDL云端推理";
+    $("pi05-stop").textContent = "停止 AutoDL云端推理";
     renderPi05Connections(pi.connections || {});
   }
 
   function renderPi05Connections(connections) {
-    const map = [["pi05-connection-ssh", connections.ssh_forward, "SSH 本地转发", "127.0.0.1:8000"], ["pi05-connection-policy", connections.policy, "π0.5 WebSocket", "OpenPI policy server"]];
+    const map = [["pi05-connection-ssh", connections.ssh_forward, "SSH 本地转发", "127.0.0.1:8000"], ["pi05-connection-policy", connections.policy, "AutoDL Policy WebSocket", "OpenPI policy server"]];
     map.forEach(([id, item, fallbackLabel, fallbackEndpoint]) => { const element = $(id); if (!element) return; const stateName = item?.state || "bad"; element.className = `pi05-connection-node ${stateName}`; element.innerHTML = `<b>${item?.label || fallbackLabel}</b><small>${item?.endpoint || fallbackEndpoint}</small><em>${item?.message || "等待连接检测"}</em>`; });
-    const message = $("pi05-connection-message"); if (message) message.textContent = connections.policy?.state === "ok" ? "连接完成，可以接入 π0.5" : "请依次检查 OSC 服务、SSH 转发和 OpenPI policy server";
+    const message = $("pi05-connection-message"); if (message) message.textContent = connections.policy?.state === "ok" ? "连接完成，可以接入 AutoDL云端推理" : "请依次检查 OSC 服务、SSH 转发和 AutoDL policy server";
   }
 
   function cameraConfigBody() { return { cameras: {
@@ -1023,7 +1049,7 @@
     // A successful /api/status response already proves that the service is
     // online. This flag describes only the USB-CAN robot transport.
     badge("connection", transport.connected ? "\u786c\u4ef6\u5df2\u8fde\u63a5" : "\u786c\u4ef6\u672a\u8fde\u63a5", transport.connected ? "ok" : "warn");
-    const adapterName = selectedAdapter() === "pi05" ? "π0.5" : selectedAdapter() === "pico" ? "PICO 4 Ultra" : "WebAdapter";
+    const adapterName = selectedAdapter() === "pi05" ? "AutoDL云端推理" : selectedAdapter() === "pico" ? "PICO 4 Ultra" : "WebAdapter";
     const modeLabel = current.state === "ACTIVE" ? `${adapterName} + ${isShadowSession(current) ? "影子" : "真机"}` : "未接入";
     badge("osc-mode", modeLabel, current.state === "ACTIVE" && isShadowSession(current) ? "ok" : current.state === "ACTIVE" ? "warn" : "neutral");
     badge("session-state", current.state || "IDLE", current.state === "ACTIVE" ? "ok" : "neutral");
@@ -1234,21 +1260,52 @@
     return { model: { prompt: $("pi05-prompt")?.value || "" }, cameras: {
       external: { index: Number($("pi05-external-index")?.value), width: 640, height: 480 },
       wrist: { index: Number($("pi05-wrist-index")?.value), width: 640, height: 480 },
-    }};
+    }, execution: { action_delta_scale: Number($("pi05-action-scale")?.value ?? 1) }};
   }
 
-  let pi05PromptTimer = null;
   async function commitPi05Prompt() {
     const prompt = $("pi05-prompt")?.value?.trim() || "";
-    if (!prompt) return;
+    if (!prompt) {
+      state.pi05PromptNotice = "任务文本不能为空。";
+      renderPi05();
+      return;
+    }
+    const revision = (state.pi05PromptRevision || 0) + 1;
+    state.pi05PromptRevision = revision;
+    state.pi05PromptSaving = true;
+    state.pi05PromptDirty = true;
+    state.pi05PromptNotice = "正在保存任务文本…";
+    renderPi05();
     try {
-      state.pi05 = await api("/api/pi05/config", "POST", { model: { prompt } }, 5000);
+      const confirmed = await api("/api/pi05/config", "POST", { model: { prompt } }, 5000);
+      if (revision !== state.pi05PromptRevision) return;
+      const savedPrompt = String(confirmed?.config?.model?.prompt || confirmed?.prompt || "").trim();
+      if (savedPrompt !== prompt) throw new Error("服务返回的任务文本与提交值不一致");
+      state.pi05 = confirmed;
+      state.pi05PromptDirty = false;
+      state.pi05PromptNotice = "任务文本已保存；当前及下次重启后的 AutoDL云端推理都会使用它。";
+      if ($("pi05-prompt")) $("pi05-prompt").value = savedPrompt;
+      renderPi05();
+    } catch (error) {
+      if (revision !== state.pi05PromptRevision) return;
+      state.pi05PromptNotice = `任务文本保存失败：${error.message}`;
+      renderPi05();
+    } finally {
+      if (revision === state.pi05PromptRevision) state.pi05PromptSaving = false;
+    }
+  }
+
+  async function savePi05ActionScale() {
+    const scale = Number($("pi05-action-scale")?.value);
+    if (!Number.isFinite(scale) || scale < 0 || scale > 1) return;
+    try {
+      state.pi05 = await api("/api/pi05/config", "POST", { execution: { action_delta_scale: scale } }, 5000);
       const result = $("pi05-result");
-      if (result) result.textContent = "Prompt 已提交，下一轮推理将使用新任务说明。";
+      if (result) result.textContent = `动作 Δ 缩放已保存为 ${scale.toFixed(2)}×；夹爪比例保持原样。`;
       renderPi05();
     } catch (error) {
       const result = $("pi05-result");
-      if (result) result.textContent = `Prompt 提交失败：${error.message}`;
+      if (result) result.textContent = `动作 Δ 缩放保存失败：${error.message}`;
     }
   }
 
@@ -1304,20 +1361,20 @@
       }
       // Cameras and inference are already running; this button only enables
       // forwarding the latest Action Chunk to OSC.
-      await api("/api/pi05/config", "POST", { model: { prompt: $("pi05-prompt")?.value || "" } });
+      await api("/api/pi05/config", "POST", { model: { prompt: $("pi05-prompt")?.value || "" }, execution: { action_delta_scale: Number($("pi05-action-scale")?.value ?? 1) } });
       state.pi05 = await api("/api/pi05/start", "POST", { session_id: current.id, client_id: clientId }, 10000);
       phase(current.execution_mode === "shadow"
-        ? "π0.5 已开启，但当前是影子模式，不会驱动真机；请切换为真机模式"
-        : "π0.5 已开启，Action Chunk 正在发送给 OSC 执行");
+        ? "AutoDL云端推理已开启，但当前是影子模式，不会驱动真机；请切换为真机模式"
+        : "AutoDL云端推理已开启，Nero Chunk 正在发送给 OSC 执行");
       render();
-    } catch (error) { phase(`π0.5 启动失败：${error.message}`, true); await refresh(); }
+    } catch (error) { phase(`AutoDL云端推理启动失败：${error.message}`, true); await refresh(); }
   }
 
   async function stopPi05() {
     try {
       state.pi05 = await api("/api/pi05/stop", "POST", { reason: "operator stopped pi05 adapter" });
-      phase("π0.5 推理继续运行，已停止向 OSC 输出 Action Chunk"); render();
-    } catch (error) { phase(`π0.5 停止失败：${error.message}`, true); }
+      phase("AutoDL云端推理继续运行，已停止向 OSC 输出 Nero Chunk"); render();
+    } catch (error) { phase(`AutoDL云端推理停止失败：${error.message}`, true); }
   }
 
   function stopWebAdapterForPageExit(reason) {
@@ -1487,11 +1544,17 @@
   $("start").onclick = connectWebAdapter;
   $("stop").onclick = disconnectWebAdapter;
   $("pi05-cameras")?.addEventListener("click", activateSharedCameras);
-  $("pi05-prompt")?.addEventListener("change", () => { void commitPi05Prompt(); });
   $("pi05-prompt")?.addEventListener("input", () => {
-    clearTimeout(pi05PromptTimer);
-    pi05PromptTimer = setTimeout(() => { void commitPi05Prompt(); }, 700);
+    state.pi05PromptDirty = true;
+    state.pi05PromptNotice = "任务文本已修改，点击“保存任务文本”后才会提交给 AutoDL。";
+    renderPi05();
   });
+  $("pi05-prompt-save")?.addEventListener("click", () => { void commitPi05Prompt(); });
+  $("pi05-action-scale")?.addEventListener("input", () => {
+    const value = Number($("pi05-action-scale")?.value ?? 1);
+    if ($("pi05-action-scale-value")) $("pi05-action-scale-value").textContent = `${value.toFixed(2)}×`;
+  });
+  $("pi05-action-scale")?.addEventListener("change", () => { void savePi05ActionScale(); });
   $("pi05-start")?.addEventListener("click", startPi05);
   $("pi05-stop")?.addEventListener("click", stopPi05);
   $("pico-start")?.addEventListener("click", startPico);

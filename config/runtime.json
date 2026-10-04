@@ -1,4 +1,4 @@
-{
+﻿{
   "schema_version": 1,
   "created_for": "phase3_lightweight_runtime",
   "sdk": {
@@ -67,9 +67,9 @@
     "usb_reconnect_interval_s": 3.0
   },
   "pico_adapter": {
-    "mapping_verified": true,
+    "mapping_verified": false,
     "translation_gain": 1.0,
-    "rotation_gain": 0.9,
+    "rotation_gain": 1.0,
     "position_axis_map": [
       [
         0.0,
@@ -91,16 +91,16 @@
       [
         0.0,
         0.0,
-        -1.0
+        1.0
       ],
       [
-        1.0,
         0.0,
+        -1.0,
         0.0
       ],
       [
+        -1.0,
         0.0,
-        1.0,
         0.0
       ]
     ],

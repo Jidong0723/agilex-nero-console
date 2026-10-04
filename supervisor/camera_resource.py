@@ -439,9 +439,26 @@ class SharedCameraResource:
             return self.snapshot()
 
     def read(self) -> tuple[Any, Any]:
-        with self.lock: cameras = self.cameras
-        if cameras is None: raise RuntimeError("activate the external and wrist cameras first")
-        return cameras.read()
+        """Return the latest complete pair, never a transient ``None`` frame.
+
+        ``CameraPair.read`` reports only whichever asynchronous device reads
+        completed in that instant.  A policy request needs both images; passing
+        its temporary missing side through MessagePack becomes a 0-D ndarray in
+        OpenPI and makes the remote image transform fail.  The preview owner
+        already maintains validated latest RGB frames, so wait briefly for that
+        pair instead of issuing an invalid policy request.
+        """
+        deadline = time.monotonic() + 1.5
+        with self.frame_condition:
+            while True:
+                external, wrist = self.frames.get("external"), self.frames.get("wrist")
+                if external is not None and wrist is not None:
+                    return external, wrist
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    missing = ", ".join(source for source, frame in (("external", external), ("wrist", wrist)) if frame is None)
+                    raise RuntimeError(f"shared camera frames unavailable: {missing}")
+                self.frame_condition.wait(remaining)
 
     def frame_jpeg(self, source: str, target_monotonic_ns: int | None = None) -> bytes | None:
         with self.lock:

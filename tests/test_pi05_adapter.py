@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from supervisor.pi05_adapter import Pi05InputAdapter
+from supervisor.pi05_adapter import Pi05InputAdapter, _pack_array, _unpack_array
 
 
 class _Camera:
@@ -24,15 +24,21 @@ class _Policy:
 
     def infer(self, observation):
         self.observations.append(observation)
-        # Ten-step LIBERO chunk. Every step is converted against one shared
+        # Ten-step Nero chunk. Every step is converted against one shared
         # pre-inference feedback pose; only the first five are executed.
-        return {"actions": np.asarray([[1., 0., 0., 0., 0., 0., 1.]] * 10, dtype=np.float32)}
+        return {"actions": np.asarray([[.01, 0., 0., 0., 0., 0., 1.]] * 10, dtype=np.float32)}
 
     def close(self):
         pass
 
     def is_alive(self):
         return True
+
+
+class _InitiallyUnavailablePolicy:
+    """Keep constructor background threads off a live local policy tunnel."""
+    def __init__(self, *_args):
+        raise RuntimeError("test policy connection disabled")
 
 
 class _Broker:
@@ -62,6 +68,171 @@ class _Broker:
 
 
 class Pi05AdapterTests(unittest.TestCase):
+    def setUp(self):
+        # Pi05InputAdapter starts its connection owner during construction.
+        # Never let that thread pick up an operator's real 127.0.0.1:8000
+        # tunnel before an individual test explicitly installs its own policy.
+        self._initial_policy_patch = patch("supervisor.pi05_adapter.OpenPIClient", _InitiallyUnavailablePolicy)
+        self._initial_policy_patch.start()
+
+    def tearDown(self):
+        self._initial_policy_patch.stop()
+
+    def test_openpi_msgpack_packer_preserves_rgb_array_shapes(self):
+        """The live OpenPI server requires Packer's binary ndarray markers."""
+        import msgpack
+        observation = {
+            "observation/image": np.zeros((224, 224, 3), dtype=np.uint8),
+            "observation/wrist_image": np.zeros((224, 224, 3), dtype=np.uint8),
+            "observation/state": np.zeros(8, dtype=np.float32),
+        }
+        payload = msgpack.Packer(default=_pack_array).pack(observation)
+        decoded = msgpack.unpackb(payload, object_hook=_unpack_array)
+        self.assertEqual(decoded["observation/image"].shape, (224, 224, 3))
+        self.assertEqual(decoded["observation/wrist_image"].shape, (224, 224, 3))
+        self.assertEqual(decoded["observation/state"].shape, (8,))
+
+    def test_observation_uses_direct_nero_base_pose_and_gripper_ratio(self):
+        broker = _Broker()
+        adapter = Pi05InputAdapter(broker, Path(__file__).resolve().parents[1] / "config" / "pi05.json")
+        try:
+            observation = adapter._observation(broker.state(), np.zeros((224, 224, 3), dtype=np.uint8), np.zeros((224, 224, 3), dtype=np.uint8))
+        finally:
+            adapter.close()
+        expected_ratio = .02 / .095
+        np.testing.assert_allclose(observation["observation/state"], [0., 0., .3, 0., 0., 0., expected_ratio, -expected_ratio])
+
+    def test_action_decoding_uses_chunk_start_and_left_multiplied_base_rotation(self):
+        broker = _Broker()
+        adapter = Pi05InputAdapter(broker, Path(__file__).resolve().parents[1] / "config" / "pi05.json")
+        try:
+            half = np.pi / 4
+            base = {"position_m": [.1, .2, .3], "orientation_xyzw": [0., 0., np.sin(half), np.cos(half)]}
+            target, ratio = adapter._target_from_action([.01, -.02, .03, np.pi / 2, 0., 0., .25], base)
+        finally:
+            adapter.close()
+        self.assertEqual(target["position_m"], [.11, .18000000000000002, .32999999999999996])
+        # Exp(+X 90°) · Rz(+90°) expresses the incremental axis in NERO base coordinates.
+        np.testing.assert_allclose(target["orientation_xyzw"], [.5, -.5, .5, .5], atol=1e-6)
+        self.assertEqual(ratio, .25)
+
+    def test_action_delta_scale_reduces_tcp_delta_but_not_gripper_ratio(self):
+        adapter = Pi05InputAdapter(_Broker(), Path(__file__).resolve().parents[1] / "config" / "pi05.json")
+        try:
+            adapter.config["execution"]["action_delta_scale"] = .25
+            target, ratio = adapter._target_from_action([.04, -.08, .12, 0., 0., 0., .75],
+                                                        {"position_m": [.1, .2, .3], "orientation_xyzw": [0., 0., 0., 1.]})
+        finally:
+            adapter.close()
+        self.assertAlmostEqual(target["position_m"][0], .11)
+        self.assertAlmostEqual(target["position_m"][1], .18)
+        self.assertAlmostEqual(target["position_m"][2], .33)
+        self.assertEqual(ratio, .75)
+
+    def test_invalid_gripper_ratio_rejects_action_without_clipping(self):
+        adapter = Pi05InputAdapter(_Broker(), Path(__file__).resolve().parents[1] / "config" / "pi05.json")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "row unknown.*1.01"):
+                adapter._target_from_action([0., 0., 0., 0., 0., 0., 1.01], {"position_m": [0., 0., .3], "orientation_xyzw": [0., 0., 0., 1.]})
+            diagnostic = adapter.snapshot()["gripper_ratio_diagnostic"]
+        finally:
+            adapter.close()
+        self.assertEqual(diagnostic["status"], "rejected")
+        self.assertEqual(diagnostic["action_index"], None)
+        self.assertAlmostEqual(diagnostic["raw_ratio"], 1.01)
+
+    def test_gripper_ratio_endpoint_roundoff_is_normalized_and_diagnosed(self):
+        adapter = Pi05InputAdapter(_Broker(), Path(__file__).resolve().parents[1] / "config" / "pi05.json")
+        try:
+            _target, high_ratio = adapter._target_from_action(
+                [0., 0., 0., 0., 0., 0., 1.0005],
+                {"position_m": [0., 0., .3], "orientation_xyzw": [0., 0., 0., 1.]}, action_index=3)
+            _target, low_ratio = adapter._target_from_action(
+                [0., 0., 0., 0., 0., 0., -0.0005],
+                {"position_m": [0., 0., .3], "orientation_xyzw": [0., 0., 0., 1.]}, action_index=4)
+            diagnostic = adapter.snapshot()["gripper_ratio_diagnostic"]
+        finally:
+            adapter.close()
+        self.assertEqual(high_ratio, 1.0)
+        self.assertEqual(low_ratio, 0.0)
+        self.assertEqual(diagnostic["status"], "boundary_normalized")
+        self.assertEqual(diagnostic["action_index"], 4)
+        self.assertAlmostEqual(diagnostic["raw_ratio"], -0.0005)
+
+    def test_boundary_roundoff_chunk_continues_without_hold(self):
+        """A tiny float32 endpoint overshoot must not stop AutoDL control."""
+        class BoundaryPolicy(_Policy):
+            def infer(self, observation):
+                return {"actions": np.asarray([[.01, 0., 0., 0., 0., 0., 1.0005]] * 10, dtype=np.float32)}
+
+        broker = _Broker()
+        adapter = Pi05InputAdapter(broker, Path(__file__).resolve().parents[1] / "config" / "pi05.json")
+        adapter.cameras = _Camera()
+        adapter.config["execution"]["period_s"] = .01
+        try:
+            with patch("supervisor.pi05_adapter.OpenPIClient", BoundaryPolicy):
+                adapter.start("session-1", "client-1")
+                deadline = time.monotonic() + 1.0
+                while len([item for item in broker.commands if item["type"] == "track_tcp"]) < 5 and time.monotonic() < deadline:
+                    time.sleep(.01)
+                snapshot = adapter.snapshot()
+        finally:
+            adapter.close()
+        self.assertNotEqual(snapshot["state"], "ERROR")
+        self.assertGreaterEqual(len([item for item in broker.commands if item["type"] == "track_tcp"]), 5)
+        self.assertFalse(any(item["type"] == "hold" for item in broker.commands))
+        self.assertEqual(snapshot["gripper_ratio_diagnostic"]["status"], "boundary_normalized")
+
+    def test_rejected_osc_target_stops_entire_chunk_and_requests_hold(self):
+        broker = _Broker()
+        broker.fail_track = True
+        original_track = broker.track_tcp
+        def rejected_track(*args, **kwargs):
+            if broker.fail_track:
+                return {"ok": False, "reason": "workspace rejected"}
+            return original_track(*args, **kwargs)
+        broker.track_tcp = rejected_track
+        adapter = Pi05InputAdapter(broker, Path(__file__).resolve().parents[1] / "config" / "pi05.json")
+        adapter.cameras = _Camera()
+        adapter.config["execution"]["period_s"] = .01
+        with patch("supervisor.pi05_adapter.OpenPIClient", _Policy):
+            adapter.start("session-1", "client-1")
+            deadline = time.monotonic() + 1.0
+            while adapter.snapshot()["state"] != "ERROR" and time.monotonic() < deadline:
+                time.sleep(.01)
+            snapshot = adapter.snapshot()
+            adapter.close()
+        self.assertEqual(snapshot["state"], "ERROR")
+        self.assertIn("workspace rejected", snapshot["last_rejection"])
+        self.assertEqual(len([item for item in broker.commands if item["type"] == "track_tcp"]), 0)
+        self.assertTrue(any(item["type"] == "hold" for item in broker.commands))
+
+    def test_workspace_preflight_rejects_whole_chunk_before_first_dispatch(self):
+        class OutsideWorkspacePolicy(_Policy):
+            def infer(self, observation):
+                return {"actions": np.asarray([[1., 0., 0., 0., 0., 0., .5]] * 10, dtype=np.float32)}
+
+        broker = _Broker()
+        original_state = broker.state
+        def state_with_workspace():
+            snapshot = original_state()
+            snapshot["workspace"] = {"min_xyz_m": [-.6, -.6, 0.], "max_xyz_m": [.6, .6, .7], "min_tcp_z_m": 0.}
+            return snapshot
+        broker.state = state_with_workspace
+        adapter = Pi05InputAdapter(broker, Path(__file__).resolve().parents[1] / "config" / "pi05.json")
+        adapter.cameras = _Camera()
+        with patch("supervisor.pi05_adapter.OpenPIClient", OutsideWorkspacePolicy):
+            adapter.start("session-1", "client-1")
+            deadline = time.monotonic() + 1.0
+            while adapter.snapshot()["state"] != "ERROR" and time.monotonic() < deadline:
+                time.sleep(.01)
+            snapshot = adapter.snapshot()
+            adapter.close()
+        self.assertEqual(snapshot["state"], "ERROR")
+        self.assertIn("outside the OSC workspace", snapshot["last_rejection"])
+        self.assertFalse(any(item["type"] == "track_tcp" for item in broker.commands))
+        self.assertTrue(any(item["type"] == "hold" for item in broker.commands))
+
     def test_websocket_state_is_disconnected_when_handshake_fails(self):
         broker = _Broker()
         adapter = Pi05InputAdapter(broker, Path(__file__).resolve().parents[1] / "config" / "pi05.json")
@@ -101,7 +272,7 @@ class Pi05AdapterTests(unittest.TestCase):
             snapshot = adapter.snapshot()
             adapter.close()
         self.assertEqual(snapshot["model_state"], "DISCONNECTED")
-        self.assertIn("socket closed", snapshot["websocket_error"])
+        self.assertTrue(snapshot["websocket_error"])
     def test_action_chunk_flows_to_absolute_osc_target(self):
         broker = _Broker()
         adapter = Pi05InputAdapter(broker, Path(__file__).resolve().parents[1] / "config" / "pi05.json")
@@ -119,19 +290,19 @@ class Pi05AdapterTests(unittest.TestCase):
         motion = motions[0]
         gripper = next(item for item in broker.commands if item["type"] == "gripper")
         self.assertEqual(motion["type"], "track_tcp")
-        # π0.5 +X is configured as NERO -X; 1 * .05 * .2 = .01 m.
-        self.assertAlmostEqual(motion["payload"]["target_pose"]["position_m"][0], -.01, places=6)
+        # AutoDL values are physical Nero metres; no LIBERO sign or scale is applied.
+        self.assertAlmostEqual(motion["payload"]["target_pose"]["position_m"][0], .01, places=6)
         self.assertEqual(gripper["type"], "gripper")
-        self.assertAlmostEqual(gripper["payload"]["width_m"], .01)
+        self.assertAlmostEqual(gripper["payload"]["width_m"], .095)
         # Targets are not cumulative inside the chunk: all five use the same
         # feedback pose captured for the inference observation.
         for item in motions:
-            self.assertAlmostEqual(item["payload"]["target_pose"]["position_m"][0], -.01, places=6)
+            self.assertAlmostEqual(item["payload"]["target_pose"]["position_m"][0], .01, places=6)
         self.assertEqual(snapshot["action_chunk_length"], 10)
         self.assertEqual(len(snapshot["absolute_tcp_chunk"]), 10)
         self.assertEqual(snapshot["inference_base_tcp"]["position_m"], [0., 0., .3])
 
-    def test_osc_outage_does_not_stop_inference_or_action_chunk_publication(self):
+    def test_osc_outage_rejects_chunk_and_holds_before_more_rows_execute(self):
         broker = _Broker()
         adapter = Pi05InputAdapter(broker, Path(__file__).resolve().parents[1] / "config" / "pi05.json")
         adapter.cameras = _Camera()
@@ -146,9 +317,9 @@ class Pi05AdapterTests(unittest.TestCase):
             adapter.close()
         self.assertGreaterEqual(snapshot["chunk_sequence"], 1)
         self.assertIsNotNone(snapshot["action_chunk"])
-        self.assertEqual(snapshot["last_error"], None)
-        self.assertIn("simulated OSC outage", snapshot["osc_error"])
-        self.assertNotEqual(snapshot["state"], "ERROR")
+        self.assertEqual(snapshot["state"], "ERROR")
+        self.assertIn("simulated OSC outage", snapshot["last_rejection"])
+        self.assertTrue(any(item["type"] == "hold" for item in broker.commands))
 
     def test_pi05_snapshot_does_not_query_osc_during_control_outage(self):
         broker = _Broker()

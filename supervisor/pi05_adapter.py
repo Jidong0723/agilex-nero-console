@@ -1,4 +1,4 @@
-"""π0.5 input adapter: OpenPI observations to OSC absolute TCP commands.
+"""AutoDL OpenPI inference adapter: Nero observations to OSC TCP commands.
 
 This module deliberately owns no robot object, transport, or servo loop.  It
 is an input adapter running beside the HTTP service; its only output path is
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -17,6 +18,9 @@ import threading
 import time
 from typing import Any
 from .camera_resource import SharedCameraResource
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _finite(values: Any, length: int, name: str) -> list[float]:
@@ -77,16 +81,27 @@ def _unpack_array(value: dict[bytes, Any]) -> Any:
 class OpenPIClient:
     """Small copy of OpenPI's MessagePack/WebSocket protocol client."""
     def __init__(self, host: str, port: int, timeout_s: float) -> None:
+        import msgpack
         from websockets.sync.client import connect
         uri = host if host.startswith(("ws://", "wss://")) else f"ws://{host}:{port}"
         self.socket = connect(uri, compression=None, max_size=None, open_timeout=timeout_s, close_timeout=2)
         self.socket.recv(timeout=timeout_s)  # policy metadata handshake
+        # Match OpenPI's ``msgpack_numpy.Packer`` rather than ``packb``.  The
+        # streaming packer preserves the binary ndarray marker keys required
+        # by the server's object hook; packb makes valid RGB arrays arrive as
+        # zero-dimensional values with this OpenPI runtime.
+        self._packer = msgpack.Packer(default=_pack_array)
+        self._io_lock = threading.Lock()
+        self.last_health_error: str | None = None
         self.timeout_s = timeout_s
 
     def infer(self, observation: dict[str, Any]) -> Any:
         import msgpack
-        self.socket.send(msgpack.packb(observation, default=_pack_array))
-        reply = self.socket.recv(timeout=self.timeout_s)
+        # ``websockets.sync`` permits only one receive operation per socket.
+        # Keep inference and the idle health probe on the same serialized path.
+        with self._io_lock:
+            self.socket.send(self._packer.pack(observation))
+            reply = self.socket.recv(timeout=self.timeout_s)
         if isinstance(reply, str):
             raise RuntimeError(f"OpenPI server error: {reply}")
         return msgpack.unpackb(reply, object_hook=_unpack_array)
@@ -101,16 +116,26 @@ class OpenPIClient:
         """Return whether the WebSocket is still open, with a real ping."""
         state = str(getattr(self.socket, "state", "")).upper()
         if state and state not in {"OPEN", "1"}:
+            self.last_health_error = f"socket state {state}"
             return False
+        # An inference is already a stronger liveness check than ping.  Do not
+        # race it just because the status refresh happened at the same moment.
+        if not self._io_lock.acquire(blocking=False):
+            return True
         try:
             pong = self.socket.ping()
-            return bool(pong.wait(timeout=1.0))
-        except Exception:
+            alive = bool(pong.wait(timeout=1.0))
+            self.last_health_error = None if alive else "ping timed out"
+            return alive
+        except Exception as exc:
+            self.last_health_error = f"{type(exc).__name__}: {exc}"
             return False
+        finally:
+            self._io_lock.release()
 
 
 class _LegacyCameraPair:
-    """Latest-frame dual camera reader with the π0.5 224x224 RGB contract."""
+    """Latest-frame dual camera reader with the AutoDL 224x224 RGB contract."""
     def __init__(self, config: dict[str, Any]) -> None:
         import cv2
         self.cv2 = cv2
@@ -180,7 +205,44 @@ class Pi05InputAdapter:
                 "inference_base_tcp": None, "action_chunk_length": 0, "chunk_sequence": 0,
                 "executed_steps": 0, "sequence": 0, "execution_enabled": False,
                 "osc_error": None,
-                "priming": False, "updated_at": time.time()}
+                "camera_wait_reason": None,
+                "priming": False, "last_rejection": None,
+                # The policy was trained to emit a closed [0, 1] gripper
+                # ratio.  Keep the last boundary decision visible so an
+                # operator can distinguish floating-point round-off from a
+                # genuinely invalid policy output.
+                "gripper_ratio_diagnostic": None,
+                "decoded_first_target": None,
+                "websocket_diagnostics": {"connect_attempts": 0, "connect_successes": 0,
+                                          "disconnects": 0, "ping_failures": 0,
+                                          "inference_failures": 0, "last_event": "等待 AutoDL Policy WebSocket"},
+                "updated_at": time.time()}
+
+    def _record_websocket_event(self, event: str, detail: str | None = None, *, log: bool = True) -> None:
+        """Retain compact, operator-visible evidence for connection flapping."""
+        counters = {"connect_attempt": "connect_attempts", "connect_success": "connect_successes",
+                    "disconnect": "disconnects", "ping_failure": "ping_failures",
+                    "inference_failure": "inference_failures"}
+        text = event if not detail else f"{event}: {detail}"
+        with self.lock:
+            diagnostics = self.state.setdefault("websocket_diagnostics", {})
+            counter = counters.get(event)
+            if counter:
+                diagnostics[counter] = int(diagnostics.get(counter, 0)) + 1
+            diagnostics["last_event"] = text
+            diagnostics["updated_at"] = time.time()
+        if log:
+            LOGGER.info("AutoDL Policy WebSocket %s", text)
+
+    def _record_inference_input(self, external: Any, wrist: Any, observation: dict[str, Any]) -> None:
+        def describe(value: Any) -> str:
+            shape = getattr(value, "shape", None)
+            dtype = getattr(value, "dtype", None)
+            return f"shape={tuple(shape) if shape is not None else None}, dtype={dtype}"
+        with self.lock:
+            diagnostics = self.state.setdefault("websocket_diagnostics", {})
+            diagnostics["last_input"] = {"external_rgb": describe(external), "wrist_rgb": describe(wrist),
+                                         "state": describe(observation.get("observation/state"))}
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -191,6 +253,19 @@ class Pi05InputAdapter:
             result["camera"] = shared
             result["connections"] = copy.deepcopy(self._connections)
             return result
+
+    def _next_sequence(self) -> int:
+        """Allocate one strictly increasing sequence across TCP, gripper and HOLD.
+
+        Two commands in one Action Chunk can be issued in the same millisecond.
+        OSC rejects duplicate sequences, so retain the last emitted value rather
+        than recalculating an independent timestamp at every call site.
+        """
+        with self.lock:
+            previous = int(self.state.get("sequence", 0))
+            sequence = max(previous + 1, int(time.time() * 1000))
+            self.state["sequence"] = sequence
+            return sequence
 
     def frame_jpeg(self, source: str) -> bytes | None:
         return self.camera_resource.frame_jpeg(source) if self.camera_resource else None
@@ -247,6 +322,7 @@ class Pi05InputAdapter:
             # signal.  Idle sessions may still use ping to publish status.
             connected = policy is not None and (worker_active or policy.is_alive())
             if policy is not None and not connected:
+                self._record_websocket_event("ping_failure", getattr(policy, "last_health_error", None))
                 self._invalidate_policy(policy, "OpenPI WebSocket disconnected")
             if not connected and time.monotonic() >= retry_at:
                 with self._policy_create_lock:
@@ -258,6 +334,7 @@ class Pi05InputAdapter:
                             continue_connect = True
                     if continue_connect:
                         try:
+                            self._record_websocket_event("connect_attempt")
                             policy = OpenPIClient(str(model["host"]), int(model["port"]), float(model["request_timeout_s"]))
                             with self.lock:
                                 if self._connection_stop.is_set():
@@ -266,9 +343,11 @@ class Pi05InputAdapter:
                                     self._policy = policy
                                     self._policy_generation += 1
                                     self.state.update({"model_state": "CONNECTED", "websocket_error": None, "updated_at": time.time()})
+                                    self._record_websocket_event("connect_success")
                                     if self.camera_resource and self.camera_resource.snapshot().get("ready"):
                                         self._ensure_worker()
                         except Exception as exc:
+                            self._record_websocket_event("connect_failure", f"{type(exc).__name__}: {exc}")
                             with self.lock:
                                 self.state.update({"model_state": "DISCONNECTED", "websocket_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
             self._connection_wakeup.wait(1.0)
@@ -281,6 +360,7 @@ class Pi05InputAdapter:
             self._policy = None
             self._policy_retry_at = time.monotonic() + 2.0
             self.state.update({"model_state": "DISCONNECTED", "websocket_error": reason, "updated_at": time.time()})
+            self._record_websocket_event("disconnect", reason)
         if policy is not None:
             policy.close()
 
@@ -302,9 +382,10 @@ class Pi05InputAdapter:
         """Wait for the single connection-owner thread to publish a client.
 
         Connection creation must stay in ``_connection_loop``.  Creating a
-        fallback client here races that loop and produces multiple OpenPI
+        fallback client here would race that loop and produce multiple OpenPI
         sockets, which appear on the server as clients that vanish during
-        handshake.
+        handshake.  It would also erase the observable disconnected interval
+        after a failed inference.
         """
         deadline = time.monotonic() + float(self.config["model"]["request_timeout_s"])
         while time.monotonic() < deadline and not self.stop_event.is_set():
@@ -312,24 +393,9 @@ class Pi05InputAdapter:
                 policy = self._policy
             if policy is not None:
                 return policy
-            with self._policy_create_lock:
-                with self.lock:
-                    policy = self._policy
-                if policy is not None:
-                    return policy
-                try:
-                    model = self.config["model"]
-                    policy = OpenPIClient(str(model["host"]), int(model["port"]), float(model["request_timeout_s"]))
-                    with self.lock:
-                        self._policy = policy
-                        self._policy_generation += 1
-                        self.state.update({"model_state": "CONNECTED", "websocket_error": None, "updated_at": time.time()})
-                    return policy
-                except Exception as exc:
-                    with self.lock:
-                        self.state.update({"model_state": "DISCONNECTED", "websocket_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
-            time.sleep(.05)
-        raise RuntimeError("π0.5 WebSocket is not connected")
+            self._connection_wakeup.set()
+            self.stop_event.wait(.05)
+        raise RuntimeError("AutoDL Policy WebSocket is not connected")
 
     def _ensure_worker(self) -> None:
         with self.lock:
@@ -364,7 +430,7 @@ class Pi05InputAdapter:
         self._connections = {
             "control": {"state": "bad" if osc_error else ("ok" if transport.get("connected") else "warn"), "label": "NERO control service", "endpoint": "127.0.0.1:8765", "message": str(osc_error) if osc_error else "OSC control channel available"},
             "ssh_forward": {"state": "ok" if local_forward_listening else "bad", "label": "SSH 本地转发", "endpoint": f"127.0.0.1:{port}", "message": "本地转发端口已监听" if local_forward_listening else "本地转发端口未监听"},
-            "policy": {"state": "ok" if policy_connected else "bad", "label": "π0.5 WebSocket", "endpoint": "OpenPI policy server", "message": "OpenPI WebSocket 已连接" if policy_connected else (str(self.state.get("websocket_error")) if self.state.get("websocket_error") else "OpenPI WebSocket 未连接")},
+            "policy": {"state": "ok" if policy_connected else "bad", "label": "AutoDL Policy WebSocket", "endpoint": "OpenPI policy server", "message": "AutoDL Policy WebSocket 已连接" if policy_connected else (str(self.state.get("websocket_error")) if self.state.get("websocket_error") else "AutoDL Policy WebSocket 未连接")},
         }
 
     def camera_devices(self) -> list[dict[str, Any]]:
@@ -390,15 +456,22 @@ class Pi05InputAdapter:
         with self.lock:
             model = value.get("model") if isinstance(value, dict) else None
             cameras = value.get("cameras") if isinstance(value, dict) else None
+            execution = value.get("execution") if isinstance(value, dict) else None
             if isinstance(model, dict) and "prompt" in model:
                 prompt = str(model["prompt"]).strip()
                 if not 1 <= len(prompt) <= 500: raise ValueError("prompt must contain 1-500 characters")
                 self.config["model"]["prompt"] = prompt; self.state["prompt"] = prompt
+            if isinstance(execution, dict) and "action_delta_scale" in execution:
+                scale = float(execution["action_delta_scale"])
+                if not math.isfinite(scale) or not 0.0 <= scale <= 1.0:
+                    raise ValueError("AutoDL action delta scale must be within [0, 1]")
+                self.config.setdefault("execution", {})["action_delta_scale"] = scale
             if isinstance(cameras, dict):
-                if self.state["state"] == "RUNNING": raise RuntimeError("stop π0.5 inference before changing cameras")
+                if self.state["state"] == "RUNNING": raise RuntimeError("stop AutoDL cloud inference before changing cameras")
                 if self.camera_resource:
                     self.camera_resource.update_config(cameras)
                     self.config["cameras"] = copy.deepcopy(self.camera_resource.config)
+                    self._persist_config_locked()
                     self.state["updated_at"] = time.time(); return self.snapshot()
                 for key in ("external", "wrist"):
                     item = cameras.get(key)
@@ -408,8 +481,16 @@ class Pi05InputAdapter:
                     self.config["cameras"][key]["index"] = index
                 if self.config["cameras"]["external"]["index"] == self.config["cameras"]["wrist"]["index"]:
                     raise ValueError("external and wrist cameras must be different")
+            self._persist_config_locked()
             self.state["updated_at"] = time.time()
             return self.snapshot()
+
+    def _persist_config_locked(self) -> None:
+        """Atomically retain operator-facing prompt and test settings across restart."""
+        temporary = self.config_path.with_suffix(f"{self.config_path.suffix}.tmp")
+        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(self.config, ensure_ascii=False, indent=2) + "\n")
+        os.replace(temporary, self.config_path)
 
     def activate_cameras(self) -> dict[str, Any]:
         if self.camera_resource:
@@ -418,7 +499,7 @@ class Pi05InputAdapter:
             self._ensure_worker()
             return self.snapshot()
         with self.lock:
-            if self.state["state"] == "RUNNING": raise RuntimeError("cannot change cameras while π0.5 is running")
+            if self.state["state"] == "RUNNING": raise RuntimeError("cannot change cameras while AutoDL cloud inference is running")
             self.preview_stop.set()
             if self.preview_thread and self.preview_thread is not threading.current_thread(): self.preview_thread.join(timeout=.5)
             if self.cameras: self.cameras.close()
@@ -441,7 +522,7 @@ class Pi05InputAdapter:
             self._osc_snapshot = copy.deepcopy(osc)
             session = osc.get("session") or {}
             if session.get("state") != "ACTIVE" or session.get("id") != session_id or session.get("client_id") != client_id:
-                raise PermissionError("π0.5 requires the caller's active OSC session")
+                raise PermissionError("AutoDL cloud inference requires the caller's active OSC session")
             self._last_gripper_target = None
             needs_priming = session.get("execution_mode") == "hardware"
             self.state.update({"state": "PRIMING" if needs_priming else "RUNNING",
@@ -463,32 +544,30 @@ class Pi05InputAdapter:
             with self.lock:
                 self.state.update({"osc_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
 
-    def stop(self, reason: str = "π0.5 adapter stopped") -> dict[str, Any]:
+    def stop(self, reason: str = "AutoDL cloud inference stopped") -> dict[str, Any]:
         with self.lock:
             self.state.update({"state": "RUNNING" if self.state.get("state") == "PRIMING" else self.state.get("state"),
                                "execution_enabled": False, "priming": False, "updated_at": time.time()})
             return self.snapshot()
 
     def _prime_startup_hold(self, session_id: str, client_id: str) -> bool:
-        """Send one zero-motion target before releasing π0.5 actions."""
+        """Send one zero-motion target before releasing AutoDL actions."""
         osc = self.osc.state()
         execution = osc.get("execution") or {}
         command = osc.get("command") or {}
         target = execution.get("measured_tcp_pose") or command.get("target_tcp")
         if not isinstance(target, dict):
-            raise RuntimeError("π0.5 startup hold requires a current measured TCP pose")
+            raise RuntimeError("AutoDL startup hold requires a current measured TCP pose")
         position = target.get("position_m")
         orientation = target.get("orientation_xyzw")
         if not isinstance(position, list) or not isinstance(orientation, list):
-            raise RuntimeError("π0.5 startup hold received an invalid TCP pose")
-        with self.lock:
-            self.state["sequence"] += 1
-            sequence = max(self.state["sequence"], int(time.time() * 1000))
+            raise RuntimeError("AutoDL startup hold received an invalid TCP pose")
+        sequence = self._next_sequence()
         result = self.osc.track_tcp(session_id, client_id, sequence, {
             "position_m": list(position), "orientation_xyzw": list(orientation),
         })
         if not result.get("ok"):
-            raise RuntimeError(f"π0.5 startup hold rejected: {result}")
+            raise RuntimeError(f"AutoDL startup hold rejected: {result}")
         hold_s = max(0.0, float(self.config["execution"].get("startup_hold_s", 0.3)))
         if self.stop_event.wait(hold_s):
             return False
@@ -516,65 +595,132 @@ class Pi05InputAdapter:
         if not isinstance(pose, dict):
             pose = {"position_m": [0.0, 0.0, 0.0], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]}
         position = _finite(pose.get("position_m"), 3, "TCP position")
-        # π0.5's state receives its rotation-vector representation.  The current
-        # system's OSC pose is xyzw; retaining zero rotvec is unsafe, so the policy
-        # currently receives the calibrated translational state plus neutral rotation
-        # until a policy-specific quaternion->rotvec calibration is configured.
+        # The AutoDL training state is expressed directly in the NERO base
+        # frame.  Do not apply LIBERO axis flips or arbitrary normalisation.
         rotvec = _quaternion_rotvec(_finite(pose.get("orientation_xyzw"), 4, "TCP orientation"))
-        signs_r = _finite(self.config["frames"]["libero_to_nero"]["rotation_axis_sign"], 3, "rotation signs")
-        gripper = (osc.get("gripper") or {}).get("width_m", 0.0); width = max(0.0, min(0.095, float(gripper)))
-        state = np.asarray([-position[0], position[1], position[2], *(rotvec[i] * signs_r[i] for i in range(3)), width / 0.095 * .04, -width / 0.095 * .04], dtype=np.float32)
+        gripper = (osc.get("gripper") or {}).get("width_m", 0.0)
+        minimum = float(self.config["gripper"]["min_width_m"])
+        maximum = float(self.config["gripper"]["max_width_m"])
+        width = max(minimum, min(maximum, float(gripper)))
+        ratio = (width - minimum) / (maximum - minimum)
+        state = np.asarray([*position, *rotvec, ratio, -ratio], dtype=np.float32)
         return {"observation/image": external, "observation/wrist_image": wrist, "observation/state": state,
                 "prompt": self.config["model"]["prompt"]}
 
-    def _target_from_action(self, action: Any, base: dict[str, Any]) -> tuple[dict[str, Any], float]:
-        values = _finite(action, 7, "π0.5 action")
-        if any(abs(value) > 1.05 for value in values): raise RuntimeError("π0.5 action is outside [-1, 1]")
-        values = [max(-1., min(1., value)) for value in values]
-        model, frame = self.config["model"], self.config["frames"]["libero_to_nero"]
-        rate = float(model["rate_scale"]); ps = _finite(model["position_scale_m"], 3, "position scale"); rs = _finite(model["rotation_scale_rad"], 3, "rotation scale")
-        signs_t = _finite(frame["translation_axis_sign"], 3, "translation signs"); signs_r = _finite(frame["rotation_axis_sign"], 3, "rotation signs")
-        delta = [values[i] * ps[i] * rate * signs_t[i] for i in range(3)]
-        rotvec = [values[i + 3] * rs[i] * rate * signs_r[i] for i in range(3)]
+    def _normalise_gripper_ratio(self, ratio: float, action_index: int | None = None) -> float:
+        """Accept only harmless endpoint round-off, preserving hard safety rejects.
+
+        Network inference can return float32 values infinitesimally outside a
+        closed training range (for example ``1.0000001``).  Treating that as a
+        fatal action chunk is needlessly disruptive, but broadly clipping a
+        policy output would conceal a real semantic error.  The configurable
+        tolerance is therefore deliberately small: values outside it still
+        reject the complete chunk and request HOLD.
+        """
+        tolerance = float(self.config["gripper"].get("ratio_boundary_tolerance", 0.001))
+        if not math.isfinite(tolerance) or tolerance < 0.0:
+            raise RuntimeError("AutoDL gripper ratio boundary tolerance must be finite and non-negative")
+        if 0.0 <= ratio <= 1.0:
+            return ratio
+        row = "unknown" if action_index is None else str(action_index)
+        if -tolerance <= ratio <= 1.0 + tolerance:
+            command_ratio = min(1.0, max(0.0, ratio))
+            diagnostic = {"status": "boundary_normalized", "action_index": action_index,
+                          "raw_ratio": ratio, "command_ratio": command_ratio,
+                          "tolerance": tolerance, "updated_at": time.time()}
+            with self.lock:
+                self.state["gripper_ratio_diagnostic"] = diagnostic
+            # This is a recoverable model-output boundary condition.  The
+            # state diagnostic is deliberately user-visible; keep the process
+            # log at debug level so a sustained endpoint command does not
+            # drown out actual safety events.
+            LOGGER.debug("AutoDL gripper ratio boundary-normalized at row %s: %.9g -> %.9g (tolerance %.9g)",
+                         row, ratio, command_ratio, tolerance)
+            return command_ratio
+        diagnostic = {"status": "rejected", "action_index": action_index,
+                      "raw_ratio": ratio, "tolerance": tolerance, "updated_at": time.time()}
+        with self.lock:
+            self.state["gripper_ratio_diagnostic"] = diagnostic
+        raise RuntimeError(
+            f"AutoDL gripper ratio at row {row} is {ratio:.9g}; expected [0, 1] "
+            f"(only endpoint round-off within ±{tolerance:.9g} is normalized)"
+        )
+
+    def _target_from_action(self, action: Any, base: dict[str, Any], delta_scale: float | None = None,
+                            action_index: int | None = None) -> tuple[dict[str, Any], float]:
+        values = _finite(action, 7, "AutoDL Nero action")
+        gripper_ratio = self._normalise_gripper_ratio(values[6], action_index)
+        scale = float(self.config["execution"].get("action_delta_scale", 1.0) if delta_scale is None else delta_scale)
+        if not math.isfinite(scale) or not 0.0 <= scale <= 1.0:
+            raise RuntimeError("AutoDL action delta scale must be within [0, 1]")
+        # Only the policy's relative TCP translation and rotation are scaled.
+        # Its final component is an absolute gripper-opening ratio, not a
+        # delta, so leaving it untouched preserves trained gripper semantics.
+        delta, rotvec = [value * scale for value in values[:3]], [value * scale for value in values[3:6]]
         position = [float(base["position_m"][i]) + delta[i] for i in range(3)]
-        orientation = _quat_product(_finite(base["orientation_xyzw"], 4, "TCP orientation"), _rotvec_quaternion(rotvec))
+        orientation = _quat_product(_rotvec_quaternion(rotvec), _finite(base["orientation_xyzw"], 4, "TCP orientation"))
         norm = math.sqrt(sum(value * value for value in orientation)); orientation = [value / norm for value in orientation]
-        return {"position_m": position, "orientation_xyzw": orientation}, values[6]
+        return {"position_m": position, "orientation_xyzw": orientation}, gripper_ratio
+
+    @staticmethod
+    def _validate_execution_targets(decoded: list[tuple[dict[str, Any], float]], limit: int,
+                                   osc: dict[str, Any]) -> None:
+        """Reject a whole chunk before dispatch when its executable rows leave the OSC workspace.
+
+        OSC remains authoritative for IK, lease and live safety checks.  This
+        local pass deliberately mirrors only the published Cartesian envelope,
+        so a later OSC rejection is still fail-closed rather than treated as a
+        partially valid chunk.
+        """
+        workspace = osc.get("workspace") or {}
+        lower = workspace.get("min_xyz_m")
+        upper = workspace.get("max_xyz_m")
+        min_tcp_z = workspace.get("min_tcp_z_m")
+        if lower is None or upper is None:
+            # Some early OSC snapshots have no workspace publication.  They
+            # cannot be locally preflighted, but every row is still finite and
+            # the authoritative OSC check below will reject the complete
+            # chunk on its first refusal.
+            return
+        lower = _finite(lower, 3, "OSC workspace minimum")
+        upper = _finite(upper, 3, "OSC workspace maximum")
+        floor = float(min_tcp_z) if min_tcp_z is not None else lower[2]
+        if not math.isfinite(floor) or any(low > high for low, high in zip(lower, upper)):
+            raise RuntimeError("OSC published an invalid workspace")
+        for index, (target, _gripper) in enumerate(decoded[:limit]):
+            position = _finite(target.get("position_m"), 3, f"AutoDL target {index} position")
+            if any(value < low or value > high for value, low, high in zip(position, lower, upper)) or position[2] < floor:
+                raise RuntimeError(f"AutoDL target {index} is outside the OSC workspace")
 
     def _send_gripper_if_needed(self, session_id: str, client_id: str, action_value: float) -> None:
-        """Send a gripper edge only when feedback says a transition is needed."""
-        threshold = float(self.config["gripper"]["switch_threshold"])
-        if abs(float(action_value)) < threshold:
+        """Send the trained continuous gripper opening target when it changes."""
+        minimum, maximum = float(self.config["gripper"]["min_width_m"]), float(self.config["gripper"]["max_width_m"])
+        target_width = minimum + float(action_value) * (maximum - minimum)
+        tolerance = float(self.config["gripper"].get("dedupe_tolerance_ratio", 0.01)) * (maximum - minimum)
+        if isinstance(self._last_gripper_target, (int, float)) and abs(float(self._last_gripper_target) - target_width) <= tolerance:
             return
-        desired = "open" if float(action_value) <= -threshold else "closed"
-        with self.lock:
-            current = (self._osc_snapshot.get("gripper") or {}).copy()
-        width = current.get("width_m")
-        openness = None
-        if isinstance(width, (int, float)):
-            openness = max(0.0, min(1.0, float(width) / 0.095))
-        # Match the reference adapter's 80%/20% hysteresis. Once a target has
-        # been sent, suppress duplicate SDK transactions until the opposite
-        # gripper edge is requested.
-        if desired == "open" and openness is not None and openness >= 0.8:
-            self._last_gripper_target = desired
-            return
-        if desired == "closed" and openness is not None and openness <= 0.2:
-            self._last_gripper_target = desired
-            return
-        if self._last_gripper_target == desired:
-            return
-        with self.lock:
-            self.state["sequence"] += 1
-            sequence = max(self.state["sequence"], int(time.time() * 1000))
+        sequence = self._next_sequence()
         result = self.osc.gripper(session_id, client_id, sequence, {
-            "mode": "open" if desired == "open" else "position",
-            "width_m": self.config["gripper"]["open_width_m"] if desired == "open" else self.config["gripper"]["closed_width_m"],
+            "mode": "position", "width_m": target_width,
             "force_n": self.config["gripper"]["force_n"],
         })
         if not result.get("ok"):
-            raise RuntimeError(f"π0.5 gripper command rejected: {result}")
-        self._last_gripper_target = desired
+            raise RuntimeError(f"AutoDL gripper command rejected: {result}")
+        self._last_gripper_target = target_width
+
+    def _reject_chunk(self, session_id: str | None, client_id: str | None, reason: str) -> None:
+        """Fail closed: no later row from a bad AutoDL chunk may execute."""
+        sequence = self._next_sequence()
+        with self.lock:
+            self.state.update({"state": "ERROR", "execution_enabled": False,
+                               "last_error": reason, "last_rejection": reason,
+                               "updated_at": time.time()})
+        if session_id and client_id:
+            try:
+                self.osc.hold(str(session_id), str(client_id), sequence, reason)
+            except Exception:
+                pass
+        self.stop_event.set()
 
     def _run(self) -> None:
         policy = None
@@ -604,27 +750,67 @@ class Pi05InputAdapter:
                         self.osc.heartbeat(str(client_id), str(session_id))
                     except Exception as exc:
                         with self.lock: self.state.update({"osc_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
-                external, wrist = self.camera_resource.read() if self.camera_resource else (self.cameras.read() if self.cameras else (_ for _ in ()).throw(RuntimeError("cameras are unavailable")))
                 try:
-                    response = policy.infer(self._observation(osc, external, wrist))
+                    external, wrist = self.camera_resource.read() if self.camera_resource else (self.cameras.read() if self.cameras else (_ for _ in ()).throw(RuntimeError("cameras are unavailable")))
                 except Exception as exc:
+                    # A USB camera can momentarily skip a frame while its
+                    # shared preview thread is still recovering.  Keep the
+                    # existing Action Chunk visible and wait for the next
+                    # complete RGB pair instead of terminating AutoDL
+                    # inference with a misleading ERROR state.
+                    with self.lock:
+                        self.state.update({"camera_state": "WAITING", "last_error": None,
+                                           "camera_wait_reason": f"waiting for complete RGB pair: {type(exc).__name__}: {exc}",
+                                           "updated_at": time.time()})
+                    self.stop_event.wait(.1)
+                    continue
+                with self.lock:
+                    if self.state.get("camera_state") == "WAITING":
+                        self.state.update({"camera_state": "READY", "camera_wait_reason": None, "updated_at": time.time()})
+                observation = self._observation(osc, external, wrist)
+                self._record_inference_input(external, wrist, observation)
+                try:
+                    response = policy.infer(observation)
+                except Exception as exc:
+                    self._record_websocket_event("inference_failure", f"{type(exc).__name__}: {exc}")
                     self._invalidate_policy(policy, f"OpenPI WebSocket inference failed: {type(exc).__name__}: {exc}")
                     policy = None
                     self.stop_event.wait(.05)
                     continue
-                actions = response.get("actions") if isinstance(response, dict) else None
-                if actions is None: raise RuntimeError("OpenPI response does not contain actions")
-                rows = actions.tolist() if hasattr(actions, "tolist") else actions
-                if not isinstance(rows, list) or not rows: raise RuntimeError("OpenPI Action Chunk is empty")
-                expected_steps = int(self.config["execution"].get("expected_chunk_steps", 10))
-                if len(rows) != expected_steps:
-                    raise RuntimeError(f"OpenPI Action Chunk must contain exactly {expected_steps} steps, got {len(rows)}")
-                limit = min(len(rows), int(self.config["execution"]["replan_steps"]), int(self.config["execution"]["max_chunk_steps"]))
                 base = self._feedback_pose(osc)
-                absolute_chunk = [self._target_from_action(action, base)[0] for action in rows] if base is not None else None
+                if base is None and (not execution_enabled or not active_session):
+                    # Preview inference may continue after the operator stops
+                    # forwarding or closes the OSC session.  Without a live
+                    # TCP reference there is nothing safe to decode or send,
+                    # but this is an expected idle condition—not a rejected
+                    # AutoDL chunk and not a reason to issue HOLD again.
+                    self.stop_event.wait(float(self.config["execution"]["period_s"]))
+                    continue
+                try:
+                    actions = response.get("actions") if isinstance(response, dict) else None
+                    if actions is None: raise RuntimeError("AutoDL response does not contain actions")
+                    rows = actions.tolist() if hasattr(actions, "tolist") else actions
+                    if not isinstance(rows, list) or not rows: raise RuntimeError("AutoDL action chunk is empty")
+                    expected_steps = int(self.config["execution"].get("expected_chunk_steps", 10))
+                    if len(rows) != expected_steps:
+                        raise RuntimeError(f"AutoDL action chunk must contain exactly {expected_steps} steps, got {len(rows)}")
+                    if base is None:
+                        raise RuntimeError("OSC measured TCP feedback is unavailable for this AutoDL chunk")
+                    with self.lock:
+                        delta_scale = float(self.config["execution"].get("action_delta_scale", 1.0))
+                    decoded = [self._target_from_action(action, base, delta_scale, index)
+                               for index, action in enumerate(rows)]
+                    absolute_chunk = [target for target, _ratio in decoded]
+                    limit = min(len(rows), int(self.config["execution"]["replan_steps"]), int(self.config["execution"]["max_chunk_steps"]))
+                    self._validate_execution_targets(decoded, limit, osc)
+                except Exception as exc:
+                    self._reject_chunk(session_id, client_id, f"AutoDL action chunk rejected: {type(exc).__name__}: {exc}")
+                    break
                 with self.lock:
                     self.state.update({"action_chunk": rows, "absolute_tcp_chunk": absolute_chunk,
                                        "inference_base_tcp": copy.deepcopy(base), "action_chunk_length": len(rows),
+                                       "decoded_first_target": copy.deepcopy(absolute_chunk[0]),
+                                       "last_rejection": None,
                                        "chunk_sequence": int(self.state.get("chunk_sequence", 0)) + 1,
                                        "inference_ms": (time.monotonic()-started)*1000., "updated_at": time.time()})
                 with self.lock:
@@ -638,26 +824,30 @@ class Pi05InputAdapter:
                 if not execution_enabled or not active_session:
                     self.stop_event.wait(float(self.config["execution"]["period_s"]))
                     continue
-                if base is None or absolute_chunk is None:
-                    with self.lock:
-                        self.state.update({"osc_error": "OSC measured TCP feedback is unavailable for this Action Chunk", "updated_at": time.time()})
-                    self.stop_event.wait(float(self.config["execution"]["period_s"]))
-                    continue
                 period_s = float(self.config["execution"]["period_s"])
                 next_step_at = started + period_s
-                for index, (action, target) in enumerate(zip(rows[:limit], absolute_chunk[:limit])):
+                for index, ((target, gripper), _action) in enumerate(zip(decoded[:limit], rows[:limit])):
                     if self.stop_event.is_set(): break
-                    gripper = _finite(action, 7, "π0.5 action")[6]
-                    with self.lock: self.state["sequence"] += 1; sequence = max(self.state["sequence"], int(time.time()*1000))
+                    with self.lock:
+                        execution_enabled = bool(self.state.get("execution_enabled"))
+                    if not execution_enabled:
+                        # The operator may stop AutoDL forwarding while this
+                        # chunk is between rows.  Do not let a deliberately
+                        # revoked session turn that normal stop into an OSC
+                        # rejection on the UI.
+                        break
+                    sequence = self._next_sequence()
                     try:
                         result = self.osc.track_tcp(session_id, client_id, sequence, target)
                         if not result.get("ok"): raise RuntimeError(f"OSC target rejected: {result}")
-                    except Exception as exc:
-                        with self.lock: self.state.update({"osc_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
-                    try:
                         self._send_gripper_if_needed(session_id, client_id, gripper)
                     except Exception as exc:
-                        with self.lock: self.state.update({"osc_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
+                        with self.lock:
+                            execution_enabled = bool(self.state.get("execution_enabled"))
+                        if not execution_enabled:
+                            break
+                        self._reject_chunk(session_id, client_id, f"AutoDL chunk execution rejected: {type(exc).__name__}: {exc}")
+                        break
                     with self.lock: self.state["executed_steps"] += 1; self.state["updated_at"] = time.time()
                     # period_s is the complete observation-to-command cadence;
                     # policy inference time must not be added on top of it.
@@ -668,12 +858,12 @@ class Pi05InputAdapter:
         finally:
             with self.lock:
                 session_id, client_id = self.state.get("session_id"), self.state.get("client_id")
-                self.state["state"] = "IDLE" if self.stop_event.is_set() else self.state["state"]
+                if self.stop_event.is_set() and self.state.get("state") != "ERROR":
+                    self.state["state"] = "IDLE"
                 self.state["updated_at"] = time.time()
             if session_id and client_id and not self.stop_event.is_set():
                 try:
-                    self.state["sequence"] += 1
-                    self.osc.hold(str(session_id), str(client_id), max(int(self.state["sequence"]), int(time.time() * 1000)), "π0.5 adapter failed")
+                    self.osc.hold(str(session_id), str(client_id), self._next_sequence(), "AutoDL cloud inference failed")
                 except Exception:
                     pass
 

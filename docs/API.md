@@ -36,11 +36,14 @@ to absolute TCP targets before calling OSC.
 
 ## Input adapters
 
-- π0.5: `GET /api/pi05/state`, `POST /api/pi05/config`, `POST /api/pi05/start`, and `POST /api/pi05/stop`.
+- AutoDL云端推理（兼容 `pi05` 路由）：`GET /api/pi05/state`, `POST /api/pi05/config`, `POST /api/pi05/start`, and `POST /api/pi05/stop`.
+  AutoDL 的夹爪输出使用闭区间 `[0, 1]`；仅在配置的 `gripper.ratio_boundary_tolerance`
+  内对端点浮点舍入归一化，超过该范围仍会拒绝整块并请求 HOLD。状态中的
+  `gripper_ratio_diagnostic` 给出动作行、原始比例和处理结果。
 - Cameras: `GET /api/cameras/state`, `GET /api/cameras/list`, `POST /api/cameras/config`, `POST /api/cameras/activate`, and `POST /api/cameras/deactivate`.
 - PICO USB/ADB: `GET /api/adapters/pico/state`, `POST /api/adapters/pico/connect`, and `POST /api/adapters/pico/disconnect`. Run `scripts/pico_usb_connect.ps1` after connecting the headset; the APK connects to `ws://127.0.0.1:8768` through `adb reverse tcp:8768 tcp:8768`. The first WebSocket message is directly an `input_frame`; no pairing code, QR code, LAN address, or `pair` message is used. The computer-side service has no PICO SDK dependency.
 
-PICO and π0.5 run in the HTTP process. PICO owns the USB-forwarded WebSocket
+PICO and AutoDL云端推理 run in the HTTP process. PICO owns the USB-forwarded WebSocket
 connection and device anchors,
 camera and policy lifecycle, and can only read OSC state, renew a session, or
 send absolute `track_tcp`, `hold`, and `gripper` commands.
