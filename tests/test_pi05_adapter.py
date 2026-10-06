@@ -45,6 +45,7 @@ class _Broker:
     def __init__(self):
         self.commands = []
         self.fail_control = False
+        self.track_delay_s = 0.0
         self.session = {"state": "ACTIVE", "id": "session-1", "client_id": "client-1", "execution_mode": "shadow"}
 
     def state(self):
@@ -54,7 +55,11 @@ class _Broker:
 
     def track_tcp(self, session_id, client_id, sequence, target_pose):
         if self.fail_control: raise RuntimeError("simulated OSC outage")
-        self.commands.append({"session_id": session_id, "client_id": client_id, "sequence": sequence, "type": "track_tcp", "payload": {"target_pose": target_pose}})
+        started_at = time.monotonic()
+        if self.track_delay_s:
+            time.sleep(self.track_delay_s)
+        self.commands.append({"session_id": session_id, "client_id": client_id, "sequence": sequence, "type": "track_tcp", "payload": {"target_pose": target_pose},
+                              "started_at": started_at, "completed_at": time.monotonic()})
         return {"ok": True, "result": {"accepted": True}}
     def gripper(self, session_id, client_id, sequence, payload):
         self.commands.append({"session_id": session_id, "client_id": client_id, "sequence": sequence, "type": "gripper", "payload": payload})
@@ -301,6 +306,84 @@ class Pi05AdapterTests(unittest.TestCase):
         self.assertEqual(snapshot["action_chunk_length"], 10)
         self.assertEqual(len(snapshot["absolute_tcp_chunk"]), 10)
         self.assertEqual(snapshot["inference_base_tcp"]["position_m"], [0., 0., .3])
+
+    def test_slow_inference_does_not_burst_action_chunk_dispatches(self):
+        class SlowPolicy(_Policy):
+            inference_completed_at = None
+
+            def infer(self, observation):
+                time.sleep(.06)
+                response = super().infer(observation)
+                type(self).inference_completed_at = time.monotonic()
+                return response
+
+        broker = _Broker()
+        adapter = Pi05InputAdapter(broker, Path(__file__).resolve().parents[1] / "config" / "pi05.json")
+        adapter.cameras = _Camera()
+        adapter.config["execution"]["period_s"] = .03
+        try:
+            with patch("supervisor.pi05_adapter.OpenPIClient", SlowPolicy):
+                adapter.start("session-1", "client-1")
+                deadline = time.monotonic() + 2.0
+                while len([item for item in broker.commands if item["type"] == "track_tcp"]) < 5 and time.monotonic() < deadline:
+                    time.sleep(.005)
+                motions = [item for item in broker.commands if item["type"] == "track_tcp"][:5]
+                snapshot = adapter.snapshot()
+        finally:
+            adapter.close()
+        self.assertEqual(len(motions), 5)
+        self.assertIsNotNone(SlowPolicy.inference_completed_at)
+        self.assertLess(motions[0]["started_at"] - SlowPolicy.inference_completed_at, .03)
+        self.assertGreaterEqual(snapshot["inference_ms"], 50.0)
+        for previous, current in zip(motions, motions[1:]):
+            self.assertGreaterEqual(current["started_at"] - previous["completed_at"], .024)
+
+    def test_inference_latency_excludes_camera_capture_time(self):
+        class SlowCamera(_Camera):
+            def read(self):
+                time.sleep(.05)
+                return super().read()
+
+        class TimedPolicy(_Policy):
+            def infer(self, observation):
+                time.sleep(.02)
+                return super().infer(observation)
+
+        broker = _Broker()
+        adapter = Pi05InputAdapter(broker, Path(__file__).resolve().parents[1] / "config" / "pi05.json")
+        adapter.cameras = SlowCamera()
+        adapter.config["execution"]["period_s"] = .01
+        try:
+            with patch("supervisor.pi05_adapter.OpenPIClient", TimedPolicy):
+                adapter.start("session-1", "client-1")
+                deadline = time.monotonic() + 2.0
+                while adapter.snapshot()["inference_ms"] is None and time.monotonic() < deadline:
+                    time.sleep(.005)
+                inference_ms = adapter.snapshot()["inference_ms"]
+        finally:
+            adapter.close()
+        self.assertIsNotNone(inference_ms)
+        self.assertGreaterEqual(inference_ms, 15.0)
+        self.assertLess(inference_ms, 40.0)
+
+    def test_slow_osc_dispatch_stretches_chunk_without_catchup_burst(self):
+        broker = _Broker()
+        broker.track_delay_s = .05
+        adapter = Pi05InputAdapter(broker, Path(__file__).resolve().parents[1] / "config" / "pi05.json")
+        adapter.cameras = _Camera()
+        adapter.config["execution"]["period_s"] = .03
+        try:
+            with patch("supervisor.pi05_adapter.OpenPIClient", _Policy):
+                adapter.start("session-1", "client-1")
+                deadline = time.monotonic() + 2.0
+                while len([item for item in broker.commands if item["type"] == "track_tcp"]) < 5 and time.monotonic() < deadline:
+                    time.sleep(.005)
+                motions = [item for item in broker.commands if item["type"] == "track_tcp"][:5]
+        finally:
+            adapter.close()
+        self.assertEqual(len(motions), 5)
+        for previous, current in zip(motions, motions[1:]):
+            self.assertGreaterEqual(current["started_at"] - previous["completed_at"], .024)
 
     def test_osc_outage_rejects_chunk_and_holds_before_more_rows_execute(self):
         broker = _Broker()

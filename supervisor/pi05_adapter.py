@@ -738,7 +738,6 @@ class Pi05InputAdapter:
                             self.state.update({"state": "RUNNING", "websocket_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
                         self.stop_event.wait(.1)
                         continue
-                started = time.monotonic()
                 with self.lock:
                     osc = copy.deepcopy(self._osc_snapshot)
                     session = dict(osc.get("session") or {})
@@ -770,7 +769,9 @@ class Pi05InputAdapter:
                 observation = self._observation(osc, external, wrist)
                 self._record_inference_input(external, wrist, observation)
                 try:
+                    inference_started = time.monotonic()
                     response = policy.infer(observation)
+                    inference_ms = (time.monotonic() - inference_started) * 1000.0
                 except Exception as exc:
                     self._record_websocket_event("inference_failure", f"{type(exc).__name__}: {exc}")
                     self._invalidate_policy(policy, f"OpenPI WebSocket inference failed: {type(exc).__name__}: {exc}")
@@ -812,7 +813,7 @@ class Pi05InputAdapter:
                                        "decoded_first_target": copy.deepcopy(absolute_chunk[0]),
                                        "last_rejection": None,
                                        "chunk_sequence": int(self.state.get("chunk_sequence", 0)) + 1,
-                                       "inference_ms": (time.monotonic()-started)*1000., "updated_at": time.time()})
+                                       "inference_ms": inference_ms, "updated_at": time.time()})
                 with self.lock:
                     priming = bool(self.state.get("priming"))
                 if priming and active_session and session.get("execution_mode") == "hardware":
@@ -825,9 +826,19 @@ class Pi05InputAdapter:
                     self.stop_event.wait(float(self.config["execution"]["period_s"]))
                     continue
                 period_s = float(self.config["execution"]["period_s"])
-                next_step_at = started + period_s
+                last_dispatch_completed_at: float | None = None
                 for index, ((target, gripper), _action) in enumerate(zip(decoded[:limit], rows[:limit])):
                     if self.stop_event.is_set(): break
+                    # The first validated target is sent immediately.  Every
+                    # following target is paced from the completion of the
+                    # previous successful dispatch, rather than from the
+                    # observation time.  Inference or an OSC call may take
+                    # longer than one period; in that case we stretch the
+                    # chunk instead of trying to catch up with a burst.
+                    if last_dispatch_completed_at is not None:
+                        wait_s = max(0.0, last_dispatch_completed_at + period_s - time.monotonic())
+                        if self.stop_event.wait(wait_s):
+                            break
                     with self.lock:
                         execution_enabled = bool(self.state.get("execution_enabled"))
                     if not execution_enabled:
@@ -848,11 +859,8 @@ class Pi05InputAdapter:
                             break
                         self._reject_chunk(session_id, client_id, f"AutoDL chunk execution rejected: {type(exc).__name__}: {exc}")
                         break
+                    last_dispatch_completed_at = time.monotonic()
                     with self.lock: self.state["executed_steps"] += 1; self.state["updated_at"] = time.time()
-                    # period_s is the complete observation-to-command cadence;
-                    # policy inference time must not be added on top of it.
-                    if self.stop_event.wait(max(0.0, next_step_at - time.monotonic())): break
-                    next_step_at += period_s
         except Exception as exc:
             with self.lock: self.state.update({"state": "ERROR", "last_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
         finally:
