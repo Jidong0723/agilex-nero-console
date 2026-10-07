@@ -181,9 +181,6 @@ class TcpVlaDatasetRecorder:
             session = osc.get("session") or {}
             if session.get("state") != "ACTIVE":
                 raise RuntimeError("OSC 控制会话未激活，禁止开始正式父 Episode")
-            ruckig = (osc.get("diagnostics") or {}).get("ruckig")
-            if isinstance(ruckig, dict) and ruckig.get("enabled") is False:
-                raise RuntimeError(f"Ruckig 当前被旁路，不能开始采集: {ruckig.get('reason') or 'unknown reason'}")
             self._ensure_root()
             index = self._next_index()
             clock_offset_ns = self._monotonic_to_perf_offset_ns()

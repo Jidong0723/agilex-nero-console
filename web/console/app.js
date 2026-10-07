@@ -283,7 +283,7 @@
     const shadow = isShadowSession(current);
     if (allowHoldReadyResume && diagnostic.trajectory_state === "HOLD_READY" &&
         current.state === "ACTIVE" && current.client_id === clientId) {
-      // Let the backend resynchronise Ruckig and restore TRACKING from the
+      // Let the backend resynchronise the servo command state and restore TRACKING from the
       // current client's fresh deadman packet.
       return true;
     }
@@ -1603,7 +1603,7 @@
   $("hold").onclick = () => { resetWebAdapter(); $("hold").disabled = true; oscCommand("hold", { reason: "operator requested HOLD" }).then((result) => { state.osc = result.state; render(); }).catch((error) => phase(`HOLD失败：${error.message}`, true)); };
   $("freedrive").onclick = () => {
     // Clear the local UI only.  FREEDRIVE must not first submit a zero
-    // osc intent, because that would start a P1/Ruckig braking path before
+    // osc intent, because that would start a P1 servo braking path before
     // the dedicated direct Leader transition reaches the backend.
     resetWebAdapter();
     $("freedrive").disabled = true;

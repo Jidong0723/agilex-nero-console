@@ -954,17 +954,12 @@ class ShadowCpvPlant:
 
 
 class _OperationalSpaceServo:
-    """Fixed-rate operational-space servo: Pink, Ruckig and safety sync.
+    """Fixed-rate operational-space servo: Pink and safety sync.
 
-    This is the sole Pink/Ruckig/CPV loop inside the OSC runtime.
+    This is the sole Pink/CPV loop inside the OSC runtime.
     """
 
     def __init__(self, hardware: OscHardwarePort, project_root: Path, config: dict[str, Any], feedback_receiver: _OscFeedbackReceiver) -> None:
-        try:
-            import ruckig
-        except ImportError as exc:
-            raise RuntimeError("OSC requires ruckig in the control-service environment") from exc
-        self.ruckig = ruckig
         self.hardware, self.root, self.config = hardware, project_root, config
         self.limits, self.runtime = config.get("limits", {}), config.get("runtime", {})
         self._validate_tuning_config()
@@ -991,10 +986,6 @@ class _OperationalSpaceServo:
         self.motion_epoch = 0
         self.last_sent_velocity = [0.0] * 7
         self.trajectory: dict[str, list[float]] | None = None
-        self.ruckig_input = None
-        self.ruckig_output = None
-        self.ruckig_otg = None
-        self.ruckig_period_s: float | None = None
         self.posture_reference: list[float] | None = None
         self.shadow_joints: list[float] | None = None
         self.shadow_plant: ShadowCpvPlant | None = None
@@ -1049,7 +1040,6 @@ class _OperationalSpaceServo:
             "feedback_soft_stale_s": (0.04, 0.08, limits.get("feedback_soft_stale_s", 0.06)),
             "feedback_hard_stale_s": (0.1, 0.25, limits.get("feedback_hard_stale_s", 0.15)),
             "solver_stale_s": (0.02, 0.04, limits.get("solver_stale_s", 0.04)),
-            "input_filter_alpha": (0.35, 1.0, limits.get("input_filter_alpha", 1.0)),
         }
         for name, (lower, upper, raw) in ranges.items():
             try:
@@ -1122,7 +1112,7 @@ class _OperationalSpaceServo:
 
     def _invalidate_motion(self, reason: str) -> None:
         # This is a P1 braking request, not an ownership transfer. The active
-        # epoch remains valid long enough for Ruckig to transmit the braking
+        # epoch remains valid long enough for the servo to transmit the braking
         # curve. Ownership transfers use freeze_for_authority_change().
         session = dict(self.session or {})
         if session.get("execution_mode") != "shadow":
@@ -1159,12 +1149,8 @@ class _OperationalSpaceServo:
             self.trajectory_state = "HOLD_READY"
             self.trajectory_brake_reason = reason
 
-    def _initialize_ruckig(self, q: list[float], period: float) -> None:
-        period = max(0.001, min(0.1, float(period)))
-        self.ruckig_otg = self.ruckig.Ruckig(7, period)
-        self.ruckig_input = self.ruckig.InputParameter(7)
-        self.ruckig_output = self.ruckig.OutputParameter(7)
-        self.ruckig_period_s = period
+    def _initialize_trajectory(self, q: list[float]) -> None:
+        """Reset the CPV command state to measured joints at rest."""
         self.trajectory = {"position_rad": list(q), "velocity_rad_s": [0.0] * 7, "acceleration_rad_s2": [0.0] * 7}
         self.last_sent_velocity = [0.0] * 7
 
@@ -1198,12 +1184,12 @@ class _OperationalSpaceServo:
             self._bump_state()
             try:
                 if execution_mode == "shadow":
-                    authority = {"status": "shadow", "effective_lower_rad": self.authority.hard_lower, "effective_upper_rad": self.authority.hard_upper, "controller_speed_rad_s": [float(self.limits.get("joint_speed_rad_s", 1.5))] * 7, "controller_acceleration_rad_s2": [float(self.config.get("solver", {}).get("ruckig_max_acceleration", 5.0))] * 7}
+                    authority = {"status": "shadow", "effective_lower_rad": self.authority.hard_lower, "effective_upper_rad": self.authority.hard_upper, "controller_speed_rad_s": [float(self.limits.get("joint_speed_rad_s", 1.5))] * 7, "controller_acceleration_rad_s2": [float(self.config.get("solver", {}).get("joint_acceleration_limit_rad_s2", 5.0))] * 7}
                     self.authority.effective = authority
                 else:
                     self.hardware.require_operational_control()
                     authority = self._hardware_preflight()
-                self.supervisor.configure(authority, [float(self.limits.get("joint_speed_rad_s", 1.5))] * 7, [float(self.config.get("solver", {}).get("ruckig_max_acceleration", 5.0))] * 7)
+                self.supervisor.configure(authority, [float(self.limits.get("joint_speed_rad_s", 1.5))] * 7, [float(self.config.get("solver", {}).get("joint_acceleration_limit_rad_s2", 5.0))] * 7)
                 # Always create a fresh Pink bridge for a fresh session.  A
                 # previous hard reset can leave a solver child alive with a
                 # stale anchor; merely changing motion_epoch cannot make that
@@ -1245,14 +1231,14 @@ class _OperationalSpaceServo:
                     self._bump_state()
                 raise RuntimeError("osc tracking authority could not be granted")
             with self.lock:
-                self._initialize_ruckig([float(x) for x in joints], period)
+                self._initialize_trajectory([float(x) for x in joints])
                 self.posture_reference = [float(x) for x in joints]
                 self.shadow_joints = list(self.posture_reference)
                 shadow_config = dict(self.config.get("shadow_transport") or {})
                 # Shadow feedback follows the same controller limits as OSC;
                 # it must not introduce a second configurable limit.
                 shadow_config["max_joint_speed_rad_s"] = float(self.limits.get("joint_speed_rad_s", 1.5))
-                shadow_config["max_joint_acceleration_rad_s2"] = float(self.config.get("solver", {}).get("ruckig_max_acceleration", 5.0))
+                shadow_config["max_joint_acceleration_rad_s2"] = float(self.config.get("solver", {}).get("joint_acceleration_limit_rad_s2", 5.0))
                 self.shadow_plant = (
                     ShadowCpvPlant(shadow_config, self.posture_reference)
                     if execution_mode == "shadow" and bool(shadow_config.get("enabled", True)) else None
@@ -1655,7 +1641,7 @@ class _OperationalSpaceServo:
 
     def _sync_if_settled(self, feedback_q: list[float]) -> bool:
         if self.trajectory_state != "HOLD_READY": return False
-        self._initialize_ruckig(feedback_q, 1.0 / float(self.runtime.get("control_hz", 50)))
+        self._initialize_trajectory(feedback_q)
         # The posture objective is fixed for the complete OSC session. HOLD
         # and resume must not manufacture null-space stability by re-anchoring.
         if self.posture_reference is None:
@@ -1701,33 +1687,6 @@ class _OperationalSpaceServo:
         self.trajectory_brake_reason = None
         return True, "resumed from HOLD_READY"
 
-    def _advance_ruckig(self, target_velocity: list[float], period: float) -> tuple[list[float], dict[str, Any]]:
-        if self.trajectory is None or self.ruckig_input is None or self.ruckig_output is None or self.ruckig_otg is None:
-            raise RuntimeError("Ruckig state is not initialized")
-        period = max(0.001, min(0.1, float(period)))
-        # Ruckig's cycle time is fixed for the lifetime of the trajectory.
-        # Keep the same instance and pass its output state forward; rebuilding
-        # it from wall-clock jitter destroys the downstream dynamic state.
-        data = self.supervisor._require()
-        inp = self.ruckig_input
-        inp.current_position = self.trajectory["position_rad"]
-        inp.current_velocity = self.trajectory["velocity_rad_s"]
-        inp.current_acceleration = self.trajectory["acceleration_rad_s2"]
-        inp.target_velocity = list(target_velocity)
-        inp.target_acceleration = [0.0] * 7
-        inp.max_velocity = list(data["speed_rad_s"])
-        inp.max_acceleration = list(data["acceleration_rad_s2"])
-        inp.max_jerk = [float(self.config.get("solver", {}).get("ruckig_max_jerk", 20.0))] * 7
-        inp.control_interface = self.ruckig.ControlInterface.Velocity
-        started = time.perf_counter()
-        code = self.ruckig_otg.update(inp, self.ruckig_output)
-        elapsed = (time.perf_counter() - started) * 1000.0
-        if code < 0: raise RuntimeError(f"Ruckig rejected velocity trajectory: {code}")
-        velocity = list(self.ruckig_output.new_velocity)
-        self.trajectory = {"position_rad": list(self.ruckig_output.new_position), "velocity_rad_s": velocity, "acceleration_rad_s2": list(self.ruckig_output.new_acceleration)}
-        self.ruckig_output.pass_to_input(inp)
-        return velocity, {"ruckig_ms": elapsed, "cycle_s": self.ruckig_period_s, "measured_period_s": period, "result_code": int(code), "trajectory": dict(self.trajectory)}
-
     def _loop(self) -> None:
         hz = float(self.runtime.get("control_hz", 50)); period = 1.0 / hz
         # perf_counter has sub-millisecond resolution on Windows, unlike the
@@ -1739,7 +1698,7 @@ class _OperationalSpaceServo:
             if delay > 0:
                 # Windows wait handles can round an event wait to 31 ms. Use
                 # short sleeps while there is time left, then a short
-                # high-resolution spin so a 20 ms Ruckig cycle is not turned
+                # high-resolution spin so a 20 ms servo cycle is not turned
                 # into a scheduler-dependent 31 ms cycle.
                 while delay > 0 and not self.stop_event.is_set():
                     if delay > 0.005:
@@ -1750,7 +1709,7 @@ class _OperationalSpaceServo:
                 continue
             tick = clock()
             # Do not catch up missed ticks in a burst. A burst produces
-            # artificial 1 ms control intervals while Pink/Ruckig are still
+            # artificial 1 ms control intervals while Pink is still
             # configured around the nominal 20 ms servo period.
             next_tick = tick + period
             actual_dt = period if previous_tick is None else max(0.001, tick - previous_tick); previous_tick = tick
@@ -1938,20 +1897,6 @@ class _OperationalSpaceServo:
                         }
                 if state == "RUNNING" and pink and pink.get("ok"):
                     raw_dq = _finite_vector(pink.get("pink_joint_velocity_rad_s"), 7, "pink_joint_velocity_rad_s")
-                    direct_pink_cpv = bool(self.config.get("solver", {}).get("direct_pink_cpv_position", False))
-                    if not direct_pink_cpv:
-                        # Pink's position-task IK can chatter near workspace
-                        # boundaries even when the Cartesian target is fixed.
-                        # Smooth its velocity proposal before Ruckig so solver
-                        # sign changes do not become visible joint oscillation.
-                        filter_alpha = float(self.limits.get("input_filter_alpha", 1.0))
-                        if not math.isfinite(filter_alpha):
-                            filter_alpha = 1.0
-                        filter_alpha = max(0.05, min(1.0, filter_alpha))
-                        raw_dq = [
-                            filter_alpha * value + (1.0 - filter_alpha) * previous
-                            for value, previous in zip(raw_dq, self.last_sent_velocity)
-                        ]
                     delay_budget = self.supervisor.observe_delay(feedback_age, actual_dt, solver_age, float(self._timing.get("batch_skew_ms", 0.0) or 0.0) / 1000.0, float(self._timing.get("response_s", 0.0) or 0.0))
                     target_velocity, supervisor_report = self.supervisor.limit_velocity(q, qd, raw_dq, delay_budget)
                     soft_stale_scale = 1.0
@@ -1980,17 +1925,8 @@ class _OperationalSpaceServo:
                     delta = float(acceleration) * dispatch_dt
                     acceleration_limited.append(max(previous - delta, min(previous + delta, requested)))
                 target_velocity = acceleration_limited
-                direct_pink_cpv = bool(self.config.get("solver", {}).get("direct_pink_cpv_position", False))
-                if direct_pink_cpv:
-                    # Diagnostic mode: Pink's unfiltered differential-IK
-                    # output is integrated exactly once into the CPV joint
-                    # position.  Ruckig is intentionally not advanced.
-                    planned = list(target_velocity)
-                    ruckig_info = {"enabled": False, "mode": "bypassed", "reason": "direct Pink-to-CPV diagnostic mode", "measured_period_s": actual_dt}
-                else:
-                    planned, ruckig_info = self._advance_ruckig(target_velocity, actual_dt)
                 final_velocity, gate_ok, gate_reason = self.supervisor.final_gate(
-                    q, qd, planned, delay_budget,
+                    q, qd, target_velocity, delay_budget,
                     hard_stale and motion_or_brake_active,
                 )
                 gate_limited = gate_reason == "velocity clipped by final safety gate"
@@ -1998,24 +1934,26 @@ class _OperationalSpaceServo:
                     with self.lock: self.trajectory_state, self.trajectory_brake_reason = "FAULT", gate_reason or "final safety gate rejected velocity"
                     final_velocity = [0.0] * 7
                 settled = max(abs(x) for x in self.trajectory["velocity_rad_s"]) <= float(self.config.get("solver", {}).get("hold_velocity_epsilon_rad_s", 0.005)) and max(abs(x) for x in self.trajectory["acceleration_rad_s2"]) <= float(self.config.get("solver", {}).get("hold_acceleration_epsilon_rad_s2", 0.02))
+                # Integrate the final gated velocity once from current joints.
+                # Shadow and hardware use exactly the same CPV command state.
+                previous_velocity = list(self.trajectory["velocity_rad_s"])
+                position_target = [
+                    float(current) + float(command) * actual_dt
+                    for current, command in zip(q, final_velocity)
+                ]
+                self.trajectory["position_rad"] = list(position_target)
+                self.trajectory["velocity_rad_s"] = list(final_velocity)
+                self.trajectory["acceleration_rad_s2"] = [
+                    (float(command) - float(previous)) / max(0.001, actual_dt)
+                    for command, previous in zip(final_velocity, previous_velocity)
+                ]
                 if shadow:
                     # Build the identical CPV position target that hardware
                     # receives.  ShadowPlant applies it asynchronously; it is
                     # never promoted immediately to measured feedback.
-                    previous_velocity = list(self.trajectory["velocity_rad_s"])
-                    position_target = [
-                        float(current) + float(command) * actual_dt
-                        for current, command in zip(q, final_velocity)
-                    ]
                     self.shadow_joints = list(position_target)
                     if self.shadow_plant is not None:
                         self.shadow_plant.dispatch(position_target, time.monotonic())
-                    self.trajectory["position_rad"] = list(position_target)
-                    self.trajectory["velocity_rad_s"] = list(final_velocity)
-                    self.trajectory["acceleration_rad_s2"] = [
-                        (float(command) - float(previous)) / max(0.001, actual_dt)
-                        for command, previous in zip(final_velocity, previous_velocity)
-                    ]
                     result_reason = "shadow velocity servo"
                     if gate_limited:
                         result_reason += " with final safety gate velocity limit"
@@ -2023,25 +1961,9 @@ class _OperationalSpaceServo:
                         self.output_count += 1
                         self.last_output = {"status": "limited" if gate_limited else "accepted", "final_joint_target_rad": list(position_target), "final_joint_velocity_rad_s": list(final_velocity), "sequence": int((command or {}).get("sequence", session.get("sequence", 0))), "epoch": epoch}
                         self._last_dispatch_monotonic_ns = time.monotonic_ns()
-                    self._set_result(True, result_reason, robot_commands_sent=False, solver=pink if pink and pink.get("ok") else None, ruckig=ruckig_info, supervisor=supervisor_report, gate_reason=gate_reason, gate_limited=gate_limited, final_joint_target_rad=list(position_target), final_joint_velocity_rad_s=list(final_velocity))
+                    self._set_result(True, result_reason, robot_commands_sent=False, solver=pink if pink and pink.get("ok") else None, supervisor=supervisor_report, gate_reason=gate_reason, gate_limited=gate_limited, final_joint_target_rad=list(position_target), final_joint_velocity_rad_s=list(final_velocity))
                     batch = None
                 else:
-                    # In direct diagnostic mode, and whenever the final gate
-                    # changes Ruckig's proposal, build CPV from the measured
-                    # joints. This keeps the sole output a joint position.
-                    position_target = list(self.trajectory["position_rad"])
-                    if direct_pink_cpv or not gate_ok or any(abs(actual - planned_value) > 1e-9 for actual, planned_value in zip(final_velocity, planned)):
-                        previous_velocity = list(self.trajectory["velocity_rad_s"])
-                        position_target = [
-                            float(current) + float(command) * actual_dt
-                            for current, command in zip(q, final_velocity)
-                        ]
-                        self.trajectory["position_rad"] = list(position_target)
-                        self.trajectory["velocity_rad_s"] = list(final_velocity)
-                        self.trajectory["acceleration_rad_s2"] = [
-                            (float(command) - float(previous)) / max(0.001, actual_dt)
-                            for command, previous in zip(final_velocity, previous_velocity)
-                        ]
                     publication = self.hardware.publish_servo_position({
                         "control_sample_id": sample_id,
                         "target_generation": target_generation,
@@ -2065,7 +1987,7 @@ class _OperationalSpaceServo:
                         result_reason = "CPV measured-position hold sent after hard stale feedback"
                     elif gate_limited:
                         result_reason = "CPV joint-position batch sent with final safety gate velocity limit"
-                    self._set_result(gate_ok, result_reason, robot_commands_sent=False, solver=pink if pink and pink.get("ok") else None, ruckig=ruckig_info, supervisor=supervisor_report, gate_reason=gate_reason, gate_limited=gate_limited, final_joint_target_rad=list(position_target), final_joint_velocity_rad_s=list(final_velocity), cpv_mailbox=publication)
+                    self._set_result(gate_ok, result_reason, robot_commands_sent=False, solver=pink if pink and pink.get("ok") else None, supervisor=supervisor_report, gate_reason=gate_reason, gate_limited=gate_limited, final_joint_target_rad=list(position_target), final_joint_velocity_rad_s=list(final_velocity), cpv_mailbox=publication)
                 self.last_sent_velocity = list(final_velocity)
                 with self.lock:
                     arrival_position = float(self.config.get("osc", {}).get("arrival_position_tolerance_m", 0.0005))
@@ -2230,7 +2152,7 @@ class OscRuntime:
     def cpv_limits(self) -> tuple[float, float]:
         return (
             float(self._servo.limits.get("joint_speed_rad_s", 1.5)),
-            float(self._servo.config.get("solver", {}).get("ruckig_max_acceleration", 5.0)),
+            float(self._servo.config.get("solver", {}).get("joint_acceleration_limit_rad_s2", 5.0)),
         )
 
     def apply_hardware_calibration(self, calibration: dict[str, Any], feedback: dict[str, Any], cpv_parameters: dict[str, Any]) -> dict[str, Any]:

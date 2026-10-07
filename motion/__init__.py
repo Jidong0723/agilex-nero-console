@@ -1,4 +1,4 @@
-"""Deterministic OSC motion safety, Pink, and Ruckig."""
+"""Deterministic OSC motion safety, Pink, and CPV."""
 
 from .osc import OscRuntime
 

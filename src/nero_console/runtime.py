@@ -49,7 +49,7 @@ def doctor_report(root: Path | None = None) -> dict[str, Any]:
         "current_python": str(Path(sys.executable).resolve()),
         "control_python": str(control_python(base)),
         "kinematics_python": str(kinematics_python(base)),
-        "control_modules": {name: _module_status(name) for name in ("numpy", "ruckig", "pyAgxArm", "agx_cando", "can")},
+        "control_modules": {name: _module_status(name) for name in ("numpy", "pyAgxArm", "agx_cando", "can")},
         "kinematics_config": str(base / "environment-kinematics.yml"),
         "osc_config": str(base / "config" / "osc.json"),
     }
@@ -63,4 +63,3 @@ def doctor_report(root: Path | None = None) -> dict[str, Any]:
 
 def doctor_json(root: Path | None = None) -> str:
     return json.dumps(doctor_report(root), ensure_ascii=False, indent=2)
-

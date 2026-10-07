@@ -1,6 +1,6 @@
 """PICO 4 Ultra USB input adapter.
 
-This module intentionally has no robot, CAN, Pink, or Ruckig dependency.  It
+This module intentionally has no robot, CAN, or Pink dependency.  It
 owns headset-local concepts (controller anchors and buttons) and its
 only robot-facing calls are standard OSC commands.
 """

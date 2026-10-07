@@ -16,7 +16,7 @@ HTTP service / AdapterRuntime (127.0.0.1:8765)
 OperationalSpaceController process
   |-- lease manager
   |-- authority epoch / writer arbitration
-  |-- single Pink/Ruckig operational-space servo
+  |-- single Pink operational-space servo
   |-- safety validation
   |-- action lifecycle and logs
         |
@@ -53,8 +53,23 @@ can construct hardware transport.
 - `supervisor/authority.py`: current hardware writer, servo mode, and monotonically increasing authority epoch.
 - `nero_backend/robot.py`: NERO SDK access, feedback, mode transitions, CPV, joint/Cartesian motion, and gripper commands.
 - `motion/safety.py`: finite-value, dimension, status, speed, workspace, and gripper validation.
-- `motion/osc.py`: the OSC Pink/Ruckig/CPV servo for absolute TCP targets.
+- `motion/osc.py`: the OSC Pink/CPV servo for absolute TCP targets.
 - `motion/osc_kinematics_server.py`: separate Python 3.11 kinematics process.
+
+## OSC output path
+
+Pink proposes joint velocity from an absolute TCP target. The servo applies
+joint-limit and stale-feedback derating, checks acceleration against the
+dispatch interval, and applies the final safety gate. It integrates the final
+velocity once from current joints into a CPV position target; hardware and
+shadow use the same calculation. There is no alternative trajectory planner
+or input velocity filter.
+
+`solver.joint_acceleration_limit_rad_s2` configures the requested acceleration
+limit (20.0 in the shipped configuration). Hardware uses its intersection with
+the controller limits, while shadow uses it for its simulated plant. A missing
+solver result or a HOLD request brakes using the same limit. Hardware enters
+HOLD only after the final braking publication is accepted by the sender.
 
 ## Priorities
 

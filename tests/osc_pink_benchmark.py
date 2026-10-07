@@ -191,7 +191,7 @@ def run(settings: dict[str, float]) -> dict[str, Any]:
                 "last_sent_joint_velocity_rad_s": previous_velocity.tolist(),
                 "joint_speed_limit_rad_s": [float(limits["joint_speed_rad_s"])] * 7,
                 "joint_acceleration_limit_rad_s2": [
-                    float(settings.get("joint_acceleration_limit_rad_s2", solver_config["ruckig_max_acceleration"]))
+                    float(settings.get("joint_acceleration_limit_rad_s2", solver_config["joint_acceleration_limit_rad_s2"]))
                 ] * 7,
                 "soft_lower_rad": soft_lower,
                 "soft_upper_rad": soft_upper,

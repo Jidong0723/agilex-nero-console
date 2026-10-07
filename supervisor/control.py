@@ -1094,7 +1094,6 @@ class OperationalSpaceController:
             "estimated_tracking_error": estimated_tracking_error,
             "measured_tracking_error": measured_tracking_error,
             "pink": pink,
-            "ruckig": last_result.get("ruckig"),
             "safety_gate": gate,
             "timing": raw_diagnostics.get("timing", {}) if active_session else {},
             "cycle_trace": raw_diagnostics.get("cycle_trace", {}),
@@ -1162,7 +1161,7 @@ class OperationalSpaceController:
                 "mode": execution_mode,
                 "sample_id": execution_sample.get("sample_id"),
                 # Stable cross-stream identifiers used by the demonstration
-                # recorder to join feedback, Pink, Ruckig and the dispatched
+                # recorder to join feedback, Pink and the dispatched
                 # CPV sample without relying on wall-clock proximity alone.
                 "control_sample_id": execution_sample.get("sample_id"),
                 "feedback_revision": execution_sample.get("feedback_revision"),
@@ -1240,7 +1239,6 @@ class OperationalSpaceController:
             "target_generation": execution.get("target_generation", servo.get("target_generation")),
             "motion_epoch": diagnostics.get("motion_epoch", (servo.get("session") or {}).get("motion_epoch")),
             "pink": last_result.get("solver"),
-            "ruckig": diagnostics.get("ruckig"),
             "applied_joint_velocity_rad_s": (servo.get("last_dispatched") or {}).get("velocity_rad_s"),
             "output_status": (servo.get("last_dispatched") or {}).get("status"),
             "measured_tcp_pose": execution.get("measured_tcp_pose"),

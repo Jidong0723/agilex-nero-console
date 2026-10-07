@@ -11,7 +11,7 @@ target sent through the OSC API.
 
 ```text
 AdapterRuntime -> narrow OSC client -> OperationalSpaceController
-                                      -> Pink/Ruckig/Safety
+                                      -> Pink/Safety
                                       -> Shadow plant or CAN
 ```
 

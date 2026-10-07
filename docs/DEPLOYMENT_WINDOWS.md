@@ -22,7 +22,7 @@ Replace `<YOUR_REPOSITORY_URL>` with the published GitHub repository URL.
 
 The two environments are intentionally separate:
 
-- `.venv` runs the Web service, NERO SDK, CANDO backend, and Ruckig control loop.
+- `.venv` runs the Web service, NERO SDK, CANDO backend, and Pink-to-CPV control loop.
 - `.conda/nero-kinematics` runs Pinocchio and Pink in an isolated subprocess.
 
 Do not upload or copy either environment between computers. Virtual environments contain absolute paths and platform-specific binaries. Recreate them from `requirements.txt` and `environment-kinematics.yml` on every workstation. The service, watchdog, reset helper and spawned hardware worker always use the project `.venv`; only the solver uses `.conda/nero-kinematics`.
@@ -71,7 +71,7 @@ Expected versions are Pinocchio `4.1.0` and Pink `4.3.0`. If the executable is m
 ## Control environment checks
 
 ```powershell
-.\.venv\Scripts\python.exe -c "import numpy, ruckig, pyAgxArm, agx_cando; print('control imports OK')"
+.\.venv\Scripts\python.exe -c "import numpy, pyAgxArm, agx_cando; print('control imports OK')"
 ```
 
 If CANDO cannot be opened, verify the Windows driver, USB connection, architecture (x64), and that no second NERO control process owns the adapter. The service only supports one USB-CAN owner.

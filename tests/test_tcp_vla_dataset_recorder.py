@@ -49,7 +49,7 @@ class TcpVlaRawDatasetRecorderTests(unittest.TestCase):
                               "tcp_pose": pose},
                               "feedback_mailbox": {"received_monotonic_ns": now}},
                 "command": {"target_generation": 3, "epoch": 2, "target_tcp": pose},
-                "diagnostics": {"pink": {"ok": True}, "ruckig": {"enabled": True}},
+                "diagnostics": {"pink": {"ok": True}},
                 "gripper": {"width_m": 0.095},
             }
 
@@ -122,7 +122,7 @@ class TcpVlaRawDatasetRecorderTests(unittest.TestCase):
                 return {
                     "session": {"state": "ACTIVE", "execution_mode": "hardware"},
                     "execution": {"feedback_revision": 10},
-                    "diagnostics": {"ruckig": {"enabled": True}},
+                    "diagnostics": {},
                 }
 
             def sensor_sample(self, target_monotonic_ns, wait_s=0.0):
@@ -223,7 +223,7 @@ class TcpVlaRawDatasetRecorderTests(unittest.TestCase):
         class IncompleteOsc:
             def state(self):
                 return {"session": {"state": "ACTIVE", "execution_mode": "hardware"},
-                        "diagnostics": {"ruckig": {"enabled": True}}}
+                        "diagnostics": {}}
 
             def sensor_sample(self, target_monotonic_ns, wait_s=0.0):
                 return {"feedback_revision": 7, "feedback_monotonic_ns": target_monotonic_ns,
