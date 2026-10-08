@@ -1294,6 +1294,9 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     str(body.get("client_id", "anonymous")),
                     str(body.get("execution_mode", "shadow")),
                 ))
+            if self.path == "/api/osc/output-mode":
+                return self._json_ok(self.broker.osc_output_mode(
+                    str(body.get("mode", "")), str(body.get("client_id", ""))))
             if self.path == "/api/osc/command":
                 return self._json_ok(self.broker.osc_command(body))
             if self.path == "/api/osc/session/stop":

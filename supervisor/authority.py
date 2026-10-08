@@ -472,6 +472,14 @@ class HardwareTxOwner:
             last_finished_ns = self._cpv_last_finished_ns
             previous_target = self._cpv_last_target
             previous_velocity = self._cpv_last_velocity
+            output_mode = entry.get("output_mode", "cpv")
+            prior_mode = getattr(self, "_osc_last_output_mode", "cpv")
+            if (output_mode == "impedance" or prior_mode == "impedance") and (
+                    output_mode != prior_mode or int(entry["epoch"]) != getattr(self, "_osc_last_output_epoch", None)):
+                # A new MIT/CPV ownership boundary starts at measured position.
+                # Never interpolate a fresh mode's first target from old mode
+                # position/velocity history, which could resurrect an old pose.
+                previous_target, previous_velocity, last_finished_ns = None, None, None
             final_gate_limited = False
             if last_finished_ns is not None and previous_target is not None and previous_velocity is not None:
                 actual_dt = max(0.001, (started_ns - last_finished_ns) / 1e9)
@@ -490,9 +498,23 @@ class HardwareTxOwner:
             else:
                 velocity = [float(value) for value in entry.get("joint_velocity_rad_s") or [0.0] * 7]
             with self._active_lock:
-                self._active = {"method": "send_cpv_position", "priority": "p1", "category": "servo_position",
+                self._active = {"method": "send_impedance_command" if entry.get("output_mode") == "impedance" else "send_cpv_position", "priority": "p1", "category": "servo_position",
                                 "command_epoch": entry["epoch"], "mailbox_revision": revision, "started_monotonic_ns": started_ns}
-            result = self.backend.send_cpv_position(values)
+            if entry.get("output_mode") == "impedance":
+                command = dict(entry["impedance_command"])
+                command["q_des_rad"] = list(values)
+                def mit_guard():
+                    with self._epoch_lock:
+                        current = (int(entry["epoch"]) == self._epoch and self._pending_epoch is None
+                            and self._exclusive_category is None
+                            and int(entry.get("target_generation", -1)) >= self._cpv_generation_barrier.get(int(entry["epoch"]), -1))
+                    return current and (not callable(guard) or guard())
+                try:
+                    result = self.backend.send_impedance_command(command, execute_guard=mit_guard)
+                except PermissionError as exc:
+                    raise ServoWriteRevoked(str(exc)) from exc
+            else:
+                result = self.backend.send_cpv_position(values)
             finished_ns = time.monotonic_ns()
             result = dict(result or {})
             result.update({"status": "sent", "mailbox_revision": revision,
@@ -510,6 +532,7 @@ class HardwareTxOwner:
             with self._cpv_result_changed:
                 self._cpv_sent_count += 1; self._cpv_last_dispatched_revision = revision
                 self._cpv_last_target = list(values); self._cpv_last_velocity = list(velocity); self._cpv_last_finished_ns = finished_ns
+                self._osc_last_output_mode, self._osc_last_output_epoch = output_mode, int(entry["epoch"])
                 self._cpv_last_success = dict(result); self._cpv_last_result = dict(result); self._cpv_results[revision] = dict(result)
                 self._trim_cpv_results(); self._cpv_result_changed.notify_all()
         except ServoWriteRevoked as exc:

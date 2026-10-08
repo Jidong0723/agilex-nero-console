@@ -1,4 +1,5 @@
 from __future__ import annotations
+from contextlib import nullcontext
 import ctypes
 import json
 import math
@@ -27,6 +28,8 @@ class OscHardwarePort(Protocol):
 
     def require_operational_control(self) -> None: ...
     def prepare_osc_hardware(self) -> dict[str, Any]: ...
+    def prepare_osc_impedance(self, entry_factory, config: dict[str, Any]) -> dict[str, Any]: ...
+    def exit_osc_impedance(self, reason: str) -> dict[str, Any]: ...
     def osc_stream_active(self) -> bool: ...
     def grant_osc_tracking(self, session_id: str, epoch: int) -> bool: ...
     def mark_osc_stopping(self, session_id: str, epoch: int, reason: str) -> bool: ...
@@ -961,6 +964,9 @@ class _OperationalSpaceServo:
 
     def __init__(self, hardware: OscHardwarePort, project_root: Path, config: dict[str, Any], feedback_receiver: _OscFeedbackReceiver) -> None:
         self.hardware, self.root, self.config = hardware, project_root, config
+        from motion.osc_output import OutputSelection
+        self.output_selection = OutputSelection(project_root)
+        self.impedance_output = None
         self.limits, self.runtime = config.get("limits", {}), config.get("runtime", {})
         self._validate_tuning_config()
         # Import lazily: supervisor.control imports this module, while the
@@ -976,6 +982,7 @@ class _OperationalSpaceServo:
         # the old servo thread performs its normal braking shutdown.
         self._session_transition_lock = threading.Lock()
         self.session: dict[str, Any] | None = None
+        self.last_execution_mode = "hardware"
         self.state_sequence = 0
         self.last_error: str | None = None
         self._accepting_targets = False
@@ -1196,9 +1203,17 @@ class _OperationalSpaceServo:
                 # response safe for the new clutch.
                 self.solver.close()
                 self.solver.start()
+                if self.output_selection.mode == "impedance":
+                    from motion.osc_impedance import ImpedanceOutput
+                    self.impedance_output = ImpedanceOutput(self.root, self.config,
+                        authority["effective_lower_rad"], authority["effective_upper_rad"])
+                    entry_q = (list(self._wait_for_feedback()["joints"]) if execution_mode != "shadow"
+                        else _finite_vector(self.config.get("shadow_initial_joints_rad", [0.0] * 7), 7, "shadow_initial_joints_rad"))
+                    self.impedance_output.start(entry_q)
                 if execution_mode != "shadow":
                     feedback_revision = self._feedback_receiver.revision()
-                    hardware_authority = self.hardware.prepare_osc_hardware()
+                    hardware_authority = (self.hardware.prepare_osc_impedance(self.impedance_output.entry, self.impedance_output.config)
+                        if self.impedance_output else self.hardware.prepare_osc_hardware())
                     # RX runs for the whole OSC runtime. Require a sample
                     # published after hardware preparation before arming CPV.
                     feedback = self._feedback_receiver.wait_for_revision_after(
@@ -1209,8 +1224,17 @@ class _OperationalSpaceServo:
                     self._cpv_parameters = {"status": "not_part_of_osc_runtime"}
                 else:
                     joints = _finite_vector(self.config.get("shadow_initial_joints_rad", [0.0] * 7), 7, "shadow_initial_joints_rad")
+                if self.impedance_output:
+                    impedance_initial_pose = self._current_tcp_pose(joints)
             except Exception as exc:
                 self.solver.close()
+                if self.impedance_output:
+                    try:
+                        if execution_mode != "shadow":
+                            self.hardware.exit_osc_impedance("OSC MIT start failed")
+                    finally:
+                        self.impedance_output.close()
+                        self.impedance_output = None
                 with self.lock:
                     self.session = None
                     self.command = None
@@ -1222,6 +1246,10 @@ class _OperationalSpaceServo:
             period = 1.0 / float(self.runtime.get("control_hz", 50))
             if execution_mode != "shadow" and not self.hardware.grant_osc_tracking(session_id, int(hardware_authority["control_epoch"])):
                 self.solver.close()
+                if self.impedance_output:
+                    self.hardware.exit_osc_impedance("OSC MIT authority grant failed")
+                    self.impedance_output.close()
+                    self.impedance_output = None
                 with self.lock:
                     self.session = None
                     self.command = None
@@ -1243,6 +1271,9 @@ class _OperationalSpaceServo:
                     ShadowCpvPlant(shadow_config, self.posture_reference)
                     if execution_mode == "shadow" and bool(shadow_config.get("enabled", True)) else None
                 )
+                if execution_mode == "shadow" and self.impedance_output:
+                    from motion.osc_impedance import ShadowImpedancePlant
+                    self.shadow_plant = ShadowImpedancePlant(joints, self.impedance_output, shadow_config)
                 self.last_solver_result = None
                 self._solver_reuse_count = 0
                 self.control_sample_id = 0
@@ -1257,9 +1288,10 @@ class _OperationalSpaceServo:
                 self.motion_epoch = int(hardware_authority["control_epoch"]) if execution_mode != "shadow" else self.motion_epoch
                 self.solver.discard_before_epoch(self.motion_epoch)
                 self.session = {"state": "ACTIVE", "session_id": session_id, "client_id": client_id, "execution_mode": execution_mode, "started_at": time.time(), "sequence": 0, "last_input_age_s": None, "motion_epoch": self.motion_epoch}
+                self.last_execution_mode = execution_mode
                 self.command = None
                 self.target_generation += 1
-                self._target_pose = self._current_tcp_pose([float(x) for x in joints])
+                self._target_pose = impedance_initial_pose if self.impedance_output else self._current_tcp_pose([float(x) for x in joints])
                 # ``joints`` is obtained from the fresh RX sample required by
                 # hardware start_session.  Publish that measured TCP pose at
                 # once, before the first Pink cycle.  Input adapters need an
@@ -1311,6 +1343,7 @@ class _OperationalSpaceServo:
         """
         with self.lock:
             active = self._session_active()
+            shadow_session = (self.session or {}).get("execution_mode") == "shadow"
             if active:
                 self._invalidate_motion(reason)
         deadline = time.monotonic() + 1.5
@@ -1340,6 +1373,11 @@ class _OperationalSpaceServo:
         # CPV sample here could reopen CPV after the mode handoff.
         if servo_stopped:
             self.solver.close()
+            if self.impedance_output:
+                if not shadow_session:
+                    self.hardware.exit_osc_impedance(reason)
+                self.impedance_output.close()
+                self.impedance_output = None
         with self.lock:
             self.session = None
             self.last_error = None
@@ -1794,6 +1832,30 @@ class _OperationalSpaceServo:
                     state = self.trajectory_state; epoch = self.motion_epoch
                 # HOLD_READY is a frozen state until a fresh absolute OSC target arrives.
                 if state == "HOLD_READY":
+                    if self.impedance_output:
+                        if hard_stale:
+                            self._fault_zero("MIT hold feedback hard stale", shadow)
+                            continue
+                        if not shadow:
+                            transport = self.hardware.servo_transport_diagnostics()
+                            dispatch = transport.get("last_result") or {}
+                            if dispatch.get("status") == "failed":
+                                self._fault_zero(f"MIT hold dispatch failed: {dispatch}", shadow)
+                                continue
+                        hold_q = list((self.trajectory or {}).get("position_rad") or measured_q)
+                        mit = self.impedance_output.build(hold_q, measured_q, actual_dt, self.control_sample_id, epoch,
+                            feedback_monotonic_ns=(feedback or {}).get("monotonic_ns"))
+                        if shadow:
+                            self.shadow_plant.dispatch(hold_q, time.monotonic())
+                        elif self.hardware.servo_can_write(str(session.get("session_id")), epoch):
+                            self.hardware.publish_servo_position({
+                                "joint_target_rad": hold_q, "joint_velocity_rad_s": [0.0] * 7,
+                                "output_mode": "impedance", "impedance_command": mit,
+                                "target_generation": self.target_generation,
+                                "control_sample_id": self.control_sample_id,
+                                "max_joint_speed_rad_s": float(self.limits.get("joint_speed_rad_s", 1.5)),
+                                "max_joint_acceleration_rad_s2": max(self.supervisor.limit_data["acceleration_rad_s2"]),
+                            }, str(session.get("session_id")), epoch)
                     with self.lock:
                         self._timing = {
                             "actual_dt_s": actual_dt,
@@ -1947,6 +2009,14 @@ class _OperationalSpaceServo:
                     (float(command) - float(previous)) / max(0.001, actual_dt)
                     for command, previous in zip(final_velocity, previous_velocity)
                 ]
+                output_fields = {}
+                if self.impedance_output:
+                    if hard_stale:
+                        self._fault_zero("MIT feedback hard stale", shadow)
+                        continue
+                    mit = self.impedance_output.build(position_target, measured_q, actual_dt, sample_id, epoch,
+                        feedback_monotonic_ns=(feedback or {}).get("monotonic_ns"))
+                    output_fields = {"output_mode": "impedance", "impedance_command": mit}
                 if shadow:
                     # Build the identical CPV position target that hardware
                     # receives.  ShadowPlant applies it asynchronously; it is
@@ -1965,6 +2035,7 @@ class _OperationalSpaceServo:
                     batch = None
                 else:
                     publication = self.hardware.publish_servo_position({
+                        **output_fields,
                         "control_sample_id": sample_id,
                         "target_generation": target_generation,
                         "sequence": int((command or {}).get("sequence", session.get("sequence", 0))),
@@ -2101,12 +2172,17 @@ class _OperationalSpaceServo:
                         self.trajectory_brake_reason = "servo write authority revoked"
                 self._set_result(False, str(exc), robot_commands_sent=False)
             except Exception as exc:
-                self._fault_zero(f"osc loop: {type(exc).__name__}: {exc}", shadow=False)
+                self._fault_zero(f"osc loop: {type(exc).__name__}: {exc}", shadow=bool((self.session or {}).get("execution_mode") == "shadow"))
 
     def _fault_zero(self, reason: str, shadow: bool) -> None:
         with self.lock: self.trajectory_state, self.trajectory_brake_reason = "FAULT", reason
         if not shadow:
             self.hardware.trigger_safety_fault(reason)
+        if self.impedance_output:
+            self.stop_event.set()
+            with self.lock:
+                self.trajectory_state, self.trajectory_brake_reason = "FAULT", reason
+                self._accepting_targets = False
         self.last_sent_velocity = [0.0] * 7
         self._set_result(False, reason, robot_commands_sent=not shadow)
 
@@ -2134,7 +2210,61 @@ class OscRuntime:
     def wait_for_rx_after(self, revision: int, timeout_s: float) -> dict[str, Any]:
         return self._receiver.wait_for_revision_after(revision, timeout_s)
 
-    def status(self) -> dict[str, Any]: return self._servo.status()
+    def status(self) -> dict[str, Any]:
+        return {**self._servo.status(), **self.output_status()}
+
+    def output_status(self) -> dict[str, Any]:
+        servo = self._servo
+        with servo.lock:
+            state = servo.trajectory_state if servo.session else "IDLE"
+            reason = None
+            if servo.session and servo.session.get("state") != "ACTIVE":
+                reason = "OSC mode transition in progress"
+            elif state not in {"IDLE", "HOLD_READY"}:
+                reason = f"output switch requires IDLE or settled HOLD_READY, current={state}"
+            elif servo.session and (max(map(abs, (servo.trajectory or {}).get("velocity_rad_s", [0]))) > 0.005
+                    or max(map(abs, (servo.trajectory or {}).get("acceleration_rad_s2", [0]))) > 0.02):
+                reason = "OSC is not settled"
+            return {"output_mode": servo.output_selection.mode,
+                "output_switch": {"allowed": reason is None, "reason": reason,
+                    "execution_mode": (servo.session or {}).get("execution_mode", servo.last_execution_mode),
+                    "selection_error": servo.output_selection.error},
+                "impedance": servo.impedance_output.diagnostics() if servo.impedance_output else {"loaded": False}}
+
+    def select_output_mode(self, mode: str, client_id: str, stop_hardware, *, handoff_lock=None, switch_guard=None) -> dict[str, Any]:
+        from motion.osc_output import OutputSelection
+        mode = OutputSelection.validate(mode)
+        servo = self._servo
+        # Match start_session's lock order: session transition before hardware
+        # handoff. Reversing this order can deadlock a concurrent mode choice
+        # against an in-progress hardware session start.
+        with servo._session_transition_lock, (handoff_lock or nullcontext()):
+            if switch_guard:
+                switch_guard()
+            with servo.lock:
+                switch = self.output_status()["output_switch"]
+                if not switch["allowed"]:
+                    raise PermissionError(switch["reason"])
+                if servo.session and servo.session.get("client_id") != client_id:
+                    raise PermissionError("OSC session is owned by another client")
+                if mode == servo.output_selection.mode:
+                    if servo.output_selection.error:
+                        servo.output_selection.save(mode)
+                        servo._bump_state()
+                    return self.status()
+                hardware = bool(servo.session and servo.session.get("execution_mode") == "hardware")
+                servo._accepting_targets = False
+            stopped = servo.stop_session("OSC output mode selected")
+            if not stopped["handoff"]["servo_stopped"]:
+                raise RuntimeError("OSC output switch failed: servo thread did not stop")
+            if hardware:
+                result = stop_hardware()
+                if not result.get("ok"):
+                    raise RuntimeError(f"OSC output switch hardware exit failed: {result}")
+            with servo.lock:
+                servo.output_selection.save(mode)
+                servo._bump_state()
+            return self.status()
     def fast_status(self) -> dict[str, Any]: return self._servo.fast_status()
     def target_pose(self) -> dict[str, list[float]] | None: return self._servo._public_target_pose()
     def accepting_targets(self) -> bool: return self._servo._is_accepting_targets()

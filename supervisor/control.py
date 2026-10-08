@@ -18,6 +18,7 @@ from .authority import (
 from nero_backend.robot import NeroRobot
 from shared.schemas import jsonable, now_iso
 from motion.osc import OscRuntime, pose_from_tcp
+from motion.safety import arm_status_has_error
 from .telemetry import TelemetryReader
 from .hardware_maintenance import HardwareMaintenance
 
@@ -127,6 +128,8 @@ class _ControllerOscCommandPort:
 
     def require_operational_control(self) -> None: self._controller._require_operational_control()
     def prepare_osc_hardware(self) -> dict[str, Any]: return self._controller.prepare_osc_hardware()
+    def prepare_osc_impedance(self, entry_factory, config: dict[str, Any]) -> dict[str, Any]: return self._controller.prepare_osc_impedance(entry_factory, config)
+    def exit_osc_impedance(self, reason: str) -> dict[str, Any]: return self._controller.exit_osc_impedance(reason)
     def osc_stream_active(self) -> bool: return self._controller.osc_stream_active()
     def grant_osc_tracking(self, session_id: str, epoch: int) -> bool: return self._controller.grant_osc_tracking(session_id, epoch)
     def mark_osc_stopping(self, session_id: str, epoch: int, reason: str) -> bool: return self._controller.mark_osc_stopping(session_id, epoch, reason)
@@ -185,6 +188,7 @@ class OperationalSpaceController:
         self.supervisor = ControlSupervisor()
         self._status_cache: tuple[float, dict[str, Any]] | None = None
         self._last_cpv_mode_entry: dict[str, Any] | None = None
+        self._last_impedance_mode_entry: dict[str, Any] | None = None
         self._cpv_profile_cache: dict[str, Any] = {"status": "not_read"}
         self._active_action: dict[str, Any] | None = None
         self._action_observers: list[Callable[..., None]] = []
@@ -358,6 +362,70 @@ class OperationalSpaceController:
 
         threading.Thread(target=request_reset, name="transport-fault-reset", daemon=True).start()
 
+    def prepare_osc_impedance(self, entry_factory, config: dict[str, Any]) -> dict[str, Any]:
+        # STARTING pauses aggregate polling while Pink/gravity warm up. Its
+        # cache age is not CAN feedback age; retain the preflight checks and
+        # require the independent RX sample before touching the hardware.
+        self._require_operational_control(allow_stale=True)
+        feedback = self._osc_cached_feedback()
+        age = feedback.get("age_s")
+        joints = feedback.get("joint_angles_rad") or []
+        velocities = feedback.get("joint_velocity_rad_s") or []
+        if (not isinstance(age, (int, float)) or not math.isfinite(age) or not 0 <= age <= 0.15
+                or len(joints) != 7 or len(velocities) != 7
+                or not all(isinstance(x, (int, float)) and math.isfinite(x) for x in [*joints, *velocities])):
+            raise RuntimeError("MIT preparation requires fresh seven-joint CAN feedback")
+        with self._handoff_lock:
+            control = self.robot.get_control_state()
+            readiness = self._feedback_readiness(control)
+            if (not readiness.get("ok") or control.get("mode") in {"FAULT", "DISCONNECTED", "DEGRADED", "EMERGENCY_DAMPING"}
+                    or control.get("emergency_latched")
+                    or arm_status_has_error((control.get("robot") or {}).get("arm_status"))
+                    or self.supervisor.snapshot().writer == ArmWriter.SAFETY):
+                raise RuntimeError("MIT preparation requires connected, fault-free hardware feedback")
+            if control.get("mode") == "FREEDRIVE":
+                result = self.robot.hold_follower_without_position_target("OSC MIT start exits FREEDRIVE").to_dict()
+                if not result.get("ok"):
+                    raise RuntimeError(f"cannot exit FREEDRIVE for MIT: {result}")
+            state = self._set_authority(ArmWriter.SERVO, ServoMode.HOLDING, "OSC MIT session prepared", advance_epoch=True)
+            epoch = int(state["control_epoch"])
+            def measured_entry(q):
+                sample = self._osc.rx_snapshot() or {}
+                age = sample.get("age_s")
+                measured = sample.get("joints") or []
+                velocities = sample.get("velocities") or []
+                if (not isinstance(age, (float, int)) or not 0 <= age <= 0.06
+                        or len(measured) != 7 or len(velocities) != 7
+                        or not all(math.isfinite(float(x)) for x in [*measured, *velocities])
+                        or max(abs(float(x)) for x in velocities) > 0.04
+                        or max(abs(float(a) - float(b)) for a, b in zip(q, measured)) > 0.02):
+                    raise RuntimeError("MIT first frame requires fresh, settled measured joints")
+                command = entry_factory(list(measured))
+                command["motion_epoch"] = epoch
+                command["feedback_monotonic_ns"] = sample["fresh_received_at_monotonic_ns"]
+                return command
+            try:
+                entry = self.robot.call("p1", "prepare_impedance", measured_entry, config,
+                    entry_guard=lambda: self.supervisor.allows_servo(None, epoch),
+                    command_epoch=epoch, category="servo_position",
+                    execute_guard=lambda: self.supervisor.allows_servo(None, epoch), dispatch_timeout_s=5.0)
+                self._last_impedance_mode_entry = entry.get("impedance_mode_entry")
+            except Exception:
+                self._set_authority(ArmWriter.NONE, ServoMode.SUSPENDED, "OSC MIT preparation failed", advance_epoch=True)
+                raise
+            return state
+
+    def exit_osc_impedance(self, reason: str) -> dict[str, Any]:
+        state = self._set_authority(ArmWriter.MODE_TRANSITION, ServoMode.SUSPENDED,
+            "OSC MIT exit", advance_epoch=True)
+        try:
+            result = self.robot.call("p0", "exit_impedance_mode", reason, dispatch_timeout_s=3.0)
+            self._set_authority(ArmWriter.SERVO, ServoMode.HOLDING, reason)
+            return result
+        except Exception:
+            self._set_authority(ArmWriter.SAFETY, ServoMode.HOLDING, "FAULT: MIT exit unconfirmed")
+            raise
+
     def _osc_cached_feedback(self) -> dict[str, Any]:
         """Read only the OSC-owned RX snapshot; never enqueue a P2 call."""
         sample = self._osc.rx_snapshot()
@@ -524,7 +592,7 @@ class OperationalSpaceController:
             self.robot.config.get("control_service", {}).get("servo_velocity_dispatch_timeout_s", 0.75),
         ))
         if (
-            active.get("method") == "send_cpv_position"
+            active.get("method") in {"send_cpv_position", "send_impedance_command"}
             and float(active.get("age_ms") or 0.0) > timeout_s * 1000.0
         ):
             progress = getattr(self._transport_owner.backend, "cpv_dispatch_progress", lambda: {})()
@@ -566,7 +634,8 @@ class OperationalSpaceController:
                     )
                 )
                 batch = self.robot.call(
-                    "p0", "prime_cpv_position_from_feedback",
+                    "p0", ("exit_impedance_mode" if getattr(self._transport_owner.backend, "impedance_stream_active", lambda: False)()
+                           else "prime_cpv_position_from_feedback"),
                     dispatch_timeout_s=max(0.05, safety_timeout_s),
                 )
             except Exception as exc:
@@ -1027,6 +1096,53 @@ class OperationalSpaceController:
             response["state"] = self.osc_state()
         return response
 
+    def _output_switch_status(self, control: dict[str, Any]) -> dict[str, Any]:
+        result = dict(self._osc.output_status()["output_switch"])
+        authority = self.authority_status(control)
+        reason = result.get("reason")
+        if authority["safety_state"] == "FAULT":
+            reason = "fault must be cleared before selecting OSC output"
+        elif authority["arm_writer"] == "MODE_TRANSITION" or authority["servo_mode"] in {"TRACKING", "STOPPING"}:
+            reason = "motion or hardware mode transition in progress; HOLD first"
+        elif self._active_action is not None or self.leases.current() is not None:
+            reason = "an action or control lease is active"
+        else:
+            with self._jobs_lock:
+                if any(job.get("status") in {"queued", "running"} for job in self._jobs.values()):
+                    reason = "an operator action is pending"
+        session = self._osc.status().get("session") or {}
+        if session.get("execution_mode", result.get("execution_mode")) != "shadow":
+            feedback = self._osc_cached_feedback()
+            velocities = feedback.get("joint_velocity_rad_s") or []
+            joints = feedback.get("joint_angles_rad") or []
+            age = feedback.get("age_s")
+            fresh = (isinstance(age, (int, float)) and math.isfinite(age) and 0 <= age <= 0.15
+                and len(velocities) == len(joints) == 7
+                and all(isinstance(x, (int, float)) and math.isfinite(x) for x in [*joints, *velocities]))
+            if (not control.get("connected") or control.get("mode") != "HOLD"
+                    or authority["servo_mode"] != "HOLDING"):
+                reason = "hardware must be in confirmed HOLD before output switch"
+            elif control.get("emergency_latched") or arm_status_has_error((control.get("robot") or {}).get("arm_status")):
+                reason = "hardware fault must be cleared before output switch"
+            elif not fresh:
+                reason = "fresh seven-joint feedback required before output switch"
+            elif max(abs(float(x)) for x in velocities) > 0.04:
+                reason = "hardware is not settled; HOLD first"
+        return {**result, "allowed": reason is None, "reason": reason}
+
+    def osc_output_mode(self, mode: str, client_id: str) -> dict[str, Any]:
+        if not str(client_id).strip():
+            raise ValueError("client_id is required")
+        def switch_guard():
+            switch = self._output_switch_status(self.status().get("control") or {})
+            if not switch["allowed"]:
+                raise PermissionError(switch["reason"])
+        switch_guard()
+        self._osc.select_output_mode(mode, client_id,
+            lambda: self.handoff_to_console("OSC output mode switch"),
+            handoff_lock=self._handoff_lock, switch_guard=switch_guard)
+        return {"ok": True, "state": self.osc_state()}
+
     def osc_state(self) -> dict[str, Any]:
         servo = dict(self._osc.status())
         session = servo.get("session")
@@ -1146,6 +1262,10 @@ class OperationalSpaceController:
                            "norm_rad": math.sqrt(sum(value * value for value in error))}
         return {
             "schema_version": "nero.osc.v2",
+            "output_mode": servo.get("output_mode", "cpv"),
+            "output_switch": self._output_switch_status(snapshot.get("control") or {}),
+            "impedance": {**servo.get("impedance", {"loaded": False}),
+                "last_mode_entry": self._last_impedance_mode_entry},
             "state_sequence": servo.get("state_sequence", 0),
             "session": session,
             "command": {

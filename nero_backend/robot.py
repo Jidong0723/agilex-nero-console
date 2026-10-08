@@ -232,6 +232,8 @@ class NeroRobot:
     def disconnect(self) -> dict[str, Any]:
         if self.robot is None:
             return {"ok": True, "value": "not_connected"}
+        if self.impedance_stream_active():
+            self.exit_impedance_mode("control service disconnect")
         result = call_safe("disconnect", self.robot.disconnect)
         self.robot = None
         self.gripper = None
@@ -332,7 +334,7 @@ class NeroRobot:
             "leader_feedback_hz": leader_hz if leader_active else None,
             "emergency_latched": self._emergency_latched,
             "freedrive_recovery": dict(self._freedrive_recovery),
-            "continuous_stream_active": self._cpv_stream_started,
+            "continuous_stream_active": self.continuous_stream_active(),
             "arm_status_feedback": self.arm_status_snapshot(),
             "error": error,
         }
@@ -346,6 +348,9 @@ class NeroRobot:
         command are sent after the CPV stream has reached zero velocity.
         """
         self.request_preempt(reason)
+        if self.impedance_stream_active():
+            result = self.exit_impedance_mode(reason)
+            return self._control_result("follower_hold", reason, True, True, result)
         transition_epoch = self.preempt_epoch()
         if self.robot is None:
             return self._control_result(
@@ -973,6 +978,8 @@ class NeroRobot:
 
     def _enter_cpv_stream_if_needed(self) -> dict[str, Any]:
         """Enter CPV once and require a post-command Arm Status revision."""
+        if self.impedance_stream_active():
+            raise RuntimeError("cannot send CPV while MIT exit is unconfirmed")
         if self._cpv_stream_started:
             return {"entered": False, "confirmed": True, **self.arm_status_snapshot()}
         if self.robot is None:
@@ -1056,7 +1063,27 @@ class NeroRobot:
 
     def continuous_stream_active(self) -> bool:
         """Whether a CPV stream still owns the controller motion mode."""
-        return bool(self._cpv_stream_started)
+        return bool(self._cpv_stream_started or self.impedance_stream_active())
+
+    def impedance_stream_active(self) -> bool:
+        adapter = getattr(self, "_osc_impedance_hardware", None)
+        return bool(adapter and adapter.active)
+
+    def prepare_impedance(self, entry_factory, config: dict[str, Any], entry_guard=None) -> dict[str, Any]:
+        from nero_backend.osc_impedance import ImpedanceHardware
+        if getattr(self, "_osc_impedance_hardware", None) is None:
+            self._osc_impedance_hardware = ImpedanceHardware(self)
+        return self._osc_impedance_hardware.enter(entry_factory, config, entry_guard)
+
+    def send_impedance_command(self, command: dict[str, Any], execute_guard=None) -> dict[str, Any]:
+        if not self.impedance_stream_active():
+            raise RuntimeError("MIT output is inactive")
+        return self._osc_impedance_hardware.send(command, execute_guard)
+
+    def exit_impedance_mode(self, reason: str = "OSC MIT stop") -> dict[str, Any]:
+        if not self.impedance_stream_active():
+            return {"ok": True, "already_exited": True}
+        return self._osc_impedance_hardware.exit(reason)
 
     def stop_cpv_for_mode_transition(self, reason: str = "mode transition requested") -> dict[str, Any]:
         """Quiesce CPV before an official Follower or Leader transition.
@@ -1066,6 +1093,8 @@ class NeroRobot:
         """
         if self.robot is None:
             raise RuntimeError("robot not connected")
+        if self.impedance_stream_active():
+            return self.exit_impedance_mode(reason)
         with self._transition_lock:
             was_active = bool(
                 self._cpv_stream_started

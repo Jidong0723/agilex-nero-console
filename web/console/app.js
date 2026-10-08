@@ -61,6 +61,10 @@
     right: [0, 0],
     rightMode: "zy",
     webAdapterActive: false,
+    webAdapterSessionId: null,
+    webAdapterEpoch: null,
+    connecting: false,
+    outputModeBusy: false,
     picoMappingDraft: null,
     picoMappingOverride: null,
     picoMappingBusy: false,
@@ -309,10 +313,46 @@
   }
 
   function resetWebAdapter() {
+    state.requestGeneration += 1;
     state.webAdapterActive = false;
+    state.webAdapterSessionId = null;
+    state.webAdapterEpoch = null;
     state.oscAnchor = null;
     state.intentPending = false;
     resetInput(false);
+  }
+
+  function updateOscState(osc, authoritative = false) {
+    if (!osc) return false;
+    const sequence = Number(osc.state_sequence || osc.session?.sequence || 0);
+    if (!authoritative && sequence < state.latestSequence) return false;
+    state.latestSequence = sequence;
+    state.osc = osc;
+    state.oscSequence = Math.max(state.oscSequence, Number(osc.command?.sequence || osc.session?.sequence || 0));
+    return true;
+  }
+
+  async function selectOutputMode(mode) {
+    if (state.outputModeBusy || !state.osc?.output_switch?.allowed) return;
+    if (mode === state.osc.output_mode && !state.osc.output_switch.selection_error) return;
+    const generation = ++state.requestGeneration;
+    state.outputModeBusy = true;
+    render();
+    try {
+      const result = await api("/api/osc/output-mode", "POST", { mode, client_id: clientId }, 10000);
+      if (generation !== state.requestGeneration) return;
+      updateOscState(result.state);
+      render();
+      phase("输出模式已选择。请重新连接输入适配器；不会自动恢复运动。");
+    } catch (error) {
+      if (generation !== state.requestGeneration) return;
+      phase(`输出模式切换失败：${error.message}`, true);
+      const osc = await api("/api/osc/state", "GET").catch(() => null);
+      if (generation === state.requestGeneration) updateOscState(osc);
+    } finally {
+      state.outputModeBusy = false;
+      render();
+    }
   }
 
   const selectedAdapter = () => $("input-adapter")?.value || "web";
@@ -561,7 +601,7 @@
       let current = session();
       if (current.state !== "ACTIVE") {
         const started = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId }, 10000);
-        state.osc = started.state; current = session();
+        updateOscState(started.state, true); current = session();
       }
       state.pico = await api("/api/adapters/pico/connect", "POST", { session_id: current.id, client_id: clientId }, 10000);
        phase("PICO USB 接收器已启动；请运行 ADB 转发脚本并连接 APK。 "); render();
@@ -570,7 +610,7 @@
   }
 
   async function stopPico() {
-    try { state.pico = await api("/api/adapters/pico/disconnect", "POST", { reason: "Console disconnected PICO" }); state.osc = (await api("/api/osc/session/stop", "POST", { reason: "PICO Adapter disconnected" })).state; render(); }
+    try { state.pico = await api("/api/adapters/pico/disconnect", "POST", { reason: "Console disconnected PICO" }); updateOscState((await api("/api/osc/session/stop", "POST", { reason: "PICO Adapter disconnected" })).state); render(); }
     catch (error) { phase(`PICO 断开失败：${error.message}`, true); }
   }
 
@@ -722,6 +762,8 @@
     if (!target?.position_m || !target?.orientation_xyzw) return phase("OSC 尚未提供当前 TCP 位姿", true);
     state.oscAnchor = { position_m: [...target.position_m], orientation_xyzw: [...target.orientation_xyzw] };
     state.webAdapterActive = true;
+    state.webAdapterSessionId = current.id;
+    state.webAdapterEpoch = state.osc?.authority?.control_epoch;
     resetInput(false);
     state.lastPoseTick = performance.now();
     updateInputView(); render();
@@ -822,6 +864,7 @@
     const current = session();
     if (current.state !== "ACTIVE" || current.client_id !== clientId) return;
     if (!state.webAdapterActive) return;
+    const generation = state.requestGeneration;
     const anchor = state.oscAnchor || state.osc?.command?.target_tcp;
     if (!anchor?.position_m || !anchor?.orientation_xyzw) return;
     const sequence = nextOscSequence();
@@ -837,12 +880,11 @@
       acknowledgement_only: true,
       payload: { target_pose: targetPose },
     }, 3000);
+    if (generation !== state.requestGeneration || current.id !== session().id) return;
     if (result?.state) {
-      const resultSequence = Number(result.state.state_sequence || result.state.session?.sequence || 0);
-      if (resultSequence >= state.latestSequence) {
-        state.latestSequence = resultSequence;
-        state.osc = result.state;
-      }
+      updateOscState(result.state);
+      render();
+      if (generation !== state.requestGeneration) return;
     }
     if (!result?.ok) {
       const acceptedSequence = Number(result?.result?.accepted_sequence);
@@ -873,8 +915,9 @@
       return;
     }
     state.intentBusy = true;
+    const generation = state.requestGeneration;
     sendIntent().catch((error) => {
-      if (state.webAdapterActive) phase(`意图发送失败：${error.message}`, true);
+      if (generation === state.requestGeneration && state.webAdapterActive) phase(`意图发送失败：${error.message}`, true);
     }).finally(() => {
       state.intentBusy = false;
       if (state.intentPending) {
@@ -1033,7 +1076,25 @@
   }
 
   function render() {
+    const currentSession = session();
+    if (state.webAdapterActive && (currentSession.state !== "ACTIVE" || currentSession.client_id !== clientId ||
+        currentSession.id !== state.webAdapterSessionId || state.osc?.authority?.control_epoch !== state.webAdapterEpoch)) {
+      resetWebAdapter();
+    }
     const osc = state.osc || {};
+    const outputSwitch = osc.output_switch || {};
+    for (const mode of ["cpv", "impedance"]) {
+      const button = $(`output-${mode}`);
+      if (!button) continue;
+      button.disabled = state.outputModeBusy || !outputSwitch.allowed;
+      button.setAttribute("aria-pressed", String((osc.output_mode || "cpv") === mode));
+      button.classList.toggle("primary", (osc.output_mode || "cpv") === mode);
+      button.title = outputSwitch.reason || "选择下一次启动的输出模式，不自动运动";
+    }
+    if ($("output-mode-note")) $("output-mode-note").textContent =
+      `当前选择：${osc.output_mode === "impedance" ? "阻抗控制（裸法兰重力模型，忽略夹爪质量）" : "原控制 CPV"}。` +
+      (outputSwitch.reason || "停稳后可选择；切换结束旧会话，再次连接时从实测姿态启动。") +
+      (outputSwitch.selection_error ? ` ${outputSwitch.selection_error}` : "");
     const broker = osc.authority || {};
     const transport = osc.transport || {};
     const command = osc.command || {};
@@ -1118,7 +1179,7 @@
     $("gate-state").textContent = timing.gate_limited === true ? "限速" : timing.gate_ok === true ? "通过" : timing.gate_ok === false ? "拒绝" : "--";
     $("trajectory-state").textContent = diagnostic.trajectory_state || "--";
     const source = execution.observed_source || "--";
-    $("observed-source").textContent = source === "simulated_cpv_feedback" ? "影子 CPV 模拟" : source === "measured_can_feedback" ? "CAN 实测" : "--";
+    $("observed-source").textContent = source === "simulated_cpv_feedback" ? "影子反馈模拟" : source === "measured_can_feedback" ? "CAN 实测" : "--";
     const jointTargetError = execution.joint_target_error || {};
     $("joint-target-error").textContent = Number.isFinite(finite(jointTargetError.max_abs_rad, NaN)) ? `${fixed(jointTargetError.max_abs_rad * 180 / Math.PI, 2)}°` : "--";
     const active = current.state === "ACTIVE";
@@ -1126,7 +1187,7 @@
     // only this browser's adapter state.  The OSC session may still be
     // ACTIVE and owned by this client, so keep a path to re-anchor/reconnect
     // instead of stranding the UI behind a disabled button.
-    $("start").disabled = current.state === "STARTING" || (active && state.webAdapterActive);
+    $("start").disabled = state.connecting || current.state === "STARTING" || (active && state.webAdapterActive);
     $("start").textContent = active && !state.webAdapterActive ? "重新接入 WebAdapter" : "接入 WebAdapter";
     $("stop").disabled = !active;
     if ($("reanchor")) {
@@ -1172,12 +1233,7 @@
       if (generation !== state.requestGeneration) return;
       const oscResult = results[0];
       if (oscResult.status === "fulfilled") {
-        const osc = oscResult.value;
-        const sequence = Number(osc.state_sequence || osc.session?.sequence || 0);
-        if (sequence >= state.latestSequence) {
-          state.latestSequence = sequence;
-          state.osc = osc;
-        }
+        updateOscState(oscResult.value);
       }
       if (includeAuxiliary) {
         const pi05Result = results[1];
@@ -1221,21 +1277,21 @@
   }
 
   async function connectWebAdapter() {
-    state.requestGeneration += 1;
+    if (state.connecting) return;
     resetWebAdapter();
+    const generation = state.requestGeneration;
+    state.connecting = true;
     $("start").disabled = true;
     phase("正在接入 WebAdapter…");
     const executionMode = $("execution-mode").value;
     try {
       const result = await api("/api/osc/session/start", "POST", { execution_mode: executionMode, client_id: clientId }, 10000);
+      if (generation !== state.requestGeneration) return;
       const osc = result.state;
-      const sequence = Number(osc?.state_sequence || osc?.session?.sequence || 0);
       // A control-service restart resets state_sequence to zero.  This is a
       // fresh authoritative response to the user's explicit connect action,
       // so it must replace any snapshot from the previous process instance.
-      state.latestSequence = sequence;
-      state.osc = osc;
-      state.oscSequence = Math.max(state.oscSequence, Number(osc.command?.sequence || osc.session?.sequence || 0));
+      updateOscState(osc, true);
       if (osc?.session?.state === "ACTIVE") {
         await reanchorWebAdapter();
         phase("WebAdapter 已接入 OSC", false);
@@ -1245,15 +1301,25 @@
       render();
       await refresh();
     } catch (error) {
+      if (generation !== state.requestGeneration) return;
       phase(`WebAdapter 接入失败：${error.message}`, true);
       await refresh();
+    } finally {
+      state.connecting = false;
+      render();
     }
   }
 
   async function disconnectWebAdapter() {
-    state.requestGeneration += 1;
     resetWebAdapter();
-    try { state.osc = (await api("/api/osc/session/stop", "POST", { reason: "WebAdapter disconnected" })).state; render(); } catch (error) { phase(`WebAdapter 断开失败：${error.message}`, true); }
+    const generation = state.requestGeneration;
+    try {
+      const result = await api("/api/osc/session/stop", "POST", { reason: "WebAdapter disconnected" });
+      if (generation !== state.requestGeneration) return;
+      updateOscState(result.state); render();
+    } catch (error) {
+      if (generation === state.requestGeneration) phase(`WebAdapter 断开失败：${error.message}`, true);
+    }
   }
 
   function pi05ConfigBody() {
@@ -1357,7 +1423,7 @@
       let current = session();
       if (current.state !== "ACTIVE" || current.client_id !== clientId) {
         const result = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId }, 10000);
-        state.osc = result.state; state.latestSequence = Number(result.state?.state_sequence || 0); current = session();
+        updateOscState(result.state, true); current = session();
       }
       // Cameras and inference are already running; this button only enables
       // forwarding the latest Action Chunk to OSC.
@@ -1401,34 +1467,33 @@
     const current = session();
     if (state.heartbeatBusy || current.state !== "ACTIVE" || current.client_id !== clientId || !current.id) return;
     state.heartbeatBusy = true;
+    const generation = state.requestGeneration;
     try {
       const result = await api("/api/osc/session/heartbeat", "POST", {
         session_id: current.id,
         client_id: clientId,
       }, 3000);
+      if (generation !== state.requestGeneration || current.id !== session().id) return;
       const osc = result?.state;
       if (!osc) return;
-      const sequence = Number(osc.state_sequence || osc.session?.sequence || 0);
-      if (sequence >= state.latestSequence) {
-        state.latestSequence = sequence;
-        state.osc = osc;
-        state.oscSequence = Number(osc.command?.sequence || osc.session?.sequence || 0);
-        render();
-      }
+      updateOscState(osc);
+      render();
       state.heartbeatFailures = 0;
     } catch (error) {
+      if (generation !== state.requestGeneration || current.id !== session().id) return;
       phase(`OSC 会话心跳失败：${error.message}`, true);
       state.heartbeatFailures += 1;
       if (state.heartbeatFailures >= 2) {
         // Do not leave an ACTIVE backend session after this browser has lost
         // the ability to renew its ownership lease.  The endpoint performs
-        // the official CPV-to-Follower/HOLD handoff and returns a fresh UI
+        // the official output-to-Follower/HOLD handoff and returns a fresh UI
         // snapshot that makes reconnect immediately available.
         resetWebAdapter();
+        const stopGeneration = state.requestGeneration;
         try {
           const result = await api("/api/osc/session/stop", "POST", { reason: "WebAdapter heartbeat lost" }, 3000);
-          state.osc = result.state;
-          state.latestSequence = Number(result.state?.state_sequence || 0);
+          if (stopGeneration !== state.requestGeneration) return;
+          updateOscState(result.state);
           render();
         } catch (stopError) {
           phase(`WebAdapter 安全断开失败：${stopError.message}`, true);
@@ -1517,7 +1582,7 @@
         await api("/api/pi05/stop", "POST", { reason: "execution mode changed" }).catch(() => {});
         await api("/api/osc/session/stop", "POST", { reason: "execution mode changed" });
         const result = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId }, 10000);
-        state.osc = result.state;
+        updateOscState(result.state, true);
         phase($("execution-mode").value === "hardware" ? "已切换为真机模式，请点击开始自动控制" : "已切换为影子模式");
       } catch (error) {
         phase(`控制模式切换失败：${error.message}`, true);
@@ -1525,6 +1590,9 @@
     }
     render();
   });
+  for (const mode of ["cpv", "impedance"]) {
+    $(`output-${mode}`)?.addEventListener("click", () => selectOutputMode(mode));
+  }
   $("right-mode")?.addEventListener("change", () => {
     // Changing the axis mapping must not clear the active joystick or the
     // accumulated relative TCP pose. Only the interpretation of the right
@@ -1595,12 +1663,14 @@
     $(`camera-open-${scope}`)?.addEventListener("click", activateSharedCameras);
     $(`camera-close-${scope}`)?.addEventListener("click", deactivateSharedCameras);
   });
-  const oscCommand = (type, payload = {}) => {
+  const oscCommand = async (type, payload = {}) => {
     const current = session();
+    const generation = state.requestGeneration;
     const sequence = nextOscSequence();
-    return api("/api/osc/command", "POST", { session_id: current.id, client_id: clientId, sequence, type, payload });
+    const result = await api("/api/osc/command", "POST", { session_id: current.id, client_id: clientId, sequence, type, payload });
+    return generation === state.requestGeneration ? result : { ...result, state: null };
   };
-  $("hold").onclick = () => { resetWebAdapter(); $("hold").disabled = true; oscCommand("hold", { reason: "operator requested HOLD" }).then((result) => { state.osc = result.state; render(); }).catch((error) => phase(`HOLD失败：${error.message}`, true)); };
+  $("hold").onclick = () => { resetWebAdapter(); $("hold").disabled = true; oscCommand("hold", { reason: "operator requested HOLD" }).then((result) => { updateOscState(result.state); render(); }).catch((error) => phase(`HOLD失败：${error.message}`, true)); };
   $("freedrive").onclick = () => {
     // Clear the local UI only.  FREEDRIVE must not first submit a zero
     // osc intent, because that would start a P1 servo braking path before
@@ -1608,7 +1678,7 @@
     resetWebAdapter();
     $("freedrive").disabled = true;
     oscCommand("freedrive", { reason: "operator requested FREEDRIVE" })
-      .then((result) => { state.osc = result.state; render(); })
+      .then((result) => { updateOscState(result.state); render(); })
       .catch((error) => phase(`FREEDRIVE失败：${error.message}`, true));
   };
   $("gripper-open").onclick = () => oscCommand("gripper", { mode: "open", force_n: Number($("gripper-force-input").value) });
