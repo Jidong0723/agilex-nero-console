@@ -59,7 +59,7 @@ class ImpedanceHardware:
             sample = b.arm_status_snapshot()
             if int(sample.get("revision") or 0) > baseline and sample.get("ctrl_mode") == 1:
                 matches = sample.get("mode_feedback") == expected
-                if matches if entering else not matches:
+                if matches if entering else sample.get("mode_feedback") == 0x05:
                     return sample
             time.sleep(0.005)
         raise RuntimeError(f"MIT {'entry' if entering else 'exit'} mode confirmation timed out: {b.arm_status_snapshot()}")
@@ -150,11 +150,24 @@ class ImpedanceHardware:
                         self._send(values, command=command)
                     except Exception as exc:
                         hold_error = exc
+                # Follower selects the linkage role, NOT the motion mode. The
+                # vendor call preserves MIT and can disable feedback push.
+                # Explicitly leave MIT before any CPV position frame; never
+                # switch to P/J, whose old targets could be resurrected.
+                cpv = getattr(b.robot.OPTIONS.MOTION_MODE, "CPV", None)
+                if cpv is None or not callable(getattr(b.robot, "move_cpv_pos", None)):
+                    raise RuntimeError("MIT exit requires SDK CPV position hold support")
                 baseline = int(b.arm_status_snapshot().get("revision") or 0)
-                b.robot.set_follower_mode()
+                b.robot.set_motion_mode(cpv)
                 confirmed = self._wait_mode(baseline, entering=False)
                 q = b._read_stable_follower_joints(timeout=float(self.config.get("exit_timeout_s", 1)))
-                self.vector(q, "MIT exit feedback")
+                q = self.vector(q, "MIT exit feedback")
+                # Fresh measured hold, not an old CPV or MIT reference. All
+                # writes still occur inside the unique Transport Owner thread.
+                for index, position in enumerate(q, 1):
+                    b.robot.move_cpv_pos(joint_index=index, pos=position)
+                q = b._read_stable_follower_joints(timeout=float(self.config.get("exit_timeout_s", 1)))
+                self.vector(q, "MIT exit settled feedback")
                 feedback = b.read_cached_osc_feedback() if hasattr(b, "read_cached_osc_feedback") else None
                 if feedback is not None:
                     velocities = self.vector(feedback.get("joint_velocity_rad_s"), "MIT exit measured velocity")

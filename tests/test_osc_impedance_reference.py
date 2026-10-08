@@ -294,6 +294,17 @@ class SimplePlantTests(unittest.TestCase):
         self.assertEqual(plant.count, 1)
         self.assertEqual(plant.reference.snapshot()["action"], "hold")
 
+    def test_shadow_target_generation_change_again_revokes_delayed_batch(self):
+        plant = ShadowImpedancePlant(Q, self.output, {**self.config, "impedance_send_delay_s": .04})
+        with patch("motion.osc_impedance.time.perf_counter_ns", side_effect=[
+                1_000_000_000 + i * 20_000_000 for i in range(20)]):
+            for i in range(20):
+                self.command(generation=i + 1)
+                plant.dispatch(Q, i * .02)
+                plant.advance(.02, i * .02)
+        self.assertEqual(plant.count, 0)
+        self.assertIsNone(plant.reference.snapshot())
+
     def test_shadow_rejects_expired_gravity_before_reference_commit(self):
         plant = ShadowImpedancePlant(Q, self.output, self.config)
         command = self.command()

@@ -467,6 +467,8 @@ class HardwareTxOwner:
         try:
             with self._epoch_lock:
                 valid_epoch = int(entry["epoch"]) == self._epoch and self._exclusive_category is None
+                # Only explicit revocations advance this barrier, not incoming
+                # TCP generations. A newer input may still be solving.
                 generation_barrier = self._cpv_generation_barrier.get(int(entry["epoch"]), -1)
             guard = entry.get("execute_guard")
             if (not valid_epoch or int(entry.get("target_generation", -1)) < generation_barrier
@@ -536,6 +538,8 @@ class HardwareTxOwner:
                 from motion.osc_impedance_reference import torque_diagnostics
                 command["torque_diagnostics"] = torque_diagnostics(command, values)
                 def mit_guard():
+                    # Stop/ownership barriers only. Ordinary input refreshes
+                    # must not interrupt a seven-joint batch already started.
                     with self._epoch_lock:
                         current = (int(entry["epoch"]) == self._epoch and self._pending_epoch is None
                             and self._exclusive_category is None

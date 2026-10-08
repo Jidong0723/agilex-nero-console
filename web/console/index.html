@@ -4,23 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NERO Control Runtime</title>
-  <link rel="stylesheet" href="styles.css?v=operator-actions-v10">
+  <link rel="stylesheet" href="styles.css?v=console-cards-v12">
 </head>
 <body>
   <header class="topbar">
     <div class="brand-block"><div class="brand-mark">N7</div><div><p class="kicker">NERO CONTROL RUNTIME</p><h1>统一控制工作台</h1></div></div>
-    <div class="top-status" aria-label="系统总览"><span id="connection" class="badge neutral">服务检查中</span><span id="osc-mode" class="badge neutral">未启动</span><span id="session-state" class="badge neutral">无会话</span><span id="feedback-state" class="badge neutral">反馈 --</span><span id="safety-state" class="badge neutral">安全 --</span></div>
+    <div class="top-status" aria-label="系统总览"><span id="connection" class="badge neutral">服务检查中</span><span id="osc-mode" class="badge neutral">未启动</span><span id="session-state" class="badge neutral">无会话</span><span id="output-mode-badge" class="badge neutral">控制器 CPV</span><span id="safety-state" class="badge neutral">安全 --</span></div>
   </header>
 
   <main class="app-shell">
-    <section class="panel" aria-label="OSC 输出模式">
-      <div class="session-actions">
-        <span>OSC 输出</span>
-        <button id="output-cpv" class="button" type="button" aria-pressed="true">原控制 CPV</button>
-        <button id="output-impedance" class="button" type="button" aria-pressed="false">阻抗控制</button>
-      </div>
-      <p id="output-mode-note" class="note">仅在停稳后选择，下一次启动生效；不会自动运动。</p>
-    </section>
     <section class="operator-rail" aria-label="操作层">
       <section class="operator-card" aria-label="动作控制"><div class="operator-context"><span class="operator-kicker">OPERATOR ACTIONS</span><strong>动作控制</strong><span>所有动作先经过 Supervisor 与写入权校验</span></div><div class="operator-phase"><span>后端阶段</span><strong id="operator-phase-label">跟随上方状态</strong></div><div class="operator-actions"><button id="hold" class="button hold" type="button"><span class="button-layer">P1</span>HOLD</button><button id="freedrive" class="button freedrive" type="button"><span class="button-layer">P2</span>FREEDRIVE</button></div></section>
       <section class="panel gripper-panel gripper-card" aria-label="夹爪事务"><div class="gripper-card-head"><div><p class="section-label">P2 · DISCRETE ACTION</p><h2>夹爪事务</h2></div><span id="gripper-health" class="badge neutral">等待</span></div><div class="gripper-readouts"><div><span>开度</span><strong id="gripper-width-value">--</strong></div><div><span>反馈力</span><strong id="gripper-force">--</strong></div><div><span>驱动</span><strong id="gripper-driver">--</strong></div></div><div class="gripper-fields"><label>夹持力<input id="gripper-force-input" type="number" min="0.2" max="3" step="0.1" value="1.0"> N</label><label>目标开度<input id="gripper-width-input" type="number" min="0" max="100" step="1" value="15"> mm</label></div><div class="button-row"><button id="gripper-open" class="button" type="button">全开</button><button id="gripper-grip" class="button primary" type="button">夹住</button><button id="gripper-position" class="button" type="button">设定开度</button></div><p id="gripper-result" class="result">离散事务不会自动恢复遥操。</p></section>
@@ -65,7 +57,8 @@
     </section>
 
     <section class="panel osc-card" aria-label="Operational Space Controller">
-      <div class="osc-card-head"><div><p class="section-label">OPERATIONAL SPACE CONTROLLER</p><h2>操作空间控制器</h2></div></div>
+      <div class="osc-card-head"><div><p class="section-label">OPERATIONAL SPACE CONTROLLER</p><h2>操作空间控制器</h2></div><div class="osc-output-actions" role="group" aria-label="OSC 输出模式"><button id="output-cpv" class="button" type="button" aria-pressed="true">CPV 控制</button><button id="output-impedance" class="button" type="button" aria-pressed="false">阻抗控制</button></div></div>
+      <p id="output-mode-note" class="note">仅在停稳后选择，下一次启动生效；不会自动运动。</p>
       <div class="layer-strip" aria-label="OSC 控制层级">
       <article class="layer-card supervisor-layer"><div class="layer-index">01</div><div class="layer-copy"><p class="layer-name">CONTROL SUPERVISOR</p><h2>控制监督</h2><p>会话 · 停车 · 模式 · 故障</p></div><div class="layer-value"><span>阶段</span><strong id="phase-result">等待会话</strong></div></article>
       <article class="layer-card authority-layer"><div class="layer-index">02</div><div class="layer-copy"><p class="layer-name">ARM WRITE AUTHORITY</p><h2>唯一写入权</h2><p>当前硬件写入者</p></div><div class="authority-values"><div><span>writer</span><strong id="writer-state">--</strong></div><div><span>mode</span><strong id="servo-state">--</strong></div></div></article>
@@ -77,6 +70,6 @@
 
     <details class="maintenance"><summary><span>维护区</span><small>仅用于控制服务恢复，不属于日常操作</small></summary><div><p>重置只重启控制服务，不发送运动、夹爪、CPV、零力或急停命令。</p><button id="reset-control" class="button" type="button">重置控制服务</button><span id="maintenance-result" class="result"></span></div></details>
   </main>
-  <script src="app.js?v=osc-hold-switch-v11"></script>
+  <script src="app.js?v=console-cards-v12"></script>
 </body>
 </html>

@@ -420,12 +420,18 @@ class OperationalSpaceController:
             "OSC MIT exit", advance_epoch=True)
         try:
             result = self.robot.call("p0", "exit_impedance_mode", reason,
-                hold_factory=self._osc.impedance_hold_command, dispatch_timeout_s=3.0)
+                hold_factory=self._osc.impedance_hold_command, dispatch_timeout_s=self._impedance_exit_timeout())
             self._set_authority(ArmWriter.SERVO, ServoMode.HOLDING, reason)
             return result
         except Exception:
             self._set_authority(ArmWriter.SAFETY, ServoMode.HOLDING, "FAULT: MIT exit unconfirmed")
             raise
+
+    def _impedance_exit_timeout(self) -> float:
+        """Budget mode confirmation plus pre/post-hold stable feedback reads."""
+        adapter = getattr(self._transport_owner.backend, "_osc_impedance_hardware", None)
+        config = getattr(adapter, "config", {}) or {}
+        return max(3.5, 3 * float(config.get("exit_timeout_s", 1.0)) + .5)
 
     def _osc_cached_feedback(self) -> dict[str, Any]:
         """Read only the OSC-owned RX snapshot; never enqueue a P2 call."""
@@ -635,6 +641,8 @@ class OperationalSpaceController:
                     )
                 )
                 mit_active = getattr(self._transport_owner.backend, "impedance_stream_active", lambda: False)()
+                if mit_active:
+                    safety_timeout_s = max(safety_timeout_s, self._impedance_exit_timeout())
                 batch = self.robot.call(
                     "p0", "exit_impedance_mode" if mit_active else "prime_cpv_position_from_feedback",
                     **({"hold_factory": self._osc.impedance_hold_command} if mit_active else {}),

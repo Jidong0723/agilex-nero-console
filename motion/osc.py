@@ -1406,6 +1406,15 @@ class _OperationalSpaceServo:
                 try:
                     if not shadow_session:
                         self.hardware.exit_osc_impedance(reason)
+                except Exception as exc:
+                    with self.lock:
+                        self.trajectory_state = "FAULT"
+                        self.last_error = f"MIT exit unconfirmed: {type(exc).__name__}: {exc}"
+                        self.last_result = {"ok": False, "reason": self.last_error, "stop": "STOP_UNCONFIRMED"}
+                        if self.session:
+                            self.session["state"] = "FAULT"
+                        self._bump_state()
+                    raise
                 finally:
                     self.impedance_output.close()
                     self.impedance_output = None
@@ -1570,8 +1579,11 @@ class _OperationalSpaceServo:
             self._target_pose = reference
             if not same_reference:
                 self.target_generation += 1
-                if self.impedance_output and self.session.get("execution_mode") != "shadow":
-                    self.hardware.revoke_servo_targets(self.motion_epoch, self.target_generation, "MIT target changed", interrupt_inflight=False)
+                # Match CPV: a new TCP input is not a stop barrier. Keep the
+                # previous ready sample until its replacement is computed and
+                # published into the one-slot mailbox. HOLD/stop/epoch paths
+                # retain strict revocation; do not compare against this input
+                # generation from the CAN sender's per-joint authority guard.
                 self._target_changed_monotonic_ns = now_ns
                 self._arrival_since_monotonic_ns = 0
                 self._arrival_reached = False

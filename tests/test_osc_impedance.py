@@ -241,10 +241,11 @@ class HardwareTests(unittest.TestCase):
         self.mode_feedback = 0x05
         self.confirm = True
         self.sdk = SimpleNamespace(
-            OPTIONS=SimpleNamespace(MOTION_MODE=SimpleNamespace(MIT="mit")),
+            OPTIONS=SimpleNamespace(MOTION_MODE=SimpleNamespace(MIT="mit", CPV="cpv")),
             get_auto_set_motion_mode_enabled=lambda: True,
             set_auto_set_motion_mode_enabled=Mock(),
-            set_motion_mode=Mock(side_effect=lambda mode: self.frames.append(("mode", mode))),
+            set_motion_mode=Mock(side_effect=self.select_mode),
+            move_cpv_pos=Mock(side_effect=lambda **kw: self.frames.append(("cpv", kw))),
             set_follower_mode=Mock(side_effect=self.follower), move_mit=self.move)
         self.backend = SimpleNamespace(robot=self.sdk, _command_lock=threading.RLock(),
             _cpv_stream_started=False, _control_mode="HOLD", _arm_status_observer_installed=True,
@@ -264,8 +265,13 @@ class HardwareTests(unittest.TestCase):
 
     def follower(self):
         self.frames.append(("follower", None))
+        # Actual vendor Follower leaves the motion mode untouched.
+
+    def select_mode(self, mode):
+        self.frames.append(("mode", mode))
         self.revision += 1
-        self.mode_feedback = 0x05
+        if mode == "cpv":
+            self.mode_feedback = 0x05
 
     def enter(self):
         return self.hardware.enter(lambda q: self.output.entry(q), {**self.output.config, "enter_timeout_s": .01})
@@ -315,12 +321,13 @@ class HardwareTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "confirmation timed out"):
             self.enter()
         self.assertFalse(self.hardware.active)
-        self.assertEqual(self.frames[-1][0], "follower")
+        self.assertEqual(self.frames[-1][0], "cpv")
+        self.sdk.set_follower_mode.assert_not_called()
         self.assertEqual(self.backend._control_mode, "HOLD")
 
     def test_exit_failure_blocks_cpv(self):
         self.enter()
-        self.sdk.set_follower_mode.side_effect = RuntimeError("CAN failure")
+        self.sdk.set_motion_mode.side_effect = RuntimeError("CAN failure")
         with self.assertRaises(RuntimeError):
             self.hardware.exit("test")
         self.assertTrue(self.hardware.active)
@@ -329,14 +336,52 @@ class HardwareTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "MIT exit"):
             NeroRobot._enter_cpv_stream_if_needed(fake)
 
-    def test_exit_sends_measured_anchor_before_follower_and_mode_confirmation(self):
+    def test_exit_sends_mit_anchor_then_explicit_cpv_and_measured_hold(self):
         self.enter()
         hold = self.output.build(Q, Q, .02, 1, 0)
         before = len(self.frames)
         result = self.hardware.exit("operator HOLD", lambda: hold)
         self.assertTrue(result["confirmed"])
-        self.assertEqual([kind for kind, _ in self.frames[before:]], ["mit"] * 7 + ["follower"])
+        self.assertEqual([kind for kind, _ in self.frames[before:]], ["mit"] * 7 + ["mode"] + ["cpv"] * 7)
+        self.assertEqual(self.frames[before + 7], ("mode", "cpv"))
+        self.assertEqual([frame["pos"] for kind, frame in self.frames[before:] if kind == "cpv"], Q)
+        self.sdk.set_follower_mode.assert_not_called()
         self.assertTrue(all(frame["p_des"] == .1 for kind, frame in self.frames[before:] if kind == "mit"))
+
+    def test_exit_requires_fresh_exact_cpv_mode_before_any_cpv_frame(self):
+        self.enter()
+        self.sdk.set_motion_mode.side_effect = lambda mode: self.frames.append(("mode", mode))
+        self.hardware.config["exit_timeout_s"] = .01
+        for mode_feedback in (0x06, 0x00, 0x05):
+            self.mode_feedback = mode_feedback
+            before = len(self.frames)
+            with self.subTest(mode_feedback=mode_feedback), self.assertRaisesRegex(RuntimeError, "confirmation timed out"):
+                self.hardware.exit("HOLD")
+            self.assertFalse(any(kind == "cpv" for kind, _ in self.frames[before:]))
+            self.assertTrue(self.hardware.active)
+
+    def test_fresh_non_mit_non_cpv_feedback_is_not_an_exit_confirmation(self):
+        self.enter()
+        def wrong_mode(mode):
+            self.revision += 1
+            self.mode_feedback = 0x00
+        self.sdk.set_motion_mode.side_effect = wrong_mode
+        self.hardware.config["exit_timeout_s"] = .01
+        before = len(self.frames)
+        with self.assertRaisesRegex(RuntimeError, "confirmation timed out"):
+            self.hardware.exit("HOLD")
+        self.assertFalse(any(kind == "cpv" for kind, _ in self.frames[before:]))
+        self.assertTrue(self.hardware.active)
+
+    def test_partial_cpv_exit_failure_keeps_fault_and_blocks_normal_writes(self):
+        self.enter()
+        self.sdk.move_cpv_pos.side_effect = RuntimeError("CPV hold CAN failure")
+        with self.assertRaisesRegex(RuntimeError, "CAN failure"):
+            self.hardware.exit("HOLD")
+        self.assertTrue(self.hardware.active)
+        self.assertEqual(self.backend._control_mode, "FAULT")
+        with self.assertRaisesRegex(RuntimeError, "exclusively confirmed"):
+            self.hardware.send(self.command)
 
     def test_unconfirmed_hold_frame_keeps_exit_faulted_even_if_follower_replies(self):
         self.enter()
@@ -449,6 +494,22 @@ class InterfaceTests(unittest.TestCase):
         self.controller.osc_state = Mock(return_value={"output_mode": "impedance"})
         self.controller._osc_cached_feedback = Mock(return_value={
             "age_s": .01, "joint_angles_rad": Q, "joint_velocity_rad_s": [0] * 7})
+
+    def test_mit_safety_exit_gets_full_handoff_budget_without_changing_cpv(self):
+        controller = self.controller
+        controller._set_authority = Mock(return_value={"control_epoch": 2})
+        controller._log = Mock()
+        backend = SimpleNamespace(impedance_stream_active=lambda: True,
+            _osc_impedance_hardware=SimpleNamespace(config={"exit_timeout_s": 2.0}))
+        controller._transport_owner = SimpleNamespace(backend=backend)
+        controller.robot = SimpleNamespace(config={}, call=Mock(return_value={"ok": True}))
+        controller.trigger_safety_fault("test")
+        self.assertEqual(controller.robot.call.call_args.args, ("p0", "exit_impedance_mode"))
+        self.assertEqual(controller.robot.call.call_args.kwargs["dispatch_timeout_s"], 6.5)
+        backend.impedance_stream_active = lambda: False
+        controller.trigger_safety_fault("test CPV")
+        self.assertEqual(controller.robot.call.call_args.args, ("p0", "prime_cpv_position_from_feedback"))
+        self.assertEqual(controller.robot.call.call_args.kwargs["dispatch_timeout_s"], .2)
 
     def test_backend_rejects_motion_fault_transition_and_active_action(self):
         for writer, servo_mode in ((ArmWriter.SERVO, ServoMode.TRACKING),
@@ -629,6 +690,23 @@ class ServoIntegrationTests(unittest.TestCase):
         self.assertEqual(command["impedance_command"]["q_des_rad"], command["joint_target_rad"])
         self.assertEqual(command["impedance_command"]["dq_des_rad_s"], [0] * 7)
 
+    def test_normal_target_updates_keep_ready_batches_but_hold_revokes(self):
+        self.servo.solver.discard_before_epoch = Mock()
+        self.servo.session["client_id"] = "test"
+        self.servo._accepting_targets = True
+        self.servo._target_pose = copy.deepcopy(cpv_tests.POSE)
+        generation = self.servo.target_generation
+        for sequence in range(2, 18):
+            target = copy.deepcopy(cpv_tests.POSE)
+            target["position_m"][0] += sequence * .0001
+            self.servo.submit_absolute_target({"client_id": "test", "session_id": "test",
+                "sequence": sequence, "payload": {"target_pose": target}}, mode="track_tcp")
+        self.assertEqual(self.servo.target_generation, generation + 16)
+        self.fixture.hardware.revoke_servo_targets.assert_not_called()
+        self.servo.request_hardware_hold("operator HOLD")
+        self.fixture.hardware.revoke_servo_targets.assert_called_once()
+        self.assertEqual(self.servo.trajectory_state, "BRAKING")
+
     def test_hard_stale_feedback_faults_instead_of_emitting_mit(self):
         self.fixture.feedback_age = .2
         self.fixture.step()
@@ -722,6 +800,9 @@ class ServoIntegrationTests(unittest.TestCase):
         self.assertIsNone(self.servo.command)
         self.assertIsNone(self.servo.impedance_output)
         self.assertFalse(self.servo._accepting_targets)
+        self.assertEqual(self.servo.trajectory_state, "FAULT")
+        self.assertEqual(self.servo.session["state"], "FAULT")
+        self.assertEqual(self.servo.last_result["stop"], "STOP_UNCONFIRMED")
 
 
 if __name__ == "__main__":

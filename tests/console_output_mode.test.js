@@ -121,6 +121,39 @@ test("backend availability alone enables/disables mode buttons", () => {
   }
 });
 
+test("overview shows output mode while hardware feedback owns the age badge", () => {
+  for (const mode of ["cpv", "impedance"]) {
+    const f = fixture(mode);
+    f.app.state.osc.transport = { can_health: { ok: true }, hardware_feedback: { feedback_age_s: .003 } };
+    f.app.state.osc.execution.feedback_age_s = .080;
+    f.app.state.osc.session.execution_mode = "shadow";
+    f.app.render();
+    assert.equal(f.nodes.get("output-mode-badge").textContent, mode === "cpv" ? "控制器 CPV" : "控制器 阻抗");
+    assert.equal(f.nodes.get("status-age").textContent, "反馈 3 ms");
+    assert.equal(f.nodes.get("status-age").className, "badge ok");
+    f.app.state.osc.session.execution_mode = "hardware";
+    f.app.render();
+    assert.equal(f.nodes.get("status-age").className, "badge warn");
+    f.app.state.osc.session = null;
+    f.app.state.osc.transport.can_health.ok = false;
+    f.app.render();
+    assert.equal(f.nodes.get("status-age").className, "badge warn");
+  }
+});
+
+test("mode actions live in OSC card and collection uses the shared bilingual heading", () => {
+  const html = fs.readFileSync(path.join(__dirname, "../web/console/index.html"), "utf8");
+  const oscCard = html.slice(html.indexOf('<section class="panel osc-card"'), html.indexOf('<p id="tcp-reference-readout"'));
+  for (const id of ["output-cpv", "output-impedance", "output-mode-note"]) {
+    assert.ok(oscCard.includes(`id="${id}"`));
+    assert.equal(html.split(`id="${id}"`).length - 1, 1);
+  }
+  assert.equal(html.includes('id="feedback-state"'), false);
+  assert.equal(html.includes('<section class="panel" aria-label="OSC 输出模式">'), false);
+  assert.ok(source.includes('<p class="section-label">DATA COLLECTION</p><h2>数据采集</h2>'));
+  assert.equal(source.includes("TCP–VLA 原始数据采集"), false);
+});
+
 test("session replacement and authority epoch invalidate anchors regardless of output mode", async () => {
   for (const mode of ["cpv", "impedance"]) {
     const f = fixture(mode);

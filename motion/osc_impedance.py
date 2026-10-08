@@ -1,7 +1,8 @@
 """Optional OSC output adapter. Pink and all trajectory gates remain upstream.
 
-The LX tracking gains, zero desired velocity, bare-flange gravity (no gripper
-mass), and torque shaping are retained. There is no separate control thread:
+The LX tracking gains, bare-flange gravity (no gripper mass), and torque
+shaping are retained; final reference position and velocity are paired.
+There is no separate control thread:
 commands go through the existing epoch-guarded, latest-only CAN mailbox.
 """
 from __future__ import annotations

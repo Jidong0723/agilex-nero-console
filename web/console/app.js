@@ -193,8 +193,17 @@
   function buildDatasetCard() {
     if ($("dataset-panel")) return;
     const panel = document.createElement("section");
-    panel.id = "dataset-panel"; panel.className = "dataset-panel";
-    panel.innerHTML = `<div class="pico-head"><span class="pi05-index">D</span><div><strong>TCP–VLA 原始数据采集</strong><small>双 RGB 20 Hz · 机械臂反馈 50 Hz · 不生成15 Hz训练数据</small></div><span id="dataset-state" class="badge neutral">未采集</span></div><div class="dataset-fields"><label>任务名称<input id="dataset-task" value="red_cube_to_tray" maxlength="120"></label><label>自然语言指令<input id="dataset-description" value="pick up the red cube and place it in the tray" maxlength="500"></label></div><section class="dataset-source"><strong>当前采集来源</strong><div id="dataset-source-summary">正在读取当前控制源和相机状态…</div></section><section class="dataset-content"><strong>本 Episode 采集内容</strong><div id="dataset-content-summary">保留自然语言目标、双RGB、关节/夹爪反馈、TCP与控制目标；训练格式稍后生成。</div></section><div class="pico-actions"><button id="dataset-start" class="button primary" type="button">开始采集 Episode</button><button id="dataset-stop" class="button quiet" type="button">结束并保存</button><button id="dataset-failed" class="button quiet" type="button">失败并归档</button></div><div class="dataset-readout"><span>运行时间<b id="dataset-duration">0.0 s</b></span><span>相机帧 / 实际频率<b id="dataset-frames">0 / 0 Hz</b></span><span>机械臂状态 / 实际频率<b id="dataset-robot-rate">0 / 0 Hz</b></span><span>原始流状态<b id="dataset-sample-kinds">--</b></span><span>原始数据门禁<b id="dataset-quality">采集中</b></span><span>采样拒绝<b id="dataset-rejected">0</b></span><span>重复/过期<b id="dataset-duplicates">0</b></span><span>写盘背压<b id="dataset-backpressure">0</b></span><span>已写入数据<b id="dataset-bytes">0 B</b></span><span>保存位置<b id="dataset-path">--</b></span></div><p id="dataset-result" class="result">采集器只读取状态，不获得额外 CAN 写权限。</p>`;
+    panel.id = "dataset-panel"; panel.className = "panel dataset-panel";
+    panel.innerHTML = `
+      <div class="dataset-head"><div><p class="section-label">DATA COLLECTION</p><h2>数据采集</h2></div><span id="dataset-state" class="badge neutral">未采集</span></div>
+      <div class="dataset-fields"><label>任务名称<input id="dataset-task" value="red_cube_to_tray" maxlength="120"></label><label>自然语言指令<input id="dataset-description" value="pick up the red cube and place it in the tray" maxlength="500"></label></div>
+      <div class="dataset-summaries">
+        <section class="dataset-source"><strong>当前采集来源</strong><div id="dataset-source-summary">正在读取当前控制源和相机状态…</div></section>
+        <section class="dataset-content"><strong>采集内容 · 原始数据</strong><div id="dataset-content-summary">自然语言目标、双 RGB、关节/夹爪反馈、TCP 与控制目标。</div></section>
+      </div>
+      <div class="dataset-actions"><button id="dataset-start" class="button primary" type="button">开始采集</button><button id="dataset-stop" class="button quiet" type="button">结束并保存</button><button id="dataset-failed" class="button quiet" type="button">失败并归档</button></div>
+      <div class="dataset-readout"><span>运行时间<b id="dataset-duration">0.0 s</b></span><span>相机帧 / 频率<b id="dataset-frames">0 / 0 Hz</b></span><span>机械臂状态 / 频率<b id="dataset-robot-rate">0 / 0 Hz</b></span><span>原始流<b id="dataset-sample-kinds">--</b></span><span>数据门禁<b id="dataset-quality">采集中</b></span><span>采样拒绝<b id="dataset-rejected">0</b></span><span>重复/过期<b id="dataset-duplicates">0</b></span><span>写盘背压<b id="dataset-backpressure">0</b></span><span>已写入<b id="dataset-bytes">0 B</b></span><span>保存位置<b id="dataset-path">--</b></span></div>
+      <p id="dataset-result" class="result">只读采集，不获得额外 CAN 写权限。</p>`;
     document.querySelector(".osc-card")?.insertAdjacentElement("afterend", panel);
   }
 
@@ -1114,7 +1123,8 @@
     const modeLabel = current.state === "ACTIVE" ? `${adapterName} + ${isShadowSession(current) ? "影子" : "真机"}` : "未接入";
     badge("osc-mode", modeLabel, current.state === "ACTIVE" && isShadowSession(current) ? "ok" : current.state === "ACTIVE" ? "warn" : "neutral");
     badge("session-state", current.state || "IDLE", current.state === "ACTIVE" ? "ok" : "neutral");
-    badge("feedback-state", Number.isFinite(feedbackAgeS) ? `反馈 ${Math.round(feedbackAgeS * 1000)} ms` : "反馈 --", transport.can_health?.ok ? "ok" : "warn");
+    const hardwareControlActive = current.state === "ACTIVE" && !isShadowSession(current);
+    badge("output-mode-badge", `控制器 ${osc.output_mode === "impedance" ? "阻抗" : "CPV"}`, hardwareControlActive ? "warn" : "ok");
     badge("safety-state", `安全 ${broker.safety_state || diagnostic.trajectory_state || "--"}`, broker.safety_state === "FAULT" ? "fault" : "neutral");
     badge("writer-state", `Writer ${broker.arm_writer || "--"}`, broker.arm_writer === "SERVO" ? "ok" : "neutral");
     badge("servo-state", `Servo ${broker.servo_mode || "--"}`, broker.servo_mode === "TRACKING" ? "ok" : "neutral");
@@ -1123,7 +1133,9 @@
     phase(state.last_error || livePhase || inputStatus, Boolean(state.last_error));
     $("solver-badge").textContent = osc.solver?.running ? "求解器在线" : "求解器空闲";
     $("solver-badge").className = `badge ${osc.solver?.running ? "ok" : "neutral"}`;
-    $("status-age").textContent = Number.isFinite(feedbackAgeS) ? `反馈 ${Math.round(feedbackAgeS * 1000)} ms` : "反馈 --";
+    const displayedHardwareAge = Number.isFinite(hardwareFeedbackAge) ? hardwareFeedbackAge : feedbackAgeS;
+    badge("status-age", Number.isFinite(displayedHardwareAge) ? `反馈 ${Math.round(displayedHardwareAge * 1000)} ms` : "反馈 --",
+      hardwareControlActive || !transport.can_health?.ok ? "warn" : "ok");
     $("control-mode").textContent = `${broker.hardware_mode || "DISCONNECTED"} · ${broker.control_role || "NONE"}`;
     $("controller-mode").textContent = controllerModeLabel(hardwareFeedback.arm_status?.ctrl_mode);
     $("active-action").textContent = osc.active_action?.type || "无";
