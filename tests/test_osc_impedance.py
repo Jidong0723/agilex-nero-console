@@ -91,11 +91,25 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(self.output.build(Q, Q, .02, 1, 0)["gravity"]["gravity_state"], "HOLD_LAST_VALID")
 
     def test_invalid_gravity_is_not_silently_replaced_by_zero(self):
-        for result in (None, {"ok": False}, gravity(age=.2), gravity(q=[.2] * 7), gravity(torque=float("nan")), gravity(age=-1)):
+        for result in (None, {"ok": False}, gravity(age=.2), gravity(q=[.301] * 7), gravity(torque=float("nan")), gravity(age=-1)):
             with self.subTest(result=result):
                 self.worker.result = result
                 with self.assertRaisesRegex(RuntimeError, "invalid impedance gravity"):
                     self.output.build(Q, Q, .02, 1, 0)
+
+    def test_gravity_posture_threshold_is_point_two_rad_for_fresh_and_cached_results(self):
+        config = self.output.gravity_config
+        self.assertEqual(config["max_q_feedback_model_error_rad"], .2)
+        self.assertEqual(config["hold_last_valid_max_q_error_rad"], .2)
+        for cached in (False, True):
+            for mismatch in (.199, .201):
+                with self.subTest(cached=cached, mismatch=mismatch):
+                    result = GravityFeedforwardManager(config).compute(
+                        Q, gravity_result=gravity(q=[q + mismatch for q in Q], age=.075 if cached else 0),
+                        dt_s=.02, enabled=True, arm_token=True, allow_hold_last_valid=cached)
+                    self.assertEqual(result.state == "INVALID", mismatch > .2)
+                    if mismatch > .2:
+                        self.assertIn("gravity_feedback_model_mismatch", result.limit_reason)
 
     def test_bad_targets_are_rejected(self):
         for target in ([2] * 7, [float("nan")] * 7, [0] * 6):
