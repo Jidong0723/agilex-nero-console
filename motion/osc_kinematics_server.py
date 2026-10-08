@@ -232,6 +232,11 @@ class Solver:
         nullspace_velocity = dq - np.linalg.pinv(np.asarray(jac, dtype=float)) @ tcp_twist
         posture_error = np.asarray(q_feedback, dtype=float) - np.asarray(posture_reference, dtype=float)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
+        measured_tcp = self.fk(measured_joint_angles)
+        if request.get("report_measured_error"):
+            measured_rotation = np.asarray(measured_tcp["rotation"], dtype=float)
+            position_error = float(np.linalg.norm(np.asarray(measured_tcp["position_m"]) - command_tcp.translation))
+            rotation_error = float(np.linalg.norm(pin.log3(measured_rotation.T @ command_tcp.rotation)))
         return {
             "ok": True,
             "pink_joint_velocity_rad_s": dq.tolist(),
@@ -239,7 +244,7 @@ class Solver:
             # This FK uses the exact CAN-feedback joint vector attached to the
             # control sample.  It is telemetry only: Pink still solves from
             # q_feedback, the delay-compensated control estimate.
-            "measured_tcp": self.fk(measured_joint_angles),
+            "measured_tcp": measured_tcp,
             "condition_number": condition,
             "jacobian_rank": jacobian_rank,
             "joint_velocity_norm": float(np.linalg.norm(dq)),

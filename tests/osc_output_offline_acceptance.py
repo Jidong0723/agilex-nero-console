@@ -22,8 +22,11 @@ from motion.osc import OscRuntime
 from motion.osc_output import OutputSelection
 
 
-def run():
+def run(physical_gravity_scale=1.3):
     config = json.loads((ROOT / "config/osc.json").read_text(encoding="utf-8-sig"))
+    # A declared nominal load, NOT inferred from clipped/slewed feedforward.
+    # Use scale=1.0 separately to expose bare-URDF / FF calibration mismatch.
+    config["shadow_transport"]["impedance_physical_gravity_scale"] = physical_gravity_scale
     runtime_config = json.loads((ROOT / "config/runtime.json").read_text(encoding="utf-8-sig"))
     config["tcp"] = {"offset_from_link7_m": runtime_config["sdk"]["task_tcp_offset_from_flange_m"], "verified": True}
     hardware = Mock()
@@ -39,18 +42,34 @@ def run():
                 session_id = started["session"]["id"]
                 anchor = copy.deepcopy(started["execution_sample"]["measured_tcp_pose"])
                 sequence = 0
-                phase = {"mode": mode, "anchor": anchor, "legs": []}
+                phase = {"mode": mode, "anchor": anchor, "legs": [],
+                    "physical_gravity_scale": physical_gravity_scale if mode == "impedance" else None}
                 # Let the LX zero-first-frame feedforward finish its slew ramp.
                 time.sleep(.4)
                 if runtime._servo.shadow_plant is not None and mode == "impedance":
                     pose = runtime._servo._current_tcp_pose(runtime._servo.shadow_plant.q)
                     phase["surrogate_startup_drift_m"] = math.dist(pose["position_m"], anchor["position_m"])
+                    deadline = time.monotonic() + 8
+                    while time.monotonic() < deadline:
+                        runtime.heartbeat("offline-acceptance", session_id)
+                        state = runtime.status()["diagnostics"]["trajectory_state"]
+                        if state == "FAULT":
+                            raise RuntimeError(runtime.status()["last_result"])
+                        if state == "HOLD_READY" and max(abs(v) for v in runtime._servo.shadow_plant.qd) <= .005:
+                            break
+                        time.sleep(.02)
+                    else:
+                        raise AssertionError("startup MIT plant did not settle for reanchoring")
+                    anchor = runtime._servo._current_tcp_pose(runtime._servo.shadow_plant.q)
+                    phase["tracking_anchor"] = copy.deepcopy(anchor)
                 for offset in (.002, 0.0):
                     target = copy.deepcopy(anchor)
                     target["position_m"][0] += offset
                     sequence += 1
-                    runtime.submit_absolute_target({"client_id": "offline-acceptance", "session_id": session_id,
+                    accepted = runtime.submit_absolute_target({"client_id": "offline-acceptance", "session_id": session_id,
                         "sequence": sequence, "payload": {"target_pose": target}}, mode="track_tcp")
+                    if not accepted.get("accepted"):
+                        raise AssertionError(f"offline target rejected: {accepted}")
                     until = time.monotonic() + (12.0 if mode == "impedance" else 4.0)
                     errors = []
                     while time.monotonic() < until:
@@ -58,6 +77,8 @@ def run():
                         status = runtime.status()
                         if status["diagnostics"]["trajectory_state"] == "FAULT":
                             raise RuntimeError(status["last_result"])
+                        if status["diagnostics"]["trajectory_state"] != "RUNNING":
+                            raise AssertionError("tracking phase unexpectedly left RUNNING")
                         sample = status.get("execution_sample") or {}
                         if sample.get("target_generation") == status["target_generation"]:
                             errors.append(float(sample.get("position_error_m", 1)))
@@ -92,4 +113,8 @@ def run():
 
 
 if __name__ == "__main__":
-    print(json.dumps(run(), ensure_ascii=False, indent=2))
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--physical-gravity-scale", type=float, default=1.3)
+    args = parser.parse_args()
+    print(json.dumps(run(args.physical_gravity_scale), ensure_ascii=False, indent=2))

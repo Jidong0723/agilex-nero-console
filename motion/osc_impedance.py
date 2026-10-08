@@ -75,6 +75,7 @@ class ImpedanceOutput:
             "gravity_computed_monotonic_ns": result["computed_monotonic_ns"],
             "gravity_max_age_s": float(self.gravity_config["hold_last_valid_max_age_s"]),
             "gravity_model_tau_nm": list(ff.tau_ff_target_nm),
+            "reference_limits": {"lower_rad": self.lower, "upper_rad": self.upper},
             "feedback_q_rad": q_actual, "sample_id": sample_id, "motion_epoch": epoch,
             "feedback_monotonic_ns": feedback_monotonic_ns or time.monotonic_ns(),
             "created_monotonic_ns": time.monotonic_ns()}
@@ -94,31 +95,71 @@ class ImpedanceOutput:
 class ShadowImpedancePlant:
     """MIT PD surrogate, not a hardware model or a CPV position follower.
 
-    Feedforward metadata supplies the nominal calibrated gravity load. This
-    isolates output/gain/torque behavior; it cannot validate real-arm dynamics.
+    Physical gravity uses the unscaled model result, independently of the
+    clipped/slewed feedforward. This is not real-arm dynamics validation.
     """
     def __init__(self, q, output, config):
         self.q, self.qd = list(q), [0.0] * 7
         self.output, self.config = output, config
         self.command = None
         self.count = 0
+        from motion.osc_impedance_reference import ImpedanceReference
+        self.reference = ImpedanceReference()
+        self.pending = None
+        self.latest = None
 
     def dispatch(self, q, now):
-        self.command = dict(self.output.last_command)
-        self.command["q_des_rad"] = list(q)
-        self.count += 1
+        c = dict(self.output.last_command)
+        entry = (c, now + float(self.config.get("impedance_send_delay_s", 0.0)))
+        if self.pending and (c["motion_epoch"] != self.pending[0]["motion_epoch"]
+                or c.get("target_generation", 0) > self.pending[0].get("target_generation", 0)):
+            self.pending = self.latest = None
+        if self.pending is None:
+            self.pending = entry
+        else:
+            self.latest = entry
 
     def advance(self, dt, now):
+        if self.pending and now >= self.pending[1]:
+            c = self.pending[0]
+            for key, maximum in (("created_monotonic_ns", .15),
+                    ("feedback_monotonic_ns", .15), ("gravity_computed_monotonic_ns", .1)):
+                age = (time.monotonic_ns() - c[key]) / 1e9
+                if not 0 <= age <= maximum:
+                    raise RuntimeError(f"shadow MIT {key} expired before dispatch")
+            candidate = self.reference.prepare(c, c.get("reference_velocity_rad_s", [0.0] * 7),
+                started_perf_ns=time.perf_counter_ns(), epoch=c["motion_epoch"],
+                generation=c.get("target_generation", 0),
+                max_speed=self.config["max_joint_speed_rad_s"],
+                max_acceleration=self.config["max_joint_acceleration_rad_s2"])
+            c["q_des_rad"] = candidate["position_rad"]
+            c["dq_des_rad_s"] = candidate["velocity_rad_s"]
+            self.command = c
+            self.reference.commit(candidate)
+            self.count += 1
+            self.pending, self.latest = self.latest, None
         if self.command:
             import math
             c = self.command
+            model = self.output.worker.latest_result()
+            if not model or not model.get("ok"):
+                raise RuntimeError("shadow physical gravity model unavailable")
+            load = model["tau_gravity_sdk_nm"]
+            physical_scale = float(self.config.get("impedance_physical_gravity_scale", 1.0))
+            viscous = float(self.config.get("impedance_viscous_friction_nm_s", .5))
+            coulomb = float(self.config.get("impedance_coulomb_friction_nm", 0.0))
             steps = max(1, math.ceil(dt / 0.002))
             h = dt / steps
             for _ in range(steps):
                 for i in range(7):
                     torque = (c["kp"][i] * (c["q_des_rad"][i] - self.q[i])
-                        - (c["kd"][i] + 0.5) * self.qd[i]
-                        + c["tau_ff_nm"][i] - c["gravity_model_tau_nm"][i])
+                        + c["kd"][i] * (c["dq_des_rad_s"][i] - self.qd[i])
+                        - viscous * self.qd[i]
+                        + c["tau_ff_nm"][i] - physical_scale * load[i])
+                    if abs(self.qd[i]) > 1e-5:
+                        torque -= math.copysign(coulomb, self.qd[i])
+                    else:
+                        torque = math.copysign(max(0.0, abs(torque) - coulomb), torque)
                     acceleration = max(-self.config["max_joint_acceleration_rad_s2"],
                         min(self.config["max_joint_acceleration_rad_s2"], torque / 0.25))
                     speed = self.config["max_joint_speed_rad_s"]
@@ -128,4 +169,5 @@ class ShadowImpedancePlant:
 
     def diagnostics(self):
         return {"enabled": True, "output_mode": "impedance", "dispatch_count": self.count,
-            "model": "MIT PD surrogate; calibrated gravity command metadata"}
+            "reference": self.reference.snapshot(),
+            "model": "MIT PD surrogate; independent model gravity, simple friction/delay"}

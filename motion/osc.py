@@ -37,7 +37,7 @@ class OscHardwarePort(Protocol):
     def publish_servo_position(self, command: dict[str, Any], session_id: str, epoch: int) -> dict[str, Any]: ...
     def servo_transport_diagnostics(self) -> dict[str, Any]: ...
     def wait_for_servo_result(self, mailbox_revision: int, timeout_s: float) -> dict[str, Any]: ...
-    def revoke_servo_targets(self, target_generation: int, reason: str) -> int: ...
+    def revoke_servo_targets(self, epoch: int, target_generation: int, reason: str, *, interrupt_inflight: bool = True) -> dict[str, Any]: ...
     def latch_osc_hold(self, reason: str) -> dict[str, Any]: ...
     def trigger_safety_fault(self, reason: str) -> dict[str, Any]: ...
 
@@ -65,6 +65,8 @@ class _OscFeedbackReceiver:
         self._revision = 0
         self._last_sdk_timestamp: Any = None
         self._last_fresh_received_ns: int | None = None
+        self._motor_timestamps = [None] * 7
+        self._motor_received_ns = [None] * 7
         self._last_error: str | None = None
 
     def start(self) -> None:
@@ -94,6 +96,9 @@ class _OscFeedbackReceiver:
             sample["last_error"] = self._last_error
             sample["running"] = bool(self._thread and self._thread.is_alive())
             sample["age_s"] = max(0.0, (time.monotonic_ns() - int(sample["fresh_received_at_monotonic_ns"])) / 1e9)
+            sample["motor_feedback"] = [dict(m, age_s=None if m.get("fresh_received_monotonic_ns") is None
+                else max(0.0, (time.monotonic_ns() - m["fresh_received_monotonic_ns"]) / 1e9))
+                for m in (sample.get("motor_feedback") or [])]
             return sample
 
     def revision(self) -> int:
@@ -170,11 +175,19 @@ class _OscFeedbackReceiver:
                     if self._last_fresh_received_ns is None:
                         self._last_fresh_received_ns = received_ns
                     with self._lock:
+                        motors = []
+                        for i, motor in enumerate((row.get("motor_feedback") or [])[:7]):
+                            ts = motor.get("sdk_timestamp")
+                            if ts is not None and ts != self._motor_timestamps[i]:
+                                self._motor_timestamps[i], self._motor_received_ns[i] = ts, received_ns
+                            motors.append(dict(motor, fresh_received_monotonic_ns=self._motor_received_ns[i]))
                         self._revision += 1
                         sample = {
                             "revision": self._revision,
                             "joints": [float(value) for value in joints],
                             "velocities": [float(value) for value in velocities],
+                            "motor_feedback": motors,
+                            "arm_status_feedback": row.get("arm_status_feedback"),
                             "sdk_joint_timestamp": sdk_timestamp,
                             "joint_feedback_hz": row.get("joint_feedback_hz"),
                             "sdk_timestamp_advanced": advanced,
@@ -1105,6 +1118,20 @@ class _OperationalSpaceServo:
     def _current_tcp_pose(self, joints: list[float]) -> dict[str, list[float]]:
         return pose_from_tcp(self.solver.fk(joints))
 
+    def impedance_hold_command(self) -> dict:
+        """Terminal MIT anchor, built on the sole sender during mode handoff."""
+        with self.lock:
+            sample = self._feedback_snapshot() or {}
+            age = sample.get("age_s")
+            if self.impedance_output is None or not isinstance(age, (int, float)) or not 0 <= age <= .15:
+                raise RuntimeError("MIT exit hold requires fresh feedback and live gravity")
+            q = _finite_vector(sample.get("joints"), 7, "MIT exit joints")
+            qd = _finite_vector(sample.get("velocities"), 7, "MIT exit velocity")
+            command = self.impedance_output.build(q, q, 1.0 / float(self.runtime.get("control_hz", 50)),
+                self.control_sample_id, self.motion_epoch, feedback_monotonic_ns=sample["monotonic_ns"])
+            command["feedback_velocity_rad_s"] = qd
+            return command
+
     def _pose_in_workspace(self, pose: dict[str, list[float]]) -> bool:
         position = pose["position_m"]
         lower = _finite_vector(self.limits.get("workspace_min_m", [-0.45, -0.45, -0.01]), 3, "workspace_min_m")
@@ -1137,6 +1164,8 @@ class _OperationalSpaceServo:
             ).start()
         self.command = None
         self.target_generation += 1
+        if self.impedance_output and session.get("execution_mode") != "shadow":
+            self.hardware.revoke_servo_targets(self.motion_epoch, self.target_generation, reason)
         self._target_pose = None
         self.trajectory_state = "BRAKING"
         self.trajectory_brake_reason = reason
@@ -1374,10 +1403,12 @@ class _OperationalSpaceServo:
         if servo_stopped:
             self.solver.close()
             if self.impedance_output:
-                if not shadow_session:
-                    self.hardware.exit_osc_impedance(reason)
-                self.impedance_output.close()
-                self.impedance_output = None
+                try:
+                    if not shadow_session:
+                        self.hardware.exit_osc_impedance(reason)
+                finally:
+                    self.impedance_output.close()
+                    self.impedance_output = None
         with self.lock:
             self.session = None
             self.last_error = None
@@ -1539,6 +1570,8 @@ class _OperationalSpaceServo:
             self._target_pose = reference
             if not same_reference:
                 self.target_generation += 1
+                if self.impedance_output and self.session.get("execution_mode") != "shadow":
+                    self.hardware.revoke_servo_targets(self.motion_epoch, self.target_generation, "MIT target changed", interrupt_inflight=False)
                 self._target_changed_monotonic_ns = now_ns
                 self._arrival_since_monotonic_ns = 0
                 self._arrival_reached = False
@@ -1711,12 +1744,18 @@ class _OperationalSpaceServo:
             qd = list(feedback.get("velocities") or [])
             if len(q) != 7 or len(qd) != 7 or not all(math.isfinite(float(x)) for x in [*q, *qd]):
                 return False, "hardware feedback is invalid"
+            if self.impedance_output and max(abs(v) for v in qd) > float(self.config["solver"].get("hold_velocity_epsilon_rad_s", .005)):
+                return False, "MIT measured joints have not settled"
             if not self.hardware.servo_can_write(str(session.get("session_id")), self.motion_epoch):
                 return False, "SERVO write authority is unavailable"
             if not self.hardware.grant_osc_tracking(str(session.get("session_id")), self.motion_epoch):
                 return False, "SERVO tracking authority could not be restored"
         else:
             q = list(self.shadow_joints or (self.trajectory or {}).get("position_rad") or [])
+            if self.impedance_output and self.shadow_plant is not None:
+                q = list(self.shadow_plant.q)
+                if max(abs(v) for v in self.shadow_plant.qd) > float(self.config["solver"].get("hold_velocity_epsilon_rad_s", .005)):
+                    return False, "shadow MIT joints have not settled"
             if len(q) != 7 or not all(math.isfinite(float(x)) for x in q):
                 return False, "shadow state is invalid"
         self._sync_if_settled([float(x) for x in q])
@@ -1750,12 +1789,15 @@ class _OperationalSpaceServo:
             # artificial 1 ms control intervals while Pink is still
             # configured around the nominal 20 ms servo period.
             next_tick = tick + period
-            actual_dt = period if previous_tick is None else max(0.001, tick - previous_tick); previous_tick = tick
+            actual_dt = period if previous_tick is None else tick - previous_tick; previous_tick = tick
             try:
                 with self.lock:
                     session = dict(self.session) if self.session else None; command = dict(self.command) if self.command else None; self.loop_count += 1
                 if not session or session.get("state") != "ACTIVE": continue
                 shadow = session.get("execution_mode") == "shadow"
+                if not .001 <= actual_dt <= .2:
+                    self._fault_zero(f"invalid OSC control interval: {actual_dt}", shadow)
+                    continue
                 feedback = None if shadow else self._feedback_snapshot()
                 shadow_feedback_q: list[float] | None = None
                 if shadow:
@@ -1785,9 +1827,24 @@ class _OperationalSpaceServo:
                         q, qd, feedback_age = [], [], float("inf")
                 if len(q) != 7 or len(qd) != 7:
                     self._fault_zero("seven-joint feedback unavailable", shadow); continue
-                measured_q = list(q) if shadow else list((feedback or {}).get("joints") or [])
+                measured_q = list(shadow_feedback_q or q) if shadow else list((feedback or {}).get("joints") or [])
                 if len(measured_q) != 7:
                     self._fault_zero("seven-joint measured feedback unavailable", shadow); continue
+                reference = None
+                if self.impedance_output:
+                    if shadow and self.shadow_plant is not None:
+                        reference = self.shadow_plant.reference.snapshot()
+                    elif not shadow:
+                        reference = self.hardware.servo_transport_diagnostics().get("impedance_reference")
+                    if not isinstance(reference, dict) or reference.get("epoch") != self.motion_epoch:
+                        reference = None
+                    if reference:
+                        # Diagnostic mirror only. Never integrate or write it
+                        # back into the sender-owned reference.
+                        self.trajectory = {"position_rad": list(reference["position_rad"]),
+                            "velocity_rad_s": list(reference["velocity_rad_s"]),
+                            "acceleration_rad_s2": [0.0] * 7}
+                        self.last_sent_velocity = list(reference["velocity_rad_s"])
                 soft_stale = feedback_age > float(self.limits.get("feedback_soft_stale_s", 0.06))
                 hard_stale = feedback_age > float(self.limits.get("feedback_hard_stale_s", 0.15))
                 age = float("inf") if not command else max(0.0, (time.monotonic_ns() - int(command["host_monotonic_ns"])) / 1e9)
@@ -1830,6 +1887,9 @@ class _OperationalSpaceServo:
                         self.trajectory_state, self.trajectory_brake_reason = "FAULT", "feedback hard stale"
                         self._accepting_targets = False
                     state = self.trajectory_state; epoch = self.motion_epoch
+                    if self.impedance_output and state == "HOLD_READY" and not hard_stale and max(abs(v) for v in qd) > float(self.config["solver"].get("hold_velocity_epsilon_rad_s", .005)):
+                        self._invalidate_motion("MIT hold measured joints moving")
+                        state = self.trajectory_state
                 # HOLD_READY is a frozen state until a fresh absolute OSC target arrives.
                 if state == "HOLD_READY":
                     if self.impedance_output:
@@ -1845,6 +1905,29 @@ class _OperationalSpaceServo:
                         hold_q = list((self.trajectory or {}).get("position_rad") or measured_q)
                         mit = self.impedance_output.build(hold_q, measured_q, actual_dt, self.control_sample_id, epoch,
                             feedback_monotonic_ns=(feedback or {}).get("monotonic_ns"))
+                        mit.update(reference_action="hold", reference_velocity_rad_s=[0.0] * 7,
+                            target_generation=self.target_generation, feedback_velocity_rad_s=list(qd))
+                        # Held telemetry must describe fresh measurements, not
+                        # the final RUNNING sample or the frozen reference.
+                        held_pose = None
+                        if callable(getattr(self.solver, "fk", None)):
+                            held_pose = self._current_tcp_pose(measured_q)
+                        with self.lock:
+                            held_errors = {}
+                            last_target = (self.execution_sample or {}).get("target_tcp")
+                            if held_pose and last_target:
+                                held_errors = {"position_error_m": math.dist(held_pose["position_m"], last_target["position_m"]),
+                                    "orientation_error_rad": 2 * math.acos(min(1.0, abs(sum(a * b for a, b in zip(
+                                        held_pose["orientation_xyzw"], last_target["orientation_xyzw"])))))}
+                            self.execution_sample = {**(self.execution_sample or {}),
+                                **held_errors,
+                                "sample_monotonic_ns": time.monotonic_ns(),
+                                "measured_joint_state_rad": list(measured_q),
+                                "measured_joint_velocity_rad_s": list(qd),
+                                "measured_tcp_pose": held_pose,
+                                "motor_feedback": (feedback or {}).get("motor_feedback"),
+                                "arm_status_feedback": (feedback or {}).get("arm_status_feedback"),
+                                "feedback_age_s": feedback_age}
                         if shadow:
                             self.shadow_plant.dispatch(hold_q, time.monotonic())
                         elif self.hardware.servo_can_write(str(session.get("session_id")), epoch):
@@ -1902,13 +1985,17 @@ class _OperationalSpaceServo:
                 now_ns = time.monotonic_ns()
                 self.pico_trace_logger.append({"record_type": "osc_sample", "monotonic_ns": now_ns, "control_sample_id": sample_id, "motion_epoch": epoch, "target_generation": target_generation})
                 dispatch_dt = actual_dt
-                if not shadow and self._last_dispatch_monotonic_ns:
-                    dispatch_dt = max(0.001, min(0.2, (now_ns - self._last_dispatch_monotonic_ns) / 1e9))
+                planning_q = list(reference["position_rad"]) if reference and reference["action"] == "track" else measured_q
+                if not self.impedance_output:
+                    planning_q = q
                 # OSC accepts an absolute TCP setpoint.  Never extrapolate a
                 # jittery, paused, or discontinuous adapter stream beyond
                 # that setpoint; Pink receives exactly what the adapter sent.
                 solver_config = self.config.get("solver", {})
                 request = {"sequence": int((command or {}).get("sequence", session.get("sequence", 0))), "control_sample_id": sample_id, "target_generation": target_generation, "motion_epoch": epoch, "joint_angles_rad": q, "measured_joint_angles_rad": measured_q, "joint_state_monotonic_ns": now_ns, "target_position_m": target_pose["position_m"], "target_orientation_xyzw": target_pose["orientation_xyzw"], "command_target_position_m": target_pose["position_m"], "command_target_orientation_xyzw": target_pose["orientation_xyzw"], "last_sent_joint_velocity_rad_s": self.last_sent_velocity, "joint_speed_limit_rad_s": data["speed_rad_s"], "joint_acceleration_limit_rad_s2": data["acceleration_rad_s2"], "soft_lower_rad": data["soft_lower_rad"], "soft_upper_rad": data["soft_upper_rad"], "posture_reference_rad": self.posture_reference or q, "posture_cost": float(solver_config.get("posture_cost", 0.001)), "damping_cost": float(solver_config.get("damping_cost", 0.01)), "frame_position_cost": float(solver_config.get("frame_position_cost", 8.0)), "frame_orientation_cost": float(solver_config.get("frame_orientation_cost", 1.0)), "frame_gain": float(solver_config.get("frame_gain", 0.5)), "frame_lm_damping": float(solver_config.get("frame_lm_damping", 1.0)), "joint_center_cost": float(solver_config.get("joint_center_cost", 0.0003)), "joint_center_deadband": float(solver_config.get("joint_center_deadband", 0.70)), "feedback_limit_tolerance_rad": float(solver_config.get("feedback_limit_tolerance_rad", 0.03)), "dt_s": dispatch_dt}
+                request["joint_angles_rad"] = planning_q
+                if self.impedance_output:
+                    request["report_measured_error"] = True
                 solve_current = getattr(self.solver, "solve_current", None)
                 if callable(solve_current):
                     pink = solve_current(request, float(self.config.get("solver", {}).get("synchronous_response_budget_s", 0.008)))
@@ -1945,6 +2032,8 @@ class _OperationalSpaceServo:
                             "joint_velocity_rad_s": list(qd),
                             "measured_joint_state_rad": list(measured_q),
                             "measured_joint_velocity_rad_s": list(qd) if shadow else list((feedback or {}).get("velocities") or []),
+                            "motor_feedback": (feedback or {}).get("motor_feedback"),
+                            "arm_status_feedback": (feedback or {}).get("arm_status_feedback"),
                             "estimated_joint_state_rad": list(q),
                             "estimated_joint_velocity_rad_s": list(qd),
                             "estimated_tcp_pose": estimated_tcp,
@@ -1986,7 +2075,7 @@ class _OperationalSpaceServo:
                 for requested, previous, acceleration in zip(target_velocity, self.last_sent_velocity, data["acceleration_rad_s2"]):
                     delta = float(acceleration) * dispatch_dt
                     acceleration_limited.append(max(previous - delta, min(previous + delta, requested)))
-                target_velocity = acceleration_limited
+                target_velocity = target_velocity if self.impedance_output else acceleration_limited
                 final_velocity, gate_ok, gate_reason = self.supervisor.final_gate(
                     q, qd, target_velocity, delay_budget,
                     hard_stale and motion_or_brake_active,
@@ -1996,19 +2085,24 @@ class _OperationalSpaceServo:
                     with self.lock: self.trajectory_state, self.trajectory_brake_reason = "FAULT", gate_reason or "final safety gate rejected velocity"
                     final_velocity = [0.0] * 7
                 settled = max(abs(x) for x in self.trajectory["velocity_rad_s"]) <= float(self.config.get("solver", {}).get("hold_velocity_epsilon_rad_s", 0.005)) and max(abs(x) for x in self.trajectory["acceleration_rad_s2"]) <= float(self.config.get("solver", {}).get("hold_acceleration_epsilon_rad_s2", 0.02))
+                if self.impedance_output:
+                    if state != "RUNNING":
+                        final_velocity = [0.0] * 7
+                    settled = not hard_stale and max(abs(x) for x in qd) <= float(self.config["solver"].get("hold_velocity_epsilon_rad_s", .005))
                 # Integrate the final gated velocity once from current joints.
                 # Shadow and hardware use exactly the same CPV command state.
                 previous_velocity = list(self.trajectory["velocity_rad_s"])
-                position_target = [
+                position_target = list(planning_q) if self.impedance_output else [
                     float(current) + float(command) * actual_dt
                     for current, command in zip(q, final_velocity)
                 ]
-                self.trajectory["position_rad"] = list(position_target)
-                self.trajectory["velocity_rad_s"] = list(final_velocity)
-                self.trajectory["acceleration_rad_s2"] = [
-                    (float(command) - float(previous)) / max(0.001, actual_dt)
-                    for command, previous in zip(final_velocity, previous_velocity)
-                ]
+                if not self.impedance_output:
+                    self.trajectory["position_rad"] = list(position_target)
+                    self.trajectory["velocity_rad_s"] = list(final_velocity)
+                    self.trajectory["acceleration_rad_s2"] = [
+                        (float(command) - float(previous)) / actual_dt
+                        for command, previous in zip(final_velocity, previous_velocity)
+                    ]
                 output_fields = {}
                 if self.impedance_output:
                     if hard_stale:
@@ -2016,6 +2110,10 @@ class _OperationalSpaceServo:
                         continue
                     mit = self.impedance_output.build(position_target, measured_q, actual_dt, sample_id, epoch,
                         feedback_monotonic_ns=(feedback or {}).get("monotonic_ns"))
+                    mit.update(reference_velocity_rad_s=list(final_velocity), target_generation=target_generation,
+                        reference_action="track" if state == "RUNNING" else "hold",
+                        feedback_velocity_rad_s=list(qd),
+                        reference_gate_mask=[abs(a - b) > 1e-9 for a, b in zip(target_velocity, final_velocity)])
                     output_fields = {"output_mode": "impedance", "impedance_command": mit}
                 if shadow:
                     # Build the identical CPV position target that hardware
@@ -2059,7 +2157,8 @@ class _OperationalSpaceServo:
                     elif gate_limited:
                         result_reason = "CPV joint-position batch sent with final safety gate velocity limit"
                     self._set_result(gate_ok, result_reason, robot_commands_sent=False, solver=pink if pink and pink.get("ok") else None, supervisor=supervisor_report, gate_reason=gate_reason, gate_limited=gate_limited, final_joint_target_rad=list(position_target), final_joint_velocity_rad_s=list(final_velocity), cpv_mailbox=publication)
-                self.last_sent_velocity = list(final_velocity)
+                if not self.impedance_output:
+                    self.last_sent_velocity = list(final_velocity)
                 with self.lock:
                     arrival_position = float(self.config.get("osc", {}).get("arrival_position_tolerance_m", 0.0005))
                     arrival_orientation = float(self.config.get("osc", {}).get("arrival_orientation_tolerance_rad", math.radians(0.25)))
@@ -2080,6 +2179,7 @@ class _OperationalSpaceServo:
                         and float(arrival_sample.get("position_error_m", float("inf"))) <= arrival_position
                         and float(arrival_sample.get("orientation_error_rad", float("inf"))) <= arrival_orientation
                         and max((abs(value) for value in final_velocity), default=0.0) <= arrival_velocity
+                        and (not self.impedance_output or max(abs(v) for v in qd) <= arrival_velocity)
                     )
                     arrival_now_ns = time.monotonic_ns()
                     if arrival_ok:
@@ -2108,7 +2208,6 @@ class _OperationalSpaceServo:
                                 self.cpv_send_count += 1
                                 self._send_times.append(time.monotonic())
                                 self._batch_history.append(dict(last_dispatched))
-                                self._last_dispatch_monotonic_ns = int(last_dispatched.get("finished_monotonic_ns") or last_dispatched.get("transport_dispatch_finished_monotonic_ns") or time.monotonic_ns())
                     if self.trajectory_state == "BRAKING" and settled:
                         # A normal tracking publication is asynchronous.  The
                         # sole exception is the final braking sample: Follower
@@ -2202,6 +2301,7 @@ class OscRuntime:
         return self._receiver.close()
 
     def rx_snapshot(self) -> dict[str, Any] | None: return self._receiver.snapshot()
+    def impedance_hold_command(self) -> dict: return self._servo.impedance_hold_command()
     def rx_sample_nearest(self, target_monotonic_ns: int, wait_s: float = 0.0) -> dict[str, Any] | None:
         return self._receiver.nearest(target_monotonic_ns, wait_s)
     def rx_samples_after(self, revision: int, wait_s: float = 0.0, max_items: int = 128) -> list[dict[str, Any]]:

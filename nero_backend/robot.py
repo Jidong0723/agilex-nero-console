@@ -284,6 +284,8 @@ class NeroRobot:
                 "sdk_timestamp": jsonable(sdk_timestamp),
                 "ctrl_mode": ctrl_mode,
                 "mode_feedback": mode_feedback,
+                "arm_status": self._enum_int(getattr(message, "arm_status", None)),
+                "err_status": jsonable(getattr(message, "err_status", None)),
             }
 
     def arm_status_snapshot(self) -> dict[str, Any]:
@@ -633,13 +635,21 @@ class NeroRobot:
             sdk_joint_timestamp = getattr(joint_message, "timestamp", None)
             joint_feedback_hz = getattr(joint_message, "hz", None)
         velocities: list[float | None] = []
+        motor_feedback = []
         for motor in raw_motors:
             value = unwrap_msg(motor)
             velocity = value.get("velocity") if isinstance(value, dict) else getattr(value, "velocity", None)
             velocities.append(float(velocity) if isinstance(velocity, (int, float)) and math.isfinite(float(velocity)) else None)
+            message = motor.get("value") if isinstance(motor, dict) else None
+            motor_feedback.append({"current_a": value.get("current") if isinstance(value, dict) else None,
+                "torque_nm": value.get("torque") if isinstance(value, dict) else None,
+                "sdk_timestamp": message.get("timestamp") if isinstance(message, dict) else None,
+                "feedback_hz": message.get("hz") if isinstance(message, dict) else None})
         return {
             "joint_angles_rad": joints,
             "joint_velocity_rad_s": velocities if len(velocities) == 7 else None,
+            "motor_feedback": motor_feedback,
+            "arm_status_feedback": self.arm_status_snapshot(),
             # These are metadata on the SDK's cached CAN message, not a new
             # CAN request.  Keep both the device/SDK timestamp and when this
             # process received the cached value.
@@ -1080,10 +1090,10 @@ class NeroRobot:
             raise RuntimeError("MIT output is inactive")
         return self._osc_impedance_hardware.send(command, execute_guard)
 
-    def exit_impedance_mode(self, reason: str = "OSC MIT stop") -> dict[str, Any]:
+    def exit_impedance_mode(self, reason: str = "OSC MIT stop", hold_factory=None) -> dict[str, Any]:
         if not self.impedance_stream_active():
             return {"ok": True, "already_exited": True}
-        return self._osc_impedance_hardware.exit(reason)
+        return self._osc_impedance_hardware.exit(reason, hold_factory)
 
     def stop_cpv_for_mode_transition(self, reason: str = "mode transition requested") -> dict[str, Any]:
         """Quiesce CPV before an official Follower or Leader transition.

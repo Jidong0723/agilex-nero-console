@@ -150,7 +150,11 @@ class HardwareTxOwner:
         self._cpv_last_target: list[float] | None = None
         self._cpv_last_velocity: list[float] | None = None
         self._cpv_last_finished_ns: int | None = None
+        self._cpv_last_started_perf_ns: int | None = None
+        self._impedance_reference = None
+        self._impedance_failed_epoch = None
         self._cpv_generation_barrier: dict[int, int] = {}
+        self._cpv_stop_generation_barrier: dict[int, int] = {}
         self._cpv_result_changed = threading.Condition(self._cpv_lock)
         self._wake = threading.Condition()
         self._last_work_was_cpv = False
@@ -218,7 +222,7 @@ class HardwareTxOwner:
                     return {"status": "timeout", "mailbox_revision": int(mailbox_revision)}
                 self._cpv_result_changed.wait(remaining)
 
-    def revoke_cpv_before_generation(self, epoch: int, target_generation: int, reason: str) -> dict[str, Any]:
+    def revoke_cpv_before_generation(self, epoch: int, target_generation: int, reason: str, *, interrupt_inflight: bool = True) -> dict[str, Any]:
         """Prevent pending CPV targets from an older OSC target generation."""
         epoch = int(epoch)
         target_generation = int(target_generation)
@@ -227,6 +231,8 @@ class HardwareTxOwner:
             self._cpv_generation_barrier[epoch] = max(
                 target_generation, self._cpv_generation_barrier.get(epoch, -1)
             )
+            if interrupt_inflight:
+                self._cpv_stop_generation_barrier[epoch] = max(target_generation, self._cpv_stop_generation_barrier.get(epoch, -1))
             pending = self._cpv_mailbox
             if (pending is not None and int(pending.get("epoch", -1)) == epoch
                     and int(pending.get("target_generation", -1)) < target_generation):
@@ -260,7 +266,9 @@ class HardwareTxOwner:
                 "failed_count": self._cpv_failed_count,
                 "last_result": dict(self._cpv_last_result) if self._cpv_last_result else None,
                 "last_success": dict(self._cpv_last_success) if self._cpv_last_success else None,
+                "impedance_reference": self._impedance_reference.snapshot() if self._impedance_reference else None,
                 "generation_barriers": dict(self._cpv_generation_barrier),
+                "stop_generation_barriers": dict(self._cpv_stop_generation_barrier),
             }
 
     def _trim_cpv_results(self) -> None:
@@ -455,6 +463,7 @@ class HardwareTxOwner:
     def _dispatch_cpv(self, entry: dict[str, Any]) -> None:
         revision = int(entry["mailbox_revision"])
         started_ns = time.monotonic_ns()
+        started_perf_ns = time.perf_counter_ns()
         try:
             with self._epoch_lock:
                 valid_epoch = int(entry["epoch"]) == self._epoch and self._exclusive_category is None
@@ -481,8 +490,26 @@ class HardwareTxOwner:
                 # position/velocity history, which could resurrect an old pose.
                 previous_target, previous_velocity, last_finished_ns = None, None, None
             final_gate_limited = False
-            if last_finished_ns is not None and previous_target is not None and previous_velocity is not None:
-                actual_dt = max(0.001, (started_ns - last_finished_ns) / 1e9)
+            reference_candidate = None
+            if output_mode == "impedance":
+                if self._impedance_failed_epoch == int(entry["epoch"]):
+                    raise RuntimeError("MIT batch failure latched; requires mode handoff")
+                from motion.osc_impedance_reference import ImpedanceReference
+                if self._impedance_reference is None:
+                    self._impedance_reference = ImpedanceReference()
+                reference_candidate = self._impedance_reference.prepare(
+                    entry["impedance_command"], entry["joint_velocity_rad_s"],
+                    started_perf_ns=started_perf_ns, epoch=int(entry["epoch"]),
+                    generation=int(entry.get("target_generation", 0)),
+                    max_speed=entry["max_joint_speed_rad_s"],
+                    max_acceleration=entry["max_joint_acceleration_rad_s2"])
+                values = reference_candidate["position_rad"]
+                velocity = reference_candidate["velocity_rad_s"]
+                final_gate_limited = reference_candidate["limited"]
+            elif last_finished_ns is not None and previous_target is not None and previous_velocity is not None:
+                actual_dt = (started_perf_ns - self._cpv_last_started_perf_ns) / 1e9
+                if not math.isfinite(actual_dt) or actual_dt <= 0:
+                    raise RuntimeError(f"invalid CPV control interval: {actual_dt}")
                 velocity = [(target - previous) / actual_dt for target, previous in zip(values, previous_target)]
                 max_speed = float(entry.get("max_joint_speed_rad_s", float("inf")))
                 max_acceleration = float(entry.get("max_joint_acceleration_rad_s2", float("inf")))
@@ -503,18 +530,27 @@ class HardwareTxOwner:
             if entry.get("output_mode") == "impedance":
                 command = dict(entry["impedance_command"])
                 command["q_des_rad"] = list(values)
+                # Position and velocity describe the same final reference step,
+                # never the raw Pink proposal or the builder's zero placeholder.
+                command["dq_des_rad_s"] = list(velocity)
+                from motion.osc_impedance_reference import torque_diagnostics
+                command["torque_diagnostics"] = torque_diagnostics(command, values)
                 def mit_guard():
                     with self._epoch_lock:
                         current = (int(entry["epoch"]) == self._epoch and self._pending_epoch is None
                             and self._exclusive_category is None
-                            and int(entry.get("target_generation", -1)) >= self._cpv_generation_barrier.get(int(entry["epoch"]), -1))
+                            and int(entry.get("target_generation", -1)) >= self._cpv_stop_generation_barrier.get(int(entry["epoch"]), -1))
                     return current and (not callable(guard) or guard())
                 try:
                     result = self.backend.send_impedance_command(command, execute_guard=mit_guard)
                 except PermissionError as exc:
+                    if getattr(exc, "partial_batch", False):
+                        raise RuntimeError("MIT partial batch revoked; reference not committed") from exc
                     raise ServoWriteRevoked(str(exc)) from exc
             else:
                 result = self.backend.send_cpv_position(values)
+            if isinstance(result, dict) and result.get("ok") is False:
+                raise RuntimeError(f"servo batch unsuccessful: {result}")
             finished_ns = time.monotonic_ns()
             result = dict(result or {})
             result.update({"status": "sent", "mailbox_revision": revision,
@@ -529,9 +565,17 @@ class HardwareTxOwner:
                            "finished_monotonic_ns": int(result.get("finished_monotonic_ns") or finished_ns),
                            "joint_target_rad": list(values), "joint_velocity_rad_s": list(velocity),
                            "final_gate_limited": final_gate_limited})
+            result["dispatch_started_perf_ns"] = started_perf_ns
+            if reference_candidate is not None:
+                self._impedance_reference.commit(reference_candidate)
+                result["impedance_reference"] = self._impedance_reference.snapshot()
+                result["torque_diagnostics"] = command["torque_diagnostics"]
             with self._cpv_result_changed:
                 self._cpv_sent_count += 1; self._cpv_last_dispatched_revision = revision
                 self._cpv_last_target = list(values); self._cpv_last_velocity = list(velocity); self._cpv_last_finished_ns = finished_ns
+                self._cpv_last_started_perf_ns = started_perf_ns
+                if output_mode != "impedance":
+                    self._impedance_reference = None
                 self._osc_last_output_mode, self._osc_last_output_epoch = output_mode, int(entry["epoch"])
                 self._cpv_last_success = dict(result); self._cpv_last_result = dict(result); self._cpv_results[revision] = dict(result)
                 self._trim_cpv_results(); self._cpv_result_changed.notify_all()
@@ -539,6 +583,8 @@ class HardwareTxOwner:
             with self._cpv_result_changed:
                 self._cpv_revoked_count += 1; result = {"status": "revoked", "mailbox_revision": revision, "error": str(exc), "control_sample_id": entry.get("control_sample_id")}; self._cpv_last_result = dict(result); self._cpv_results[revision] = result; self._cpv_result_changed.notify_all()
         except Exception as exc:
+            if entry.get("output_mode") == "impedance":
+                self._impedance_failed_epoch = int(entry["epoch"])
             with self._cpv_result_changed:
                 self._cpv_failed_count += 1; result = {"status": "failed", "mailbox_revision": revision, "error": f"{type(exc).__name__}: {exc}", "control_sample_id": entry.get("control_sample_id")}; self._cpv_last_result = dict(result); self._cpv_results[revision] = result; self._cpv_result_changed.notify_all()
         finally:

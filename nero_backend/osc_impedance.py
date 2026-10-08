@@ -30,8 +30,10 @@ class ImpedanceHardware:
         hi = limits.get("upper_rad", [12.5] * 7)
         if any(not l <= q <= h for q, l, h in zip(values["q_des_rad"], lo, hi)):
             raise ValueError("MIT position outside hardware limits")
-        if any(x != 0 for x in values["dq_des_rad_s"]):
-            raise ValueError("OSC impedance requires zero MIT desired velocity")
+        # Reject rather than let the SDK silently clamp the reference velocity.
+        # This is a protocol bound, not an interaction-safety limit.
+        if any(abs(v) > 45 for v in values["dq_des_rad_s"]):
+            raise ValueError("MIT desired velocity outside firmware range")
         if any(not 0 <= x <= 500 for x in values["kp"]) or any(not 0 <= x <= 5 for x in values["kd"]):
             raise ValueError("MIT gains outside firmware range")
         caps = [24, 24, 16, 16, 8, 8, 8] if str(self.backend.sdk_config.get("firmware")) == "default" else [16] * 7
@@ -110,11 +112,13 @@ class ImpedanceHardware:
         times = []
         for index in range(7):
             if guard is not None and not guard():
-                raise PermissionError("MIT batch authority revoked")
+                error = PermissionError("MIT batch authority revoked")
+                error.partial_batch = bool(times)
+                raise error
             if command is not None:
                 self.validate(command)
             self.backend.robot.move_mit(joint_index=index + 1,
-                p_des=values["q_des_rad"][index], v_des=0.0,
+                p_des=values["q_des_rad"][index], v_des=values["dq_des_rad_s"][index],
                 kp=values["kp"][index], kd=values["kd"][index], t_ff=values["tau_ff_nm"][index])
             times.append(time.monotonic_ns())
         return {"ok": True, "joint_sent_monotonic_ns": times,
@@ -129,17 +133,35 @@ class ImpedanceHardware:
         with b._command_lock:
             return self._send(values, guard, command)
 
-    def exit(self, reason):
+    def exit(self, reason, hold_factory=None):
         b = self.backend
         if not self.active:
             return {"ok": True, "already_exited": True}
         with b._command_lock:
             try:
+                hold_error = None
+                if hold_factory is not None:
+                    try:
+                        command = hold_factory()
+                        values = self.validate(command)
+                        measured = self.vector(command.get("feedback_q_rad"), "MIT exit measured anchor")
+                        if max(abs(a - c) for a, c in zip(measured, values["q_des_rad"])) > 1e-9:
+                            raise ValueError("MIT exit first frame must clear old spring reference")
+                        self._send(values, command=command)
+                    except Exception as exc:
+                        hold_error = exc
                 baseline = int(b.arm_status_snapshot().get("revision") or 0)
                 b.robot.set_follower_mode()
                 confirmed = self._wait_mode(baseline, entering=False)
                 q = b._read_stable_follower_joints(timeout=float(self.config.get("exit_timeout_s", 1)))
                 self.vector(q, "MIT exit feedback")
+                feedback = b.read_cached_osc_feedback() if hasattr(b, "read_cached_osc_feedback") else None
+                if feedback is not None:
+                    velocities = self.vector(feedback.get("joint_velocity_rad_s"), "MIT exit measured velocity")
+                    if max(abs(v) for v in velocities) > .005:
+                        raise RuntimeError("MIT exit joints not settled")
+                if hold_error is not None:
+                    raise RuntimeError(f"MIT exit hold frame unconfirmed: {hold_error}") from hold_error
                 b.robot.set_auto_set_motion_mode_enabled(self.auto_mode)
                 self.active = False
                 b._control_mode, b._last_control_reason = "HOLD", reason

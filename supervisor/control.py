@@ -135,7 +135,7 @@ class _ControllerOscCommandPort:
     def mark_osc_stopping(self, session_id: str, epoch: int, reason: str) -> bool: return self._controller.mark_osc_stopping(session_id, epoch, reason)
     def servo_can_write(self, session_id: str, epoch: int) -> bool: return self._controller.servo_can_write(session_id, epoch)
     def publish_servo_position(self, command: dict[str, Any], session_id: str, epoch: int) -> dict[str, Any]: return self._controller.publish_servo_position(command, session_id, epoch)
-    def revoke_servo_targets(self, epoch: int, target_generation: int, reason: str) -> dict[str, Any]: return self._controller.revoke_servo_targets(epoch, target_generation, reason)
+    def revoke_servo_targets(self, epoch: int, target_generation: int, reason: str, *, interrupt_inflight: bool = True) -> dict[str, Any]: return self._controller.revoke_servo_targets(epoch, target_generation, reason, interrupt_inflight=interrupt_inflight)
     def servo_transport_diagnostics(self) -> dict[str, Any]: return self._controller.servo_transport_diagnostics()
     def wait_for_servo_result(self, mailbox_revision: int, timeout_s: float) -> dict[str, Any]: return self._controller.wait_for_servo_result(mailbox_revision, timeout_s)
     def latch_osc_hold(self, reason: str) -> dict[str, Any]: return self._controller.latch_osc_hold(reason)
@@ -419,7 +419,8 @@ class OperationalSpaceController:
         state = self._set_authority(ArmWriter.MODE_TRANSITION, ServoMode.SUSPENDED,
             "OSC MIT exit", advance_epoch=True)
         try:
-            result = self.robot.call("p0", "exit_impedance_mode", reason, dispatch_timeout_s=3.0)
+            result = self.robot.call("p0", "exit_impedance_mode", reason,
+                hold_factory=self._osc.impedance_hold_command, dispatch_timeout_s=3.0)
             self._set_authority(ArmWriter.SERVO, ServoMode.HOLDING, reason)
             return result
         except Exception:
@@ -602,8 +603,8 @@ class OperationalSpaceController:
             self._schedule_transport_reset(f"asynchronous CPV position timeout: {detail}")
         return cpv
 
-    def revoke_servo_targets(self, epoch: int, target_generation: int, reason: str) -> dict[str, Any]:
-        return self._transport_owner.revoke_cpv_before_generation(epoch, target_generation, reason)
+    def revoke_servo_targets(self, epoch: int, target_generation: int, reason: str, *, interrupt_inflight: bool = True) -> dict[str, Any]:
+        return self._transport_owner.revoke_cpv_before_generation(epoch, target_generation, reason, interrupt_inflight=interrupt_inflight)
 
     def wait_for_servo_result(self, mailbox_revision: int, timeout_s: float) -> dict[str, Any]:
         return self._transport_owner.wait_cpv_result(mailbox_revision, timeout_s)
@@ -633,9 +634,10 @@ class OperationalSpaceController:
                     self.robot.config.get("control_service", {}).get("safety_velocity_dispatch_timeout_s", 0.2),
                     )
                 )
+                mit_active = getattr(self._transport_owner.backend, "impedance_stream_active", lambda: False)()
                 batch = self.robot.call(
-                    "p0", ("exit_impedance_mode" if getattr(self._transport_owner.backend, "impedance_stream_active", lambda: False)()
-                           else "prime_cpv_position_from_feedback"),
+                    "p0", "exit_impedance_mode" if mit_active else "prime_cpv_position_from_feedback",
+                    **({"hold_factory": self._osc.impedance_hold_command} if mit_active else {}),
                     dispatch_timeout_s=max(0.05, safety_timeout_s),
                 )
             except Exception as exc:

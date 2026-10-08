@@ -37,6 +37,12 @@ def gravity(q=Q, age=0, torque=2.0):
         "sample_id": 1, "computed_monotonic_ns": time.monotonic_ns() - int(age * 1e9)}
 
 
+def reference_command(q):
+    return {"q_des_rad": list(q), "feedback_q_rad": list(q),
+        "reference_limits": {"lower_rad": [-1] * 7, "upper_rad": [1] * 7},
+        "kp": [3.5] * 7, "kd": [.3] * 7, "tau_ff_nm": [0] * 7}
+
+
 class Worker:
     def __init__(self):
         self.result = gravity()
@@ -273,6 +279,37 @@ class HardwareTests(unittest.TestCase):
         self.assertGreater(result["impedance_mode_entry"]["mode_feedback"]["revision"], 1)
         self.assertTrue(self.hardware.active)
 
+    def test_mit_hardware_preserves_each_joint_desired_velocity(self):
+        self.enter()
+        self.assertTrue(all(frame["v_des"] == 0 for kind, frame in self.frames if kind == "mit"))
+        command = self.output.build(Q, Q, .02, 1, 0)
+        velocities = [.04, -.03, .02, 0, -.01, .05, -.06]
+        command["dq_des_rad_s"] = velocities
+        before = len(self.frames)
+        self.hardware.send(command)
+        frames = [frame for kind, frame in self.frames[before:] if kind == "mit"]
+        self.assertEqual([frame["v_des"] for frame in frames], velocities)
+        self.assertEqual([frame["p_des"] for frame in frames], Q)
+
+    def test_nonfinite_desired_velocity_rejected_before_any_frame(self):
+        self.enter()
+        for invalid in (float("nan"), float("inf")):
+            command = self.output.build(Q, Q, .02, 1, 0)
+            command["dq_des_rad_s"][2] = invalid
+            before = len(self.frames)
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "finite"):
+                self.hardware.send(command)
+            self.assertEqual(len(self.frames), before)
+
+    def test_out_of_protocol_velocity_rejected_not_silently_clamped(self):
+        self.enter()
+        command = self.output.build(Q, Q, .02, 1, 0)
+        command["dq_des_rad_s"][0] = 46
+        before = len(self.frames)
+        with self.assertRaisesRegex(ValueError, "velocity outside"):
+            self.hardware.send(command)
+        self.assertEqual(len(self.frames), before)
+
     def test_mode_timeout_performs_official_exit(self):
         self.confirm = False
         with self.assertRaisesRegex(RuntimeError, "confirmation timed out"):
@@ -291,6 +328,30 @@ class HardwareTests(unittest.TestCase):
         fake = SimpleNamespace(impedance_stream_active=lambda: True)
         with self.assertRaisesRegex(RuntimeError, "MIT exit"):
             NeroRobot._enter_cpv_stream_if_needed(fake)
+
+    def test_exit_sends_measured_anchor_before_follower_and_mode_confirmation(self):
+        self.enter()
+        hold = self.output.build(Q, Q, .02, 1, 0)
+        before = len(self.frames)
+        result = self.hardware.exit("operator HOLD", lambda: hold)
+        self.assertTrue(result["confirmed"])
+        self.assertEqual([kind for kind, _ in self.frames[before:]], ["mit"] * 7 + ["follower"])
+        self.assertTrue(all(frame["p_des"] == .1 for kind, frame in self.frames[before:] if kind == "mit"))
+
+    def test_unconfirmed_hold_frame_keeps_exit_faulted_even_if_follower_replies(self):
+        self.enter()
+        hold = self.output.build([.2] * 7, Q, .02, 1, 0)
+        with self.assertRaisesRegex(RuntimeError, "hold frame unconfirmed"):
+            self.hardware.exit("HOLD", lambda: hold)
+        self.assertTrue(self.hardware.active)
+        self.assertEqual(self.backend._control_mode, "FAULT")
+
+    def test_non_mit_feedback_alone_does_not_prove_actual_stop(self):
+        self.enter()
+        self.backend.read_cached_osc_feedback = lambda: {"joint_velocity_rad_s": [.1] * 7}
+        with self.assertRaisesRegex(RuntimeError, "not settled"):
+            self.hardware.exit("HOLD")
+        self.assertTrue(self.hardware.active)
 
     def test_queued_gravity_and_feedback_expiry_rejected(self):
         self.enter()
@@ -328,7 +389,7 @@ class MailboxTests(unittest.TestCase):
         try:
             for mode, target in (("cpv", [0] * 7), ("impedance", [.5] * 7), ("cpv", [.2] * 7)):
                 revision = owner.publish_cpv({"joint_target_rad": target, "joint_velocity_rad_s": [0] * 7,
-                    "output_mode": mode, "impedance_command": {"q_des_rad": target},
+                    "output_mode": mode, "impedance_command": reference_command(target),
                     "epoch": owner.epoch(), "max_joint_speed_rad_s": .01,
                     "max_joint_acceleration_rad_s2": .01})["mailbox_revision"]
                 result = owner.wait_cpv_result(revision, 1)
@@ -342,7 +403,8 @@ class MailboxTests(unittest.TestCase):
         owner = HardwareTxOwner(backend)
         try:
             command = {"joint_target_rad": Q, "joint_velocity_rad_s": [0] * 7,
-                "output_mode": "impedance", "impedance_command": {"q_des_rad": [9] * 7},
+                "output_mode": "impedance", "impedance_command": reference_command(Q),
+                "max_joint_speed_rad_s": 1, "max_joint_acceleration_rad_s2": 5,
                 "epoch": owner.epoch(), "target_generation": 1}
             revision = owner.publish_cpv(command)["mailbox_revision"]
             self.assertEqual(owner.wait_cpv_result(revision, 1)["status"], "sent")
@@ -557,12 +619,13 @@ class ServoIntegrationTests(unittest.TestCase):
         self.servo.impedance_output = self.output
         self.addCleanup(self.output.close)
 
-    def test_mit_consumes_the_same_pink_acceleration_and_final_gate_output(self):
+    def test_mit_publishes_velocity_without_integrating_a_second_reference(self):
         self.fixture.step()
         command = self.fixture.hardware.publish_servo_position.call_args.args[0]
         self.assertEqual(command["output_mode"], "impedance")
         for value in command["joint_target_rad"]:
-            self.assertAlmostEqual(value, .1008)
+            self.assertAlmostEqual(value, .1)
+        self.assertEqual(command["joint_velocity_rad_s"], [.5] * 7)
         self.assertEqual(command["impedance_command"]["q_des_rad"], command["joint_target_rad"])
         self.assertEqual(command["impedance_command"]["dq_des_rad_s"], [0] * 7)
 
@@ -580,6 +643,47 @@ class ServoIntegrationTests(unittest.TestCase):
         self.assertEqual(command["joint_target_rad"], Q)
         self.assertEqual(command["joint_velocity_rad_s"], [0] * 7)
         self.assertEqual(command["impedance_command"]["dq_des_rad_s"], [0] * 7)
+
+    def test_hold_telemetry_error_is_recomputed_not_a_frozen_tracking_sample(self):
+        self.servo.trajectory_state = "HOLD_READY"
+        self.servo.execution_sample = {"target_tcp": cpv_tests.POSE, "position_error_m": .5}
+        self.servo.solver.fk = lambda q: {"position_m": [.101, .2, .3],
+            "rotation": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]}
+        self.fixture.step()
+        self.assertAlmostEqual(self.servo.execution_sample["position_error_m"], .001)
+
+    def test_reference_is_read_only_and_pink_solves_from_it_not_actual_position(self):
+        reference = {"epoch": self.servo.motion_epoch, "action": "track",
+            "position_rad": [.2] * 7, "velocity_rad_s": [.1] * 7}
+        self.fixture.hardware.servo_transport_diagnostics.return_value = {"impedance_reference": reference}
+        solver = Mock(side_effect=self.fixture.solve_current)
+        self.servo.solver.solve_current = solver
+        self.fixture.step()
+        request = solver.call_args.args[0]
+        self.assertEqual(request["joint_angles_rad"], [.2] * 7)
+        self.assertEqual(request["measured_joint_angles_rad"], Q)
+        self.assertTrue(request["report_measured_error"])
+        self.assertEqual(reference["position_rad"], [.2] * 7)
+        self.assertEqual(self.servo.trajectory["position_rad"], [.2] * 7)
+
+    def test_moving_measured_joints_do_not_report_hold_ready(self):
+        self.servo.trajectory_state = "HOLD_READY"
+        original = self.servo._feedback_snapshot
+        self.servo._feedback_snapshot = lambda: {**original(), "velocities": [.1] * 7}
+        self.fixture.step()
+        self.assertEqual(self.servo.trajectory_state, "BRAKING")
+        command = self.fixture.hardware.publish_servo_position.call_args.args[0]
+        self.assertEqual(command["impedance_command"]["reference_action"], "hold")
+        self.fixture.hardware.latch_osc_hold.assert_not_called()
+
+    def test_terminal_hold_factory_clears_old_reference_and_rejects_stale_feedback(self):
+        original = self.servo._feedback_snapshot
+        self.servo._feedback_snapshot = lambda: {**original(), "age_s": self.fixture.feedback_age}
+        self.servo.trajectory["position_rad"] = [.4] * 7
+        self.assertEqual(self.servo.impedance_hold_command()["q_des_rad"], Q)
+        self.fixture.feedback_age = .2
+        with self.assertRaisesRegex(RuntimeError, "fresh feedback"):
+            self.servo.impedance_hold_command()
 
     def test_expired_gravity_in_hold_is_a_terminal_fault(self):
         self.servo.trajectory_state = "HOLD_READY"
@@ -609,6 +713,15 @@ class ServoIntegrationTests(unittest.TestCase):
         self.assertTrue(self.worker.closed)
         self.assertIsNone(self.servo.impedance_output)
         self.assertIsNone(self.servo.command)
+
+    def test_exit_failure_still_closes_worker_and_never_restores_old_targets(self):
+        self.fixture.hardware.exit_osc_impedance.side_effect = RuntimeError("exit unconfirmed")
+        with self.assertRaisesRegex(RuntimeError, "exit unconfirmed"):
+            self.servo.stop_session("operator HOLD")
+        self.assertTrue(self.worker.closed)
+        self.assertIsNone(self.servo.command)
+        self.assertIsNone(self.servo.impedance_output)
+        self.assertFalse(self.servo._accepting_targets)
 
 
 if __name__ == "__main__":
