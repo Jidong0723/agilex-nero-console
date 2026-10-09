@@ -6,7 +6,7 @@
     "timeout_s": 10.0,
     "startup_timeout_s": 30.0,
     "dt_s": 0.02,
-    "joint_acceleration_limit_rad_s2": 20.0,
+    "joint_acceleration_limit_rad_s2": 10.0,
     "posture_cost": 0.0001,
     "damping_cost": 0.03,
     "frame_position_cost": 4.0,
@@ -101,13 +101,13 @@
       3.92
     ],
     "acceleration_rad_s2": [
-      5.0,
-      5.0,
-      5.0,
-      5.0,
-      5.0,
-      5.0,
-      5.0
+      10.0,
+      10.0,
+      10.0,
+      10.0,
+      10.0,
+      10.0,
+      10.0
     ]
   },
   "joint_conventions": [

@@ -202,7 +202,7 @@
         <section class="dataset-content"><strong>采集内容 · 原始数据</strong><div id="dataset-content-summary">自然语言目标、双 RGB、关节/夹爪反馈、TCP 与控制目标。</div></section>
       </div>
       <div class="dataset-actions"><button id="dataset-start" class="button primary" type="button">开始采集</button><button id="dataset-stop" class="button quiet" type="button">结束并保存</button><button id="dataset-failed" class="button quiet" type="button">失败并归档</button></div>
-      <div class="dataset-readout"><span>运行时间<b id="dataset-duration">0.0 s</b></span><span>相机帧 / 频率<b id="dataset-frames">0 / 0 Hz</b></span><span>机械臂状态 / 频率<b id="dataset-robot-rate">0 / 0 Hz</b></span><span>原始流<b id="dataset-sample-kinds">--</b></span><span>数据门禁<b id="dataset-quality">采集中</b></span><span>采样拒绝<b id="dataset-rejected">0</b></span><span>重复/过期<b id="dataset-duplicates">0</b></span><span>写盘背压<b id="dataset-backpressure">0</b></span><span>已写入<b id="dataset-bytes">0 B</b></span><span>保存位置<b id="dataset-path">--</b></span></div>
+      <div class="dataset-readout"><span>运行时间<b id="dataset-duration">0.0 s</b></span><span>相机实际 / 目标频率<b id="dataset-frames">各目标 20 Hz</b></span><span>状态实际 / 目标频率<b id="dataset-robot-rate">目标 50 Hz</b></span><span>OSC接口输入<b id="dataset-inputs">0 条</b></span><span>丢帧 / 输入缺口<b id="dataset-drops">0</b></span><span>数据门禁<b id="dataset-quality">未评估</b></span><span>采样拒绝<b id="dataset-rejected">0</b></span><span>写盘背压<b id="dataset-backpressure">0</b></span><span>已写入<b id="dataset-bytes">0 B</b></span><span>保存位置<b id="dataset-path">--</b></span></div>
       <p id="dataset-result" class="result">只读采集，不获得额外 CAN 写权限。</p>`;
     document.querySelector(".osc-card")?.insertAdjacentElement("afterend", panel);
   }
@@ -544,7 +544,8 @@
     finally { state.picoMappingBusy = false; render(); }
   }
   async function resetPicoAnchor() { try { state.pico = await api("/api/adapters/pico/rebase", "POST", { session_id: session().id, client_id: clientId }); render(); } catch (error) { phase(`PICO 重置失败：${error.message}`, true); } }
-  const datasetSourceLabel = (source) => ({ web: "网页摇杆", pi05: "AutoDL云端推理", pico: "PICO 4 Ultra" }[source] || "网页摇杆");
+  const datasetSourceLabel = (source) => ({ web: "网页摇杆", pi05: "AutoDL云端推理", pico: "PICO 4 Ultra", external: "外部 OSC 客户端" }[source] || source || "未连接");
+  const escapeHtml = value => String(value).replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
   const datasetBytes = (value) => {
     const bytes = Math.max(0, Number(value) || 0); const units = ["B", "KB", "MB", "GB"]; let index = 0; let size = bytes;
     while (size >= 1024 && index < units.length - 1) { size /= 1024; index += 1; }
@@ -552,56 +553,68 @@
   };
   function datasetDetails(data) { return data.recording ? data : (data.last_episode || data); }
   function datasetPreview() {
-    const control_source = selectedAdapter(); const config = state.cameras?.config || {}; const sources = state.cameras?.sources || {};
-    const camera_sources = (control_source === "pi05" || control_source === "pico") ? Object.fromEntries(["external", "wrist"].map((source) => {
-      const item = config[source] || {}; const status = sources[source] || {};
+    const input_context = state.dataset?.input_context || {};
+    const control_source = input_context.control_source; const config = state.cameras?.config || {}; const sources = state.cameras?.sources || {};
+    const camera_sources = Object.fromEntries(["external", "wrist"].map((source) => {
+      const status = state.dataset?.camera_sources?.[source] || sources[source] || {}; const item = config[source] || status;
       return [source, { source, label: source === "external" ? "外部 RGB" : "腕部 RGB", folder: source === "external" ? "front" : "wrist",
         index: item.index, width: item.width, height: item.height, saved_width: status.dataset_size?.[0] || item.width, saved_height: status.dataset_size?.[1] || item.height, preview_width: status.preview_size?.[0], preview_height: status.preview_size?.[1], available: status.available === true,
         frame_available: status.frame_available === true, captured_frames: 0, dropped_frames: 0 }];
-    })) : {};
-    return { control_source, camera_sources, data_contents: { images: Object.values(camera_sources).map((camera) => ({
-      source: camera.source, label: camera.label, format: "JPEG", directory: `images/${camera.folder}`, available: camera.available,
-    })) } };
+    }));
+    return { control_source, input_context, camera_sources };
   }
   function renderDatasetSources(data) {
-    const source = data.control_source || selectedAdapter(); const cameras = data.camera_sources || {};
+    const source = data.control_source; const cameras = data.camera_sources || {};
     const rows = Object.values(cameras).map((camera) => {
-      const resolution = camera.saved_width && camera.saved_height ? `保存 ${camera.saved_width} × ${camera.saved_height}` : "保存规格未报告";
+      const width = camera.saved_width || camera.dataset_size?.[0] || camera.width;
+      const height = camera.saved_height || camera.dataset_size?.[1] || camera.height;
+      const resolution = width && height ? `保存 ${width} × ${height}` : "保存规格未报告";
       const status = camera.available ? (camera.frame_available === false ? "已选择，等待画面" : "可用") : "当前不可用";
-      const stats = data.recording ? ` · 成功 ${camera.captured_frames || 0} / 丢失 ${camera.dropped_frames || 0} / 重复 ${camera.duplicate_or_stale_frames || 0}${Number.isFinite(Number(camera.last_frame_age_ms)) ? ` / 最近 ${Number(camera.last_frame_age_ms).toFixed(0)} ms` : ""}` : "";
+      const drops = Number(data.raw_camera_drops_by_source?.[camera.source] || 0) + Number(data.camera_source_gaps?.[camera.source] || 0);
+      const stats = data.recording ? ` · 已保存 ${Number(data.raw_camera_frames_by_source?.[camera.source] || 0)} / 丢帧 ${drops}` : "";
       return `<span class="${camera.available ? "ok" : "warn"}">${camera.label || camera.source} · 设备 ${camera.index ?? "--"} · ${resolution} · ${status}${stats}</span>`;
     });
-    $("dataset-source-summary").innerHTML = `<span>控制源：<b>${datasetSourceLabel(source)}</b></span>${rows.length ? rows.join("") : "<span class=\"warn\">该控制源未选择相机；将仅记录状态、动作和控制输入。</span>"}`;
+    $("dataset-source-summary").innerHTML = `<span>实际控制源：<b>${escapeHtml(datasetSourceLabel(source))}</b> · ${data.input_context?.connected ? "已连接" : "未连接"} · ${data.input_context?.output_mode === "impedance" ? "阻抗" : "CPV"}</span>${rows.join("")}`;
   }
-  function renderDatasetContents(data) {
-    const contents = data.data_contents || {};
-    const images = Array.isArray(contents.images) && contents.images.length
-      ? contents.images.map((item) => `${item.label || item.source} JPEG → ${item.directory}`).join("；")
-      : "无图像流（仅状态、动作和控制输入）";
-    $("dataset-content-summary").innerHTML = `<span><b>episode.json</b>：手动自然语言目标、设备快照与原始流门禁</span><span><b>raw/robot_states.jsonl</b>：50 Hz关节、夹爪、实测TCP、目标TCP及时间戳</span><span><b>raw/images</b>：20 Hz双RGB时间戳图片；15 Hz、FK复核、SE(3)动作和H16均留到后处理</span>`;
+  function renderDatasetContents() {
+    $("dataset-content-summary").innerHTML = `<span><b>OSC输入</b>：逐条保存绝对TCP位姿、HOLD／停止／夹爪命令及接收结果，不采集设备原始事件</span><span><b>机器人状态</b>：目标 ${Number(state.dataset?.raw_robot_state_hz || 50)} Hz · <b>外部／腕部RGB</b>：各 ${Number(state.dataset?.raw_camera_hz || 20)} Hz，独立保存</span><span>相机可选；缺画面仍可采集，但不满足双RGB训练要求。15 Hz对齐、动作及H16留到后处理。</span>`;
   }
   function renderDataset() {
     const raw = state.dataset || {}; const data = datasetDetails(raw); const recording = raw.recording === true;
     const preview = recording ? data : datasetPreview();
     picoText("dataset-state", recording ? "采集中" : (data.status === "deleted" ? "已删除" : data.status === "completed" ? "已保存" : "未采集"));
     picoText("dataset-duration", `${Number(data.duration_s || 0).toFixed(1)} s`);
-    picoText("dataset-frames", `${data.raw_camera_frames ?? data.frame_count ?? 0} / ${Number(data.raw_camera_effective_hz || data.effective_hz || 0).toFixed(1)} Hz`);
-    picoText("dataset-robot-rate", `${data.raw_robot_states ?? 0} / ${Number(data.raw_robot_state_effective_hz || 0).toFixed(1)} Hz`);
-    picoText("dataset-sample-kinds", data.training_view_generated ? "已生成训练视图" : "仅原始数据"); picoText("dataset-rejected", data.rejected_samples ?? data.dropped_frames ?? 0); picoText("dataset-duplicates", Object.values(data.camera_sources || {}).reduce((sum, camera) => sum + Number(camera.duplicate_or_stale_frames || 0), 0)); picoText("dataset-backpressure", data.backpressure_drops ?? 0); picoText("dataset-bytes", datasetBytes(data.bytes_written));
+    const cameraHz = Number(raw.raw_camera_hz || 20), robotHz = Number(raw.raw_robot_state_hz || 50);
+    const cameraRates = data.camera_effective_hz_by_source || {};
+    picoText("dataset-frames", `外 ${Number(cameraRates.external || 0).toFixed(1)} / 腕 ${Number(cameraRates.wrist || 0).toFixed(1)} Hz · 各目标 ${cameraHz}`);
+    picoText("dataset-robot-rate", `${data.raw_robot_states ?? 0} 帧 / ${Number(data.raw_robot_state_effective_hz || 0).toFixed(1)} Hz · 目标 ${robotHz}`);
+    const cameraDrops = Number(data.raw_camera_drops || 0) + Object.values(data.camera_source_gaps || {}).reduce((sum, count) => sum + Number(count), 0);
+    const robotDrops = Number(data.raw_robot_drops || 0) + Number(data.robot_revision_gaps || 0);
+    picoText("dataset-drops", `相机 ${cameraDrops} / 状态 ${robotDrops} / 输入 ${Number(data.osc_input_gaps || 0)}`);
+    picoText("dataset-inputs", `${Number(data.osc_input_count || 0)} 条 OSC 命令`);
+    $("dataset-drops")?.classList.toggle("dataset-alert", cameraDrops + robotDrops + Number(data.osc_input_gaps || 0) > 0);
+    $("dataset-frames")?.classList.toggle("dataset-alert", cameraDrops > 0 || recording && data.duration_s > 2 && (data.enabled_cameras || Object.keys(cameraRates)).some(source => Number(cameraRates[source] || 0) < cameraHz * .9));
+    $("dataset-robot-rate")?.classList.toggle("dataset-alert", robotDrops > 0 || recording && data.duration_s > 2 && Number(data.raw_robot_state_effective_hz || 0) < robotHz * .9);
+    picoText("dataset-rejected", data.rejected_samples ?? 0);
+    picoText("dataset-backpressure", data.backpressure_drops ?? 0);
+    picoText("dataset-bytes", datasetBytes(data.bytes_written));
     const quality = data.quality || {}; picoText("dataset-quality", recording ? "采集中" : quality.raw_valid === true ? "原始数据有效" : quality.raw_valid === false ? "原始数据异常" : "未评估");
     picoText("dataset-path", data.episode_dir || raw.dataset_root || "--");
-    renderDatasetSources(preview); renderDatasetContents(preview);
+    renderDatasetSources(preview); renderDatasetContents();
     const reasons = Object.entries(data.rejection_reasons || {}).map(([reason, count]) => `${reason} ${count}`).join("；");
-    const feedback = data.last_error || (recording && reasons) || (recording ? ((data.rejected_samples || 0) > 0 && !(data.commanded_frame_count || 0) ? "正在等待双相机与实测状态满足原始数据同步要求。" : `Episode ${String(data.episode_index || "").padStart(6, "0")} 正在记录原始观测与TCP变化。`) : data.status === "discarded_empty" ? "没有形成任何相邻实测TCP动作，空目录和空视频已自动清理。" : data.status === "failed" ? "数据未通过结构或同步审计，已归档到 failed_episodes，不进入训练视图。" : data.status === "completed" ? "Episode 原始数据已保存；H16窗口将在训练视图生成阶段构建。" : "开始后会实时显示数据量、帧率和实际记录内容。");
-    picoText("dataset-result", feedback);
+    const feedback = data.last_error || (recording && reasons) || (recording ? `Episode ${String(data.episode_index ?? 0).padStart(6, "0")} 正在保存原始状态与OSC输入。` : data.status === "discarded_empty" ? "未取得原始图像、状态或OSC输入，空记录已清理。" : data.status === "failed" ? "原始数据审计未通过，已归档到 failed_episodes。" : data.status === "completed" ? "原始数据已保存；训练视图需离线生成。" : raw.input_context?.reason || "连接控制源后即可采集，相机可选。");
+    const camerasMissing = Object.values(preview.camera_sources || {}).some(camera => !camera.available || camera.frame_available === false);
+    const warning = (data.warnings || []).join("；") || (camerasMissing ? "相机画面缺失；仍可采集，但不满足双RGB训练要求。" : "");
+    picoText("dataset-result", [warning, feedback].filter(Boolean).join(" "));
+    $("dataset-result")?.classList.toggle("dataset-warning", Boolean(warning));
     const busy = state.datasetBusy;
-    $("dataset-start") && ($("dataset-start").disabled = busy || recording);
+    $("dataset-start") && ($("dataset-start").disabled = busy || recording || raw.input_context?.connected === false);
     $("dataset-stop") && ($("dataset-stop").disabled = busy || !recording);
     $("dataset-failed") && ($("dataset-failed").disabled = busy || !recording);
     ["dataset-task", "dataset-description"].forEach((id) => { if ($(id)) $(id).disabled = busy || recording; });
   }
   async function refreshDatasetState() { try { state.dataset = await api("/api/dataset/state"); renderDataset(); } catch (_) {} }
-  async function startDataset() { state.datasetBusy = true; renderDataset(); try { state.dataset = await api("/api/dataset/start", "POST", { task: $("dataset-task")?.value || "", description: $("dataset-description")?.value || "", control_source: selectedAdapter() }, 10000); } catch (error) { state.dataset = { ...(state.dataset || {}), last_error: `开始失败：${error.message}` }; } finally { state.datasetBusy = false; renderDataset(); } }
+  async function startDataset() { state.datasetBusy = true; renderDataset(); try { state.dataset = await api("/api/dataset/start", "POST", { task: $("dataset-task")?.value || "", description: $("dataset-description")?.value || "" }, 10000); } catch (error) { state.dataset = { ...(state.dataset || {}), last_error: `开始失败：${error.message}` }; } finally { state.datasetBusy = false; renderDataset(); } }
   async function stopDataset(completed) { if (!completed && !window.confirm("该 Episode 将归档到 failed_episodes 且不会进入训练视图，确定继续吗？")) return; state.datasetBusy = true; renderDataset(); try { state.dataset = await api("/api/dataset/stop", "POST", { status: completed ? "completed" : "failed" }, 30000); } catch (error) { state.dataset = { ...(state.dataset || {}), last_error: `结束失败：${error.message}` }; } finally { state.datasetBusy = false; renderDataset(); } }
 
   async function startPico() {
@@ -609,7 +622,7 @@
     try {
       let current = session();
       if (current.state !== "ACTIVE") {
-        const started = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId }, 10000);
+        const started = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId, input_source: "pico" }, 10000);
         updateOscState(started.state, true); current = session();
       }
       state.pico = await api("/api/adapters/pico/connect", "POST", { session_id: current.id, client_id: clientId }, 10000);
@@ -1297,7 +1310,7 @@
     phase("正在接入 WebAdapter…");
     const executionMode = $("execution-mode").value;
     try {
-      const result = await api("/api/osc/session/start", "POST", { execution_mode: executionMode, client_id: clientId }, 10000);
+      const result = await api("/api/osc/session/start", "POST", { execution_mode: executionMode, client_id: clientId, input_source: "web" }, 10000);
       if (generation !== state.requestGeneration) return;
       const osc = result.state;
       // A control-service restart resets state_sequence to zero.  This is a
@@ -1434,7 +1447,7 @@
     try {
       let current = session();
       if (current.state !== "ACTIVE" || current.client_id !== clientId) {
-        const result = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId }, 10000);
+        const result = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId, input_source: "pi05" }, 10000);
         updateOscState(result.state, true); current = session();
       }
       // Cameras and inference are already running; this button only enables
@@ -1593,7 +1606,7 @@
         // session while the UI says hardware mode.
         await api("/api/pi05/stop", "POST", { reason: "execution mode changed" }).catch(() => {});
         await api("/api/osc/session/stop", "POST", { reason: "execution mode changed" });
-        const result = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId }, 10000);
+        const result = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId, input_source: selectedAdapter() }, 10000);
         updateOscState(result.state, true);
         phase($("execution-mode").value === "hardware" ? "已切换为真机模式，请点击开始自动控制" : "已切换为影子模式");
       } catch (error) {

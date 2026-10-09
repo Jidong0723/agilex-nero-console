@@ -26,6 +26,8 @@ class OscClientPort(Protocol):
     def state(self) -> dict[str, Any]: ...
     def sensor_sample(self, target_monotonic_ns: int, wait_s: float = 0.0) -> dict[str, Any] | None: ...
     def sensor_samples_after(self, revision: int, wait_s: float = 0.0, max_items: int = 128) -> list[dict[str, Any]]: ...
+    def input_context(self) -> dict[str, Any]: ...
+    def input_events(self, after_revision: int, max_items: int = 512) -> dict[str, Any]: ...
     def start_session(self, client_id: str, execution_mode: str) -> dict[str, Any]: ...
     def heartbeat(self, client_id: str, session_id: str) -> dict[str, Any]: ...
     def track_tcp(self, session_id: str, client_id: str, sequence: int, target_pose: dict[str, Any]) -> dict[str, Any]: ...
@@ -37,8 +39,9 @@ class OscClientPort(Protocol):
 class OscClient:
     """Narrow adapter client backed by the OSC process proxy."""
 
-    def __init__(self, broker: Any) -> None:
+    def __init__(self, broker: Any, input_source: str = "external") -> None:
         self._broker = broker
+        self.input_source = input_source
 
     def state(self) -> dict[str, Any]:
         return self._broker.osc_state()
@@ -49,8 +52,17 @@ class OscClient:
     def sensor_samples_after(self, revision: int, wait_s: float = 0.0, max_items: int = 128) -> list[dict[str, Any]]:
         return self._broker.osc_sensor_samples_after(int(revision), float(wait_s), int(max_items))
 
+    def input_context(self) -> dict[str, Any]:
+        return self._broker.osc_input_context()
+
+    def input_events(self, after_revision: int, max_items: int = 512) -> dict[str, Any]:
+        return self._broker.osc_input_events(after_revision, max_items)
+
+    def bind_source(self, session_id: str, client_id: str, source: str) -> None:
+        self._broker.osc_bind_input_source(session_id, client_id, source)
+
     def start_session(self, client_id: str, execution_mode: str) -> dict[str, Any]:
-        return self._broker.osc_start(client_id, execution_mode)
+        return self._broker.osc_start(client_id, execution_mode, self.input_source)
 
     def heartbeat(self, client_id: str, session_id: str) -> dict[str, Any]:
         return self._broker.osc_heartbeat(client_id, session_id)
@@ -95,15 +107,15 @@ class AdapterRuntime:
             trace_dir / f"pico-adapter-{time.strftime('%Y%m%dT%H%M%S')}.jsonl",
             {"component": "pico_adapter"},
         )
-        self.pico = PicoInputAdapter(self.osc, dict(runtime_config.get("pico_adapter") or {}), self.pico_trace_logger)
+        self.pico = PicoInputAdapter(OscClient(broker, "pico"), dict(runtime_config.get("pico_adapter") or {}), self.pico_trace_logger)
         dataset_config = dict(runtime_config.get("dataset") or {})
         osc_config = json.loads((project_root / "config" / "osc.json").read_text(encoding="utf-8-sig"))
         self.dataset_fk = KinematicsClient(project_root, osc_config)
         self.dataset = TcpVlaDatasetRecorder(
             self.osc,
             self.cameras,
-            self.pico,
             project_root.parent / "dataset",
+            context_provider=self.dataset_context,
             fk_client=self.dataset_fk,
             sample_hz=float(dataset_config.get("sample_hz", 15.0)),
             raw_camera_hz=float(dataset_config.get("raw_camera_hz", 20.0)),
@@ -138,7 +150,9 @@ class AdapterRuntime:
 
     def pi05_state(self) -> dict[str, Any]: return self.pi05.snapshot()
     def pi05_update_config(self, body: dict[str, Any]) -> dict[str, Any]: return self.pi05.update_config(body)
-    def pi05_start(self, session_id: str, client_id: str) -> dict[str, Any]: return self.pi05.start(session_id, client_id)
+    def pi05_start(self, session_id: str, client_id: str) -> dict[str, Any]:
+        self.osc.bind_source(session_id, client_id, "pi05")
+        return self.pi05.start(session_id, client_id)
     def pi05_stop(self, reason: str) -> dict[str, Any]: return self.pi05.stop(reason)
     def camera_state(self) -> dict[str, Any]: return self.cameras.snapshot()
     def camera_update_config(self, body: dict[str, Any]) -> dict[str, Any]: return self.cameras.update_config(body.get("cameras", body))
@@ -153,6 +167,16 @@ class AdapterRuntime:
     def camera_devices(self) -> list[dict[str, Any]]: return self.cameras.devices()
     def camera_frame_jpeg(self, source: str) -> bytes | None: return self.cameras.frame_jpeg(source)
     def dataset_state(self) -> dict[str, Any]: return self.dataset.state()
+    def dataset_context(self) -> dict[str, Any]:
+        context = self.osc.input_context()
+        source = context["control_source"]
+        adapter = self.pico.snapshot() if source == "pico" else self.pi05.snapshot() if source == "pi05" else None
+        if adapter is not None:
+            connected = (adapter.get("connected") is True if source == "pico" else adapter.get("state") == "RUNNING")
+            context["connected"] = bool(context["connected"] and connected
+                and adapter.get("session_id") == context["session_id"])
+        context["reason"] = None if context["connected"] else "当前控制源未连接到有效 OSC 会话"
+        return context
     def dataset_episodes(self) -> dict[str, Any]: return self.dataset.episodes()
     def dataset_start(self, body: dict[str, Any]) -> dict[str, Any]: return self.dataset.start(body)
     def dataset_stop(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -160,7 +184,9 @@ class AdapterRuntime:
     def pico_state(self) -> dict[str, Any]: return self.pico.snapshot()
     def pico_reset_anchor(self, body: dict[str, Any]) -> dict[str, Any]:
         return self.pico.reset_anchor(str(body.get("session_id", "")), str(body.get("client_id", "")))
-    def pico_begin_connection(self, session_id: str, client_id: str) -> None: self.pico.begin_connection(session_id, client_id)
+    def pico_begin_connection(self, session_id: str, client_id: str) -> None:
+        self.osc.bind_source(session_id, client_id, "pico")
+        self.pico.begin_connection(session_id, client_id)
     def pico_connected(self) -> None: self.pico.connected()
     def pico_connection_lost(self, reason: str) -> None: self.pico.connection_lost(reason)
     def pico_disconnected(self, reason: str) -> None: self.pico.disconnected(reason)

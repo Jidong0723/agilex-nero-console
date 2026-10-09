@@ -1293,6 +1293,7 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 return self._json_ok(self.broker.osc_start(
                     str(body.get("client_id", "anonymous")),
                     str(body.get("execution_mode", "shadow")),
+                    str(body.get("input_source", "external")),
                 ))
             if self.path == "/api/osc/output-mode":
                 return self._json_ok(self.broker.osc_output_mode(

@@ -73,6 +73,23 @@ class ReferenceTests(unittest.TestCase):
         self.assertGreaterEqual(reverse["position_rad"][0], previous["position_rad"][0])
         self.assertLess(self.step(-.5)["position_rad"][0], reverse["position_rad"][0])
 
+    def test_shipped_ten_rad_s2_limit_keeps_mit_position_and_velocity_consistent(self):
+        acceleration = CONFIG["solver"]["joint_acceleration_limit_rad_s2"]
+        self.assertEqual(acceleration, 10.0)
+        previous = None
+        for index in range(3):
+            candidate = self.ref.prepare(self.command, [.5] * 7,
+                started_perf_ns=self.ns + index * 20_000_000, epoch=1, generation=1,
+                max_speed=1, max_acceleration=acceleration)
+            self.ref.commit(candidate)
+            if previous is not None:
+                for q, old_q, velocity, old_velocity in zip(candidate["position_rad"],
+                        previous["position_rad"], candidate["velocity_rad_s"], previous["velocity_rad_s"]):
+                    self.assertLessEqual(abs(velocity - old_velocity), .20000001)
+                    self.assertAlmostEqual(q - old_q, velocity * .02)
+            previous = candidate
+        self.assertAlmostEqual(previous["velocity_rad_s"][0], .4)
+
     def test_invalid_interval_is_not_clamped_or_caught_up(self):
         self.step()
         before = self.ref.snapshot()

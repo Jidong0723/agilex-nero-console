@@ -15,7 +15,7 @@ function fixture(mode = "cpv") {
   const element = (id) => {
     if (!nodes.has(id)) nodes.set(id, {
       value: id === "execution-mode" ? "hardware" : id === "input-adapter" ? "web" : "",
-      style: {}, classList: { toggle() {}, add() {}, remove() {} },
+      style: {}, classList: { toggle(name, enabled) { this[name] = Boolean(enabled); }, add() {}, remove() {} },
       setAttribute() {}, replaceChildren() {}, remove() {}, closest() { return null; },
       getContext() { return null; },
     });
@@ -34,9 +34,11 @@ function fixture(mode = "cpv") {
     },
   });
   vm.runInContext(source.slice(0, startup) + `
+    const renderCollection = renderDataset;
     drawWorkspace = renderHierarchy = renderPi05 = renderPico = renderDataset = renderCameraControls = () => {};
     globalThis.consoleTest = { state, render, updateOscState, connectWebAdapter, disconnectWebAdapter,
-      reanchorWebAdapter, sendIntent, heartbeat, refresh, selectOutputMode, resetWebAdapter };
+      reanchorWebAdapter, sendIntent, heartbeat, refresh, selectOutputMode, resetWebAdapter,
+      renderDataset: renderCollection, datasetPreview, startDataset };
   })();`, context);
   const app = context.consoleTest;
   let handler = async (url) => url === "/api/osc/state" ? app.state.osc : {};
@@ -73,7 +75,7 @@ for (const mode of ["cpv", "impedance"]) {
     f.app.state.relativePose.position_m[0] = 0.002;
     await f.app.sendIntent();
     assert.deepEqual(f.requests.find(r => r.url.endsWith("/start")).body,
-      { execution_mode: "hardware", client_id: "browser-test" });
+      { execution_mode: "hardware", client_id: "browser-test", input_source: "web" });
     const command = f.requests.find(r => r.url === "/api/osc/command").body;
     assert.equal(command.type, "track_tcp");
     assert.equal(command.payload.target_pose.position_m[0], 0.10200000000000001);
@@ -229,4 +231,42 @@ test("a delayed poll cannot overwrite an authoritative switch response", async (
   await refreshing;
   assert.equal(f.app.state.osc.output_mode, "impedance");
   assert.equal(f.app.state.webAdapterActive, false);
+});
+
+test("collection uses actual source, shared cameras and explicit target rates for every adapter", () => {
+  const f = fixture();
+  f.nodes.set("input-adapter", { value: "pi05" });
+  f.app.state.dataset = { raw_camera_hz: 20, raw_robot_state_hz: 50,
+    input_context: { control_source: "web", connected: true, output_mode: "impedance" },
+    camera_sources: { external: { available: true, frame_available: true }, wrist: { available: false, frame_available: false } } };
+  f.app.renderDataset();
+  assert.match(f.nodes.get("dataset-source-summary").innerHTML, /网页摇杆/);
+  assert.match(f.nodes.get("dataset-source-summary").innerHTML, /外部 RGB/);
+  assert.match(f.nodes.get("dataset-content-summary").innerHTML, /20 Hz/);
+  assert.match(f.nodes.get("dataset-content-summary").innerHTML, /50 Hz/);
+  assert.equal(f.nodes.get("dataset-result").classList["dataset-warning"], true);
+  assert.equal(f.nodes.get("dataset-start").disabled, false);
+  f.app.state.dataset.input_context.connected = false;
+  f.app.renderDataset();
+  assert.equal(f.nodes.get("dataset-start").disabled, true);
+});
+
+test("camera, robot and command-history drops are visibly highlighted", () => {
+  const f = fixture();
+  f.app.state.dataset = { recording: true, duration_s: 3, raw_camera_drops: 2, raw_robot_drops: 1,
+    osc_input_gaps: 4, osc_input_count: 75, raw_camera_hz: 20, raw_robot_state_hz: 50 };
+  f.app.renderDataset();
+  assert.equal(f.nodes.get("dataset-drops").classList["dataset-alert"], true);
+  assert.equal(f.nodes.get("dataset-frames").classList["dataset-alert"], true);
+  assert.equal(f.nodes.get("dataset-robot-rate").classList["dataset-alert"], true);
+  assert.match(f.nodes.get("dataset-drops").textContent, /相机 2.*状态 1.*输入 4/);
+  assert.match(f.nodes.get("dataset-inputs").textContent, /75/);
+});
+
+test("collection start does not use the selected UI tab as provenance", async () => {
+  const f = fixture();
+  f.route(async () => ({ recording: true }));
+  await f.app.startDataset();
+  const request = f.requests.find(r => r.url === "/api/dataset/start");
+  assert.equal("control_source" in request.body, false);
 });

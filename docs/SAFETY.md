@@ -22,7 +22,7 @@ This document describes software defenses, not a safety certification.
 
 ### Joint-motion envelope
 
-The configured OSC envelope is `1.5 rad/s` per joint and `5.0 rad/s²` per
+The configured OSC request is `5.0 rad/s` per joint and `10.0 rad/s²` per
 joint.  It is deliberately enforced at three points with the same values:
 
 - Pink's `VelocityLimit` and `AccelerationLimit` constrain each IK proposal.
@@ -41,6 +41,16 @@ it can only reduce an OSC request, never increase it.
 `shadow_transport.max_joint_acceleration_rad_s2` use the same values so the
 shadow CPV plant follows the configured envelope.  Read-only CAN calibration
 records observed CPV values but never overwrites this configured envelope.
+
+The shipped fixed hardware acceleration envelope is also `10.0 rad/s²` for
+all seven joints. CPV profile sync passes the configured acceleration to both
+SDK ACC and DCC; their CAN encoding is in 0.01 rad/s² units (10 maps to 1000).
+The calibration snapshot is historical measured data, not a profile request.
+Updating configuration does not write motor Flash: reload the service and use
+`POST /api/osc/cpv-profile/sync` in confirmed HOLD with no active OSC session,
+then verify the returned seven-joint ACC/DCC read-back. MIT reference shaping
+uses the same software acceleration envelope; MIT frames contain no ACC/DCC
+profile field. This does not guarantee a physical MIT acceleration bound.
 
 ## Required commissioning sequence
 

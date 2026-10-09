@@ -173,7 +173,7 @@ class Solver:
         frame_lm_damping = float(request.get("frame_lm_damping", 0.0))
         # Frame gain is an IK feedback gain, not a joint-speed limit.  The
         # OSC output path independently enforces joint velocity and the
-        # 5 rad/s² acceleration limit, so permit a bounded gain above one for
+        # configured acceleration limit, so permit a bounded gain above one for
         # critically faster Cartesian error correction.
         if (
             not math.isfinite(position_cost) or not 2.0 <= position_cost <= 10.0

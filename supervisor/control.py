@@ -21,6 +21,7 @@ from motion.osc import OscRuntime, pose_from_tcp
 from motion.safety import arm_status_has_error
 from .telemetry import TelemetryReader
 from .hardware_maintenance import HardwareMaintenance
+from .osc_input_journal import OscInputJournal
 
 def absolute_pose_from_sdk_rpy(tcp_pose: Any) -> dict[str, list[float]] | None:
     """Convert the SDK's base-frame XYZ/RPY feedback into the public pose form."""
@@ -192,6 +193,7 @@ class OperationalSpaceController:
         self._cpv_profile_cache: dict[str, Any] = {"status": "not_read"}
         self._active_action: dict[str, Any] | None = None
         self._action_observers: list[Callable[..., None]] = []
+        self._osc_inputs = OscInputJournal()
         self._jobs: dict[str, dict[str, Any]] = {}
         self._jobs_lock = threading.RLock()
         self._status_monitor: threading.Thread | None = None
@@ -1039,14 +1041,41 @@ class OperationalSpaceController:
         self,
         client_id: str = "anonymous",
         execution_mode: str = "shadow",
+        input_source: str = "external",
     ) -> dict[str, Any]:
         result = self._osc.start_session(
             execution_mode=execution_mode,
             client_id=client_id,
         )
+        self.osc_bind_input_source(str(result.get("session", {}).get("id", "")), client_id, input_source)
+        context = self.osc_input_context()
+        self._osc_inputs.append({"session_id": context["session_id"], "client_id": client_id,
+            "type": "session_start", "payload": {"execution_mode": execution_mode}},
+            context, time.perf_counter_ns(), accepted=True)
         return {"ok": True, "state": self.osc_state(), "session": result.get("session", {})}
 
+    def osc_bind_input_source(self, session_id: str, client_id: str, source: str) -> None:
+        session = self._osc.status().get("session") or {}
+        if session.get("state") != "ACTIVE" or session.get("id") != session_id or session.get("client_id") != client_id:
+            raise PermissionError("input source requires the caller's active OSC session")
+        self._osc_inputs.bind(session_id, str(source).strip().lower() or "external")
+
+    def osc_input_context(self) -> dict[str, Any]:
+        state = self._osc.status()
+        session = state.get("session") or {}
+        connected = session.get("state") == "ACTIVE" and not self._osc.heartbeat_expired()
+        return self._osc_inputs.context(session, state.get("output_mode", "cpv"), connected)
+
+    def osc_input_events(self, after_revision: int, max_items: int = 512) -> dict[str, Any]:
+        return self._osc_inputs.read(int(after_revision), int(max_items))
+
     def osc_stop(self, reason: str = "OSC session stopped") -> dict[str, Any]:
+        context = self.osc_input_context()
+        body = {"session_id": context["session_id"], "client_id": context["client_id"],
+                "type": "stop", "payload": {"reason": reason}}
+        return self._observe_osc_input(body, lambda: self._stop_osc_session(reason))
+
+    def _stop_osc_session(self, reason: str) -> dict[str, Any]:
         session = self._osc.status().get("session") or {}
         if session.get("state") == "ACTIVE" and session.get("execution_mode") == "shadow":
             stopped = self._osc.stop_session(reason)
@@ -1062,6 +1091,12 @@ class OperationalSpaceController:
         return {"ok": True, "state": self.osc_state()}
 
     def osc_input_hold(self, reason: str = "PICO right Grip released") -> dict[str, Any]:
+        context = self.osc_input_context()
+        body = {"session_id": context["session_id"], "client_id": context["client_id"],
+                "type": "hold", "payload": {"reason": reason}}
+        return self._observe_osc_input(body, lambda: self._osc_input_hold(reason))
+
+    def _osc_input_hold(self, reason: str) -> dict[str, Any]:
         """Deadman HOLD for PICO input while keeping its OSC session active."""
         session = self._osc.status().get("session") or {}
         mode = str(session.get("execution_mode") or "shadow")
@@ -1072,6 +1107,21 @@ class OperationalSpaceController:
         raise RuntimeError("PICO input HOLD requires an active OSC session")
 
     def osc_command(self, body: dict[str, Any]) -> dict[str, Any]:
+        return self._observe_osc_input(body, lambda: self._execute_osc_command(body))
+
+    def _observe_osc_input(self, body: dict[str, Any], execute: Callable) -> dict[str, Any]:
+        received_ns = time.perf_counter_ns()
+        context = self.osc_input_context()
+        try:
+            result = execute()
+        except Exception as exc:
+            self._osc_inputs.append(body, context, received_ns, accepted=False, error=f"{type(exc).__name__}: {exc}")
+            raise
+        self._osc_inputs.append(body, context, received_ns,
+            accepted=bool(result.get("ok", result.get("accepted", False))))
+        return result
+
+    def _execute_osc_command(self, body: dict[str, Any]) -> dict[str, Any]:
         command_type = str(body.get("type", "")).strip().lower()
         payload = dict(body.get("payload") or {})
         acknowledgement_only = bool(body.get("acknowledgement_only", False)) and command_type == "track_tcp"

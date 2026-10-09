@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from motion.osc import _OperationalSpaceServo
+from motion.osc import OscRuntime, _OperationalSpaceServo
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -99,6 +99,39 @@ class DirectCpvTests(unittest.TestCase):
         published = self.hardware.publish_servo_position.call_args.args[0]
         self.assertEqual(published["joint_target_rad"], result["final_joint_target_rad"])
         self.assertEqual(published["max_joint_acceleration_rad_s2"], 2.0)
+
+    def test_shipped_acceleration_reaches_solver_dispatch_and_profile_sync(self):
+        shipped = json.loads((ROOT / "config/osc.json").read_text(encoding="utf-8"))
+        acceleration = shipped["solver"]["joint_acceleration_limit_rad_s2"]
+        self.assertEqual(acceleration, 10.0)
+        self.assertEqual(shipped["hardware_limits"]["acceleration_rad_s2"], [10.0] * 7)
+        self.servo.config["solver"]["joint_acceleration_limit_rad_s2"] = acceleration
+        authority = self.servo.authority.initialize_fixed()
+        self.servo.supervisor.configure(authority, [1.0] * 7, [acceleration] * 7)
+        runtime = object.__new__(OscRuntime)
+        runtime._servo = self.servo
+        self.assertEqual(runtime.cpv_limits()[1], 10.0)
+        solve = self.servo.solver.solve_current
+        requests = []
+        def capture(request, timeout):
+            requests.append(request)
+            return solve(request, timeout)
+        self.servo.solver.solve_current = capture
+        result = self.step()
+        self.assertEqual(requests[0]["joint_acceleration_limit_rad_s2"], [10.0] * 7)
+        published = self.hardware.publish_servo_position.call_args.args[0]
+        self.assertEqual(published["max_joint_acceleration_rad_s2"], 10.0)
+        for q, velocity in zip(result["final_joint_target_rad"], result["final_joint_velocity_rad_s"]):
+            self.assertAlmostEqual(velocity, .2)
+            self.assertAlmostEqual(q, .104)
+        self.servo.session["execution_mode"] = "shadow"
+        self.servo._initialize_trajectory(self.q)
+        self.servo.shadow_joints = list(self.q)
+        self.hardware.publish_servo_position.reset_mock()
+        shadow_result = self.step()
+        self.assertEqual(shadow_result["final_joint_velocity_rad_s"], result["final_joint_velocity_rad_s"])
+        self.assertEqual(shadow_result["final_joint_target_rad"], result["final_joint_target_rad"])
+        self.hardware.publish_servo_position.assert_not_called()
 
     def test_shadow_matches_hardware_command(self):
         hardware_result = dict(self.step())

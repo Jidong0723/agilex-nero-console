@@ -264,3 +264,5 @@
 #tcp-reference-readout{order:7}
 .osc-panel .pi05-help .help-content{grid-template-columns:repeat(2,minmax(0,1fr))}
 @media(max-width:720px){.osc-panel .pi05-help .help-content{grid-template-columns:1fr}}
+.dataset-alert { color: #ff717b !important; background: #47232a; border-radius: 4px; padding: 2px 4px; }
+.dataset-warning { color: #f1c567 !important; }

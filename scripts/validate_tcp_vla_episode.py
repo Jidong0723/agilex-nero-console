@@ -85,10 +85,28 @@ def validate_episode(episode_dir: Path) -> dict[str, Any]:
             robot_rows = [json.loads(line) for line in robot_path.read_text(encoding="utf-8").splitlines() if line.strip()]
         except (OSError, json.JSONDecodeError) as exc:
             errors.append(f"raw_robot_manifest_invalid:{exc}")
-        if not camera_rows:
+        enabled_cameras = metadata.get("enabled_cameras", ["external", "wrist"])
+        if not camera_rows and enabled_cameras:
             errors.append("no_raw_camera_frames")
+        if len(enabled_cameras) < 2:
+            warnings.append("dual_rgb_unavailable; raw collection only")
         if not robot_rows:
             errors.append("no_raw_robot_states")
+        input_file = (metadata.get("files") or {}).get("osc_inputs")
+        if input_file:
+            try:
+                input_rows = [json.loads(line) for line in (episode_dir / input_file).read_text(encoding="utf-8").splitlines() if line.strip()]
+                if len(input_rows) != (metadata.get("raw_streams") or {}).get("osc_inputs"):
+                    errors.append("osc_input_count_mismatch")
+                if (metadata.get("raw_streams") or {}).get("osc_input_gaps"):
+                    errors.append("osc_input_history_overflow")
+                for index, row in enumerate(input_rows):
+                    if not isinstance(row.get("command"), dict) or not isinstance(row.get("context"), dict):
+                        errors.append(f"osc_input:{index}:command_or_context_missing")
+                    if not isinstance(row.get("accepted"), bool) or not isinstance(row.get("received_perf_counter_ns"), int):
+                        errors.append(f"osc_input:{index}:outcome_or_timestamp_invalid")
+            except (OSError, json.JSONDecodeError) as exc:
+                errors.append(f"osc_input_manifest_invalid:{exc}")
         independent_cameras = any(row.get("source") in ("external", "wrist") for row in camera_rows)
         camera_rows_by_source: dict[str, list[dict[str, Any]]] = {"external": [], "wrist": []}
         for index, row in enumerate(camera_rows):

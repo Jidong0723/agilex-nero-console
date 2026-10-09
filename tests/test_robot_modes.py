@@ -270,11 +270,11 @@ class RobotModeTests(unittest.TestCase):
 
     def test_configure_cpv_profile_acknowledges_and_reads_back_all_joints(self) -> None:
         robot, sdk = self.make_robot()
-        result = robot.configure_cpv_profile(2.0, 5.0, 5.0)
+        result = robot.configure_cpv_profile(2.0, 10.0, 10.0)
         self.assertTrue(result["ok"])
         self.assertEqual(sdk.cpv_profile["cv"], [2.0] * 7)
-        self.assertEqual(sdk.cpv_profile["acc"], [5.0] * 7)
-        self.assertEqual(sdk.cpv_profile["dcc"], [5.0] * 7)
+        self.assertEqual(sdk.cpv_profile["acc"], [10.0] * 7)
+        self.assertEqual(sdk.cpv_profile["dcc"], [10.0] * 7)
         self.assertEqual(len(result["joints"]), 7)
 
     def test_freedrive_state_uses_live_leader_angles(self) -> None:

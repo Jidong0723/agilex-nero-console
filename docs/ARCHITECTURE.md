@@ -66,7 +66,7 @@ shadow use the same calculation. There is no alternative trajectory planner
 or input velocity filter.
 
 `solver.joint_acceleration_limit_rad_s2` configures the requested acceleration
-limit (20.0 in the shipped configuration). Hardware uses its intersection with
+limit (10.0 rad/s² in the shipped configuration). Hardware uses its intersection with
 the controller limits, while shadow uses it for its simulated plant. A missing
 solver result or a HOLD request brakes using the same limit. Hardware enters
 HOLD only after the final braking publication is accepted by the sender.

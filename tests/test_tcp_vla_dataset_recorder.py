@@ -40,7 +40,7 @@ class TcpVlaRawDatasetRecorderTests(unittest.TestCase):
             now = time.monotonic_ns()
             pose = {"position_m": [0.1, 0.2, 0.3], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]}
             return {
-                "session": {"state": "ACTIVE", "execution_mode": "hardware"},
+                "session": {"state": "ACTIVE", "execution_mode": "hardware", "input_source": "pico"},
                 "execution": {"sample_id": self.sample_id, "feedback_revision": self.sample_id,
                               "target_generation": 3, "motion_epoch": 2, "sample_monotonic_ns": now,
                               "measured_tcp_pose": pose},
@@ -54,10 +54,13 @@ class TcpVlaRawDatasetRecorderTests(unittest.TestCase):
             }
 
         self.osc = SimpleNamespace(state=osc_state)
+        self.osc.input_context = lambda: {"control_source": "pico", "connected": True,
+            "session_id": None, "client_id": None, "execution_mode": "hardware", "output_mode": "cpv"}
+        self.osc.input_events = lambda *_: {"revision": 0, "events": [], "lost_events": 0}
 
     def recorder(self) -> TcpVlaDatasetRecorder:
         return TcpVlaDatasetRecorder(
-            self.osc, self.cameras, self.pico, Path(self.temp.name),
+            self.osc, self.cameras, Path(self.temp.name),
             sample_hz=15, raw_camera_hz=20, raw_robot_state_hz=50,
             camera_sync_limit_s=1.0, feedback_age_limit_s=1.0,
         )
@@ -116,11 +119,14 @@ class TcpVlaRawDatasetRecorderTests(unittest.TestCase):
             def __init__(self):
                 self.anchor_calls = 0
 
+            def input_events(self, *_):
+                return {"revision": 0, "events": [], "lost_events": 0}
+
             def state(self):
                 # Deliberately stale: this was the source of the episode_000012
                 # pre-history drain and false revision-gap report.
                 return {
-                    "session": {"state": "ACTIVE", "execution_mode": "hardware"},
+                    "session": {"state": "ACTIVE", "execution_mode": "hardware", "input_source": "pico"},
                     "execution": {"feedback_revision": 10},
                     "diagnostics": {},
                 }
@@ -151,7 +157,7 @@ class TcpVlaRawDatasetRecorderTests(unittest.TestCase):
 
         osc = ProducerOsc()
         recorder = TcpVlaDatasetRecorder(
-            osc, self.cameras, self.pico, Path(self.temp.name),
+            osc, self.cameras, Path(self.temp.name),
             sample_hz=15, raw_camera_hz=20, raw_robot_state_hz=50,
             camera_sync_limit_s=1.0, feedback_age_limit_s=1.0,
         )
@@ -222,7 +228,7 @@ class TcpVlaRawDatasetRecorderTests(unittest.TestCase):
     def test_start_rejects_incomplete_hardware_feedback_before_creating_episode(self):
         class IncompleteOsc:
             def state(self):
-                return {"session": {"state": "ACTIVE", "execution_mode": "hardware"},
+                return {"session": {"state": "ACTIVE", "execution_mode": "hardware", "input_source": "pico"},
                         "diagnostics": {}}
 
             def sensor_sample(self, target_monotonic_ns, wait_s=0.0):
@@ -233,7 +239,7 @@ class TcpVlaRawDatasetRecorderTests(unittest.TestCase):
             def sensor_samples_after(self, revision, wait_s=0.0, max_items=128):
                 return []
 
-        recorder = TcpVlaDatasetRecorder(IncompleteOsc(), self.cameras, self.pico, Path(self.temp.name))
+        recorder = TcpVlaDatasetRecorder(IncompleteOsc(), self.cameras, Path(self.temp.name))
         with self.assertRaisesRegex(RuntimeError, "夹爪开度.*实测TCP位姿"):
             recorder.start({"task": "test", "description": "manual prompt", "control_source": "pico"})
         self.assertIsNone(recorder.active)

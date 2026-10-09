@@ -32,8 +32,8 @@ def _utc() -> str:
 class TcpVlaDatasetRecorder:
     """Persist 20 Hz dual RGB and 50 Hz measured robot state independently."""
 
-    def __init__(self, osc: Any, cameras: Any, pico: Any, dataset_root: Path, *,
-                 fk_client: Any | None = None,
+    def __init__(self, osc: Any, cameras: Any, dataset_root: Path, *,
+                 fk_client: Any | None = None, context_provider: Any | None = None,
                  sample_hz: float = 15.0, camera_sync_limit_s: float = 0.020,
                  raw_camera_hz: float = 20.0, raw_robot_state_hz: float = 50.0,
                  raw_jpeg_quality: int = 95,
@@ -42,7 +42,8 @@ class TcpVlaDatasetRecorder:
                  training_robot_bracket_limit_s: float = 0.035,
                  gripper_closed_width_m: float = 0.010,
                  gripper_open_width_m: float = 0.095) -> None:
-        self.osc, self.cameras, self.pico = osc, cameras, pico
+        self.osc, self.cameras = osc, cameras
+        self.context_provider = context_provider or self._osc_context
         # Retained only as an injected dependency for API compatibility.  It
         # is intentionally never started or called during raw collection.
         self.fk_client = fk_client
@@ -69,6 +70,18 @@ class TcpVlaDatasetRecorder:
         self.stop_event = threading.Event()
         self.raw_camera_thread: threading.Thread | None = None
         self.raw_robot_thread: threading.Thread | None = None
+        self.input_thread: threading.Thread | None = None
+
+    def _osc_context(self) -> dict[str, Any]:
+        reader = getattr(self.osc, "input_context", None)
+        if callable(reader):
+            return reader()
+        state = self.osc.state() or {}
+        session = state.get("session") or {}
+        return {"control_source": session.get("input_source") or "external",
+                "connected": session.get("state") == "ACTIVE", "session_id": session.get("id"),
+                "client_id": session.get("client_id"), "execution_mode": session.get("execution_mode"),
+                "output_mode": state.get("output_mode", "cpv")}
 
     def _ensure_root(self) -> None:
         for name in ("episodes", "failed_episodes", "staging"):
@@ -114,6 +127,7 @@ class TcpVlaDatasetRecorder:
         for source in ("external", "wrist"):
             item, status = config.get(source) or {}, sources.get(source) or {}
             result[source] = {
+                "source": source, "label": "外部 RGB" if source == "external" else "腕部 RGB",
                 "index": item.get("index"), "width": item.get("width"), "height": item.get("height"),
                 "available": bool(status.get("available")), "frame_available": bool(status.get("frame_available")),
                 "dataset_size": status.get("dataset_size"), "capture_hz": status.get("capture_hz"),
@@ -133,6 +147,13 @@ class TcpVlaDatasetRecorder:
             sample_hz=None, training_view_hz=self.training_view_hz,
         )
         result["raw_robot_drops"] = active["_raw_robot_drops"]
+        result["raw_camera_drops"] = active["_raw_camera_drops"]
+        result["raw_camera_drops_by_source"] = copy.deepcopy(active["_raw_camera_drops_by_source"])
+        result["camera_source_gaps"] = copy.deepcopy(active["_raw_camera_source_gaps"])
+        result["robot_revision_gaps"] = active["_raw_robot_revision_gaps"]
+        result["camera_effective_hz_by_source"] = {
+            source: round(count / elapsed, 3) if elapsed else 0.0
+            for source, count in active["raw_camera_frames_by_source"].items()}
         result["raw_robot_prestart_ignored"] = active["_raw_robot_prestart_ignored"]
         if recording and elapsed > 1.0 and not active["raw_robot_states"] and not result.get("last_error"):
             result["last_error"] = ("机械臂状态尚未写入：请检查反馈流；采集前时间戳被忽略 "
@@ -141,10 +162,20 @@ class TcpVlaDatasetRecorder:
 
     def state(self) -> dict[str, Any]:
         with self.lock:
-            return self._public(self.active, True) if self.active else {
+            if self.active:
+                return self._public(self.active, True)
+            try:
+                context = self.context_provider()
+            except Exception as exc:
+                context = {"connected": False, "control_source": None,
+                           "reason": f"OSC 状态不可用: {type(exc).__name__}: {exc}"}
+            return {
                 "recording": False, "dataset_root": str(self.root), "last_episode": copy.deepcopy(self.last_episode),
                 "schema": SCHEMA_VERSION, "dataset_stage": "native_rate_raw_collection",
                 "instruction_mode": "manual_per_episode",
+                "input_context": context,
+                "camera_sources": self._camera_snapshot(self.cameras.snapshot() or {}),
+                "raw_camera_hz": self.raw_camera_hz, "raw_robot_state_hz": self.raw_robot_state_hz,
             }
 
     def start(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -157,30 +188,34 @@ class TcpVlaDatasetRecorder:
                 raise ValueError("任务名称不能为空")
             if not prompt:
                 raise ValueError("自然语言任务指令不能为空")
-            source = str(body.get("control_source") or "pico").strip().lower()
-            pico_state = self.pico.snapshot() if self.pico is not None else {}
-            if source == "pico" and not bool(pico_state.get("connected")):
-                raise RuntimeError("PICO 未连接，禁止开始正式父 Episode")
+            context = self.context_provider()
+            source = context["control_source"]
+            if not context.get("connected"):
+                raise RuntimeError(context.get("reason") or "控制源未连接到有效 OSC 会话")
+            requested_source = str(body.get("control_source") or "").strip().lower()
+            if requested_source and requested_source != source:
+                raise ValueError(f"采集来源与实际会话不一致：请求 {requested_source}，实际 {source}")
             camera_state = self.cameras.snapshot() or {}
             camera_snapshot = self._camera_snapshot(camera_state)
-            unavailable = [name for name, item in camera_snapshot.items() if not item["available"] or not item["frame_available"]]
-            if unavailable:
-                raise RuntimeError(f"双 RGB 门禁失败，缺少可用画面: {', '.join(unavailable)}")
+            enabled_cameras = [name for name, item in camera_snapshot.items() if item["available"] and item["frame_available"]]
+            warnings = [f"{name} 相机无可用画面；允许采集，但不满足双RGB训练要求"
+                        for name in camera_snapshot if name not in enabled_cameras]
             for name, item in camera_snapshot.items():
+                if name not in enabled_cameras:
+                    continue
                 if (int(item.get("width") or 0), int(item.get("height") or 0)) != (640, 480):
                     raise RuntimeError(f"{name} 原始RGB要求640×480")
                 capture_hz = _number(item.get("capture_hz"))
-                if capture_hz is None:
-                    raise RuntimeError(f"{name} 相机频率尚未稳定，请等待相机预览稳定后再开始采集")
-                if capture_hz < self.raw_camera_hz * 0.90:
-                    raise RuntimeError(
-                        f"{name} 相机实际仅 {capture_hz:.2f} Hz，低于原始采集门禁 "
-                        f"{self.raw_camera_hz * 0.90:.2f} Hz"
-                    )
+                if capture_hz is None or capture_hz < self.raw_camera_hz * 0.90:
+                    warnings.append(f"{name} 相机频率不足或尚未稳定；目标 {self.raw_camera_hz:g} Hz")
             osc = self.osc.state() or {}
             session = osc.get("session") or {}
             if session.get("state") != "ACTIVE":
                 raise RuntimeError("OSC 控制会话未激活，禁止开始正式父 Episode")
+            if context.get("session_id") != session.get("id"):
+                raise RuntimeError("采集启动时 OSC 会话已改变，请重试")
+            input_reader = getattr(self.osc, "input_events", None)
+            input_cursor = input_reader(0, 1)["revision"] if callable(input_reader) else 0
             self._ensure_root()
             index = self._next_index()
             clock_offset_ns = self._monotonic_to_perf_offset_ns()
@@ -217,6 +252,8 @@ class TcpVlaDatasetRecorder:
             else:
                 anchor_revision = int((osc.get("execution") or {}).get("feedback_revision")
                                       or ((osc.get("transport") or {}).get("hardware_feedback") or {}).get("rx_revision") or 0)
+            if not callable(input_reader):
+                raise RuntimeError("OSC 输入历史接口不可用，无法完整记录控制输入")
             staging = self.root / "staging" / f"episode_{index:06d}_{uuid.uuid4().hex}"
             for camera in ("external", "wrist"):
                 (staging / "raw" / "images" / camera).mkdir(parents=True, exist_ok=True)
@@ -227,8 +264,12 @@ class TcpVlaDatasetRecorder:
             self.active = {
                 "schema": SCHEMA_VERSION, "dataset_stage": "native_rate_raw_collection",
                 "episode_index": index, "episode_dir": str(staging), "status": "recording", "started_at": _utc(),
-                "control_source": source, "operator_device": "pico_4_ultra" if source == "pico" else source,
-                "operator_connection": "connected" if source == "pico" else "not_applicable",
+                "control_source": source, "input_context": context, "output_mode": context["output_mode"],
+                "execution_mode": context["execution_mode"], "session_id": context.get("session_id"),
+                "client_id": context.get("client_id"), "warnings": warnings,
+                "enabled_cameras": enabled_cameras, "osc_input_count": 0, "osc_input_gaps": 0,
+                "control_sources": [source], "output_modes": [context["output_mode"]],
+                "input_context_history": [{"perf_counter_ns": started_ns, **context}],
                 "task": task, "prompt": prompt,
                 "raw_camera_frames": 0, "raw_camera_frames_by_source": {"external": 0, "wrist": 0},
                 "raw_robot_states": 0, "bytes_written": 0,
@@ -242,6 +283,8 @@ class TcpVlaDatasetRecorder:
                 "_shadow": session.get("execution_mode") == "shadow",
                 "_raw_camera_manifest": (staging / "raw" / "camera_frames.jsonl").open("x", encoding="utf-8", buffering=1),
                 "_raw_robot_manifest": (staging / "raw" / "robot_states.jsonl").open("x", encoding="utf-8", buffering=1),
+                "_input_manifest": (staging / "raw" / "osc_inputs.jsonl").open("x", encoding="utf-8", buffering=1),
+                "_input_revision": input_cursor, "_input_reader": input_reader,
                 "_raw_camera_last_ns": {}, "_raw_camera_sequence": 0, "_raw_camera_next_commit": 0,
                 "_raw_camera_source_sequence": {"external": 0, "wrist": 0},
                 "_raw_camera_producer_sequences": {key: int((camera_state.get("dataset_source_sequences") or {}).get(key, 0))
@@ -260,7 +303,59 @@ class TcpVlaDatasetRecorder:
             self.raw_camera_thread = threading.Thread(target=self._raw_camera_loop, name="nero-raw-camera-20hz", daemon=True)
             self.raw_robot_thread = threading.Thread(target=self._raw_robot_loop, name="nero-raw-robot-50hz", daemon=True)
             self.raw_camera_thread.start(); self.raw_robot_thread.start()
+            self.input_thread = threading.Thread(target=self._input_loop, name="nero-osc-input-recorder", daemon=True)
+            self.input_thread.start()
             return self._public(self.active, True)
+
+    def _drain_inputs(self, active: dict[str, Any]) -> int | None:
+        reader = active["_input_reader"]
+        if not callable(reader):
+            return
+        batch = reader(active["_input_revision"], 512)
+        if batch["revision"] < active["_input_revision"]:
+            active["osc_input_gaps"] += 1
+            active["last_error"] = "OSC 输入历史已重置；当前 Episode 存在输入缺口"
+            active["_input_revision"] = 0
+            batch = reader(0, 512)
+        active["osc_input_gaps"] += int(batch.get("lost_events", 0))
+        if batch.get("lost_events"):
+            active["_input_revision"] += int(batch["lost_events"])
+        for event in batch["events"]:
+            active["_input_revision"] = event["revision"]
+            if event["received_perf_counter_ns"] < active["_started_ns"]:
+                continue
+            if event["received_perf_counter_ns"] > active.get("_stopped_ns", float("inf")):
+                continue
+            active["_input_manifest"].write(json.dumps(_json_safe(event), ensure_ascii=False,
+                separators=(",", ":"), allow_nan=False) + "\n")
+            active["osc_input_count"] += 1
+            for field, key in (("control_sources", "control_source"), ("output_modes", "output_mode")):
+                value = event["context"].get(key)
+                if value is not None and value not in active[field]:
+                    active[field].append(value)
+        return batch["revision"]
+
+    def _input_loop(self) -> None:
+        next_context = 0.0
+        while not self.stop_event.is_set():
+            active = self.active
+            if active is None:
+                break
+            try:
+                self._drain_inputs(active)
+                if time.monotonic() >= next_context:
+                    context = self.context_provider()
+                    if context != active["input_context"]:
+                        active["input_context"] = context
+                        active["input_context_history"].append({"perf_counter_ns": time.perf_counter_ns(), **context})
+                        warning = "控制源已断开；继续只读保存反馈，连接变化已记录"
+                        if not context.get("connected") and warning not in active["warnings"]:
+                            active["warnings"].append(warning)
+                    next_context = time.monotonic() + .2
+            except Exception as exc:
+                active["sample_errors"] += 1
+                active["last_error"] = f"OSC input capture: {type(exc).__name__}: {exc}"
+            self.stop_event.wait(.02)
 
     def _ratio(self, width_m: Any) -> float | None:
         width = _number(width_m)
@@ -279,6 +374,7 @@ class TcpVlaDatasetRecorder:
             "osc_config": project_root / "config" / "osc.json",
             "runtime_config": project_root / "config" / "runtime.json",
             "camera_config": project_root / "config" / "pi05.json",
+            "osc_impedance_config": project_root / "config" / "osc_impedance.json",
         }
         result: dict[str, str] = {}
         for name, source in sources.items():
@@ -295,6 +391,11 @@ class TcpVlaDatasetRecorder:
             "robot_stream": {"manifest": "raw/robot_states.jsonl", "joint_order": [f"joint{i}" for i in range(1, 8)],
                              "joint_unit": "rad", "velocity_unit": "rad/s", "tcp_frame": "robot_base",
                              "feedback_age": "SDK freshness converted from monotonic_ns to perf_counter_ns at collection start"},
+            "osc_input_stream": {"manifest": "raw/osc_inputs.jsonl", "clock": "perf_counter_ns",
+                                 "tcp_semantics": "absolute_pose_robot_base",
+                                 "position_unit": "m", "orientation": "quaternion_xyzw",
+                                 "acceptance": "OSC interface acceptance, not hardware transmission confirmation",
+                                 "contents": "OSC command payload, identity, outcome; no device-native events"},
             "future_training_view": {"rate_hz": 15.0, "pose_rotation": "Rot6D",
                                      "action": ["delta_x_m", "delta_y_m", "delta_z_m", "rotvec_x_rad", "rotvec_y_rad", "rotvec_z_rad", "absolute_gripper"],
                                      "horizon": 16, "replan_every": 8},
@@ -371,7 +472,7 @@ class TcpVlaDatasetRecorder:
     def _raw_camera_sample(self, active: dict[str, Any]) -> None:
         """Compatibility fallback for camera providers without a producer queue."""
         target_ns = time.perf_counter_ns()
-        for source in ("external", "wrist"):
+        for source in active["enabled_cameras"]:
             selected = self.cameras.dataset_frame(source, target_ns)
             if selected is None:
                 active["_raw_camera_drops"] += 1; active["_raw_camera_drops_by_source"][source] += 1; continue
@@ -389,7 +490,7 @@ class TcpVlaDatasetRecorder:
                 try:
                     self._commit_raw_camera(active)
                     if callable(drain_reader):
-                        for source_index, source in enumerate(("external", "wrist")):
+                        for source_index, source in enumerate(active["enabled_cameras"]):
                             rows = drain_reader(source, active["_raw_camera_producer_sequences"][source],
                                                 0.05 if source_index == 0 else 0.0, 8)
                             for row in rows:
@@ -406,7 +507,7 @@ class TcpVlaDatasetRecorder:
                 except Exception as exc:
                     active["_raw_camera_drops"] += 1
                     active["last_error"] = f"raw camera: {type(exc).__name__}: {exc}"
-            if not callable(drain_reader):
+            if not callable(drain_reader) or not active or not active["enabled_cameras"]:
                 deadline += self.raw_camera_period
                 self.stop_event.wait(max(0.0, deadline - time.monotonic()))
 
@@ -560,20 +661,28 @@ class TcpVlaDatasetRecorder:
             if not self.active:
                 return self.state()
             active = self.active; self.stop_event.set()
-        for thread in (self.raw_camera_thread, self.raw_robot_thread):
+        for thread in (self.raw_camera_thread, self.raw_robot_thread, self.input_thread):
             if thread and thread is not threading.current_thread():
                 thread.join(timeout=3)
+                if thread.is_alive():
+                    raise RuntimeError("采集线程尚未退出；保持文件打开，请重试保存")
         stopped_monotonic = time.monotonic()
         stopped_ns = time.perf_counter_ns()
         with self.lock:
             active = self.active
+            active["_stopped_ns"] = stopped_ns
+            # Drain the boundary history once more after producers have stopped.
+            revision = self._drain_inputs(active)
+            while revision is not None and active["_input_revision"] < revision:
+                self._drain_inputs(active)
+            active["_input_manifest"].flush(); active["_input_manifest"].close()
             self._commit_raw_camera(active, wait=True)
             active["_raw_executor"].shutdown(wait=True)
             active["_raw_camera_manifest"].flush(); active["_raw_camera_manifest"].close()
             active["_raw_robot_manifest"].flush(); active["_raw_robot_manifest"].close()
             duration = max(0.0, stopped_monotonic - active["_started_monotonic"])
             active["duration_s"] = duration
-            if sum(active["raw_camera_frames_by_source"].values()) == 0 and active["raw_robot_states"] == 0:
+            if sum(active["raw_camera_frames_by_source"].values()) == 0 and active["raw_robot_states"] == 0 and active["osc_input_count"] == 0:
                 shutil.rmtree(active["_staging"])
                 active["episode_dir"] = None; active["status"] = "discarded_empty"
                 active["quality"].update(training_eligible=False, raw_valid=False, reasons=["no_raw_camera_or_robot_samples"])
@@ -605,11 +714,16 @@ class TcpVlaDatasetRecorder:
             reasons: list[str] = []
             feedback_age_gate_s = max(0.05, self.feedback_age_limit_s)
             feedback_age_above_limit = sum(age > feedback_age_gate_s for age in active["_raw_feedback_ages"])
-            if any(count == 0 for count in active["raw_camera_frames_by_source"].values()) or active["raw_robot_states"] == 0:
+            dual_rgb = len(active["enabled_cameras"]) == 2
+            if any(active["raw_camera_frames_by_source"][source] == 0 for source in active["enabled_cameras"]) or active["raw_robot_states"] == 0:
                 reasons.append("missing_required_raw_stream")
+            if active["osc_input_gaps"]:
+                reasons.append("osc_input_history_overflow")
+            if any(item.get("session_id") != active["session_id"] for item in active["input_context_history"]):
+                reasons.append("osc_session_changed")
             if active["_raw_robot_drops"]:
                 reasons.append("raw_robot_samples_rejected")
-            if duration >= 2.0 and camera_rate < self.raw_camera_hz * 0.90:
+            if duration >= 2.0 and any(camera_rates[source] < self.raw_camera_hz * .90 for source in active["enabled_cameras"]):
                 reasons.append("raw_camera_rate_below_90_percent")
             if duration >= 2.0 and robot_rate < self.raw_robot_state_hz * 0.90:
                 reasons.append("raw_robot_state_rate_below_90_percent")
@@ -625,20 +739,27 @@ class TcpVlaDatasetRecorder:
                 reasons.append("raw_camera_timestamps_not_strictly_increasing")
             if robot_timestamp_nonmonotonic:
                 reasons.append("raw_robot_timestamps_not_strictly_increasing")
-            if duration >= 2.0 and reconstruction["coverage"] < 0.95:
+            if dual_rgb and duration >= 2.0 and reconstruction["coverage"] < 0.95:
                 reasons.append("15hz_reconstruction_coverage_below_95_percent")
-            if duration >= 2.0 and reconstruction["grid_points"] >= 17 and reconstruction["possible_h16_windows"] < 1:
+            if dual_rgb and duration >= 2.0 and reconstruction["grid_points"] >= 17 and reconstruction["possible_h16_windows"] < 1:
                 reasons.append("no_contiguous_h16_window_reconstructable")
             accepted = status == "completed" and not reasons
             active["quality"].update(training_eligible=False, raw_valid=accepted, reasons=reasons)
+            active["quality"]["training_blockers"] = [] if dual_rgb else ["dual_rgb_unavailable"]
             metadata = {
                 "schema_version": SCHEMA_VERSION, "dataset_stage": "native_rate_raw_collection",
                 "parent_episode_index": active["episode_index"], "accepted": accepted,
+                "control_source": active["control_source"], "session_id": active["session_id"],
+                "client_id": active["client_id"], "execution_mode": active["execution_mode"],
+                "output_mode": active["output_mode"], "input_context_history": active["input_context_history"],
+                "control_sources": active["control_sources"], "output_modes": active["output_modes"],
+                "enabled_cameras": active["enabled_cameras"], "warnings": active["warnings"],
                 "failure": None if accepted else (reason or "; ".join(reasons) or "operator marked episode failed"),
                 "instruction_mode": "manual_per_episode", "task": active["task"], "prompt": active["prompt"],
                 "segment_order": [active["task"]], "segments": [],
                 "gates": {name: False for name in PHYSICAL_GATES}, "gate_source": "not_evaluated_during_raw_collection",
-                "files": {"raw_camera": "raw/camera_frames.jsonl", "raw_robot_state": "raw/robot_states.jsonl"},
+                "files": {"raw_camera": "raw/camera_frames.jsonl", "raw_robot_state": "raw/robot_states.jsonl",
+                          "osc_inputs": "raw/osc_inputs.jsonl"},
                 "videos": {}, "depth_recorded": False, "raw_collection": True,
                 "training_view_generated": False, "horizon_windows_built": False,
                 "recording_hz": None, "training_view_hz": self.training_view_hz,
@@ -649,6 +770,7 @@ class TcpVlaDatasetRecorder:
                                  "camera_effective": camera_rate, "camera_effective_by_source": camera_rates,
                                  "robot_state_effective": robot_rate},
                 "raw_streams": {"camera_frames": active["raw_camera_frames"], "robot_states": active["raw_robot_states"],
+                                "osc_inputs": active["osc_input_count"], "osc_input_gaps": active["osc_input_gaps"],
                                 "camera_frames_by_source": active["raw_camera_frames_by_source"],
                                 "camera_total_frames": sum(active["raw_camera_frames_by_source"].values()),
                                 "camera_drops": active["_raw_camera_drops"], "robot_state_drops": active["_raw_robot_drops"],
@@ -702,7 +824,8 @@ class TcpVlaDatasetRecorder:
             return result
 
     def close(self) -> None:
-        self.stop("failed", "control service shutdown")
+        if self.active:
+            self.stop("failed", "control service shutdown")
 
     def episodes(self) -> dict[str, Any]:
         self._ensure_root(); items = []
