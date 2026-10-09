@@ -261,21 +261,87 @@ class BrokerPreemptionTests(unittest.TestCase):
             "acc": [10.0] * 7, "dcc": [10.0] * 7, "cv": [1.5] * 7,
             "pp": [5.0] * 7, "kp": [0.8] * 7, "ki": [60.0] * 7}}
         after = copy.deepcopy(before)
-        after["values"]["cv"] = [5.0] * 7
-        with patch.object(self.hardware._osc, "cpv_limits", return_value=(5.0, 10.0)), \
+        after["values"]["cv"] = [2.0] * 7
+        with patch.object(self.hardware._osc, "cpv_limits", return_value=(2.0, 10.0)), \
              patch.object(self.hardware, "osc_readonly_cpv_parameters", return_value={"cpv_parameters": before}) as read, \
              patch.object(self.hardware, "read_osc_cpv_parameters", return_value=after), \
              patch.object(self.hardware.robot, "call", return_value={"ok": True}) as write:
-            self.assertTrue(self.hardware.osc_set_cpv_speed(5.0)["ok"])
-            write.assert_called_once_with("p0", "configure_cpv_profile", 5.0, 10.0, 10.0,
+            self.assertTrue(self.hardware.osc_set_cpv_speed(2.0)["ok"])
+            write.assert_called_once_with("p0", "configure_cpv_profile", 2.0, None, None,
                                           category="cpv_profile_configuration")
-            for invalid in (0.0, -1.0, 5.1, float("nan")):
+            for invalid in (0.0, -1.0, 2.1, float("nan")):
                 with self.assertRaises(ValueError):
                     self.hardware.osc_set_cpv_speed(invalid)
             self.assertEqual(read.call_count, 1)
             after["values"]["acc"][0] = 1.0
             with self.assertRaisesRegex(RuntimeError, "untouched CPV parameter acc"):
-                self.hardware.osc_set_cpv_speed(5.0)
+                self.hardware.osc_set_cpv_speed(2.0)
+
+    def test_cpv_startup_profile_guard_rejects_reset_and_missing_values_without_writes(self) -> None:
+        from unittest.mock import patch
+        import copy
+        correct = {"status": "available", "values": {
+            "acc": [10.0] * 7, "dcc": [10.0] * 7, "cv": [2.0] * 7}}
+        with patch.object(self.hardware._osc, "cpv_limits", return_value=(2.0, 10.0)), \
+             patch.object(self.hardware, "read_osc_cpv_parameters", return_value=correct) as read, \
+             patch.object(self.hardware.robot, "call") as write:
+            self.assertTrue(self.hardware._verify_cpv_profile("before_cpv_prime")["verification"]["ok"])
+            for name, value in (("acc", 1.0), ("dcc", 1.0), ("cv", 1.5),
+                                ("acc", None), ("cv", float("nan"))):
+                changed = copy.deepcopy(correct)
+                changed["values"][name][2] = value
+                read.return_value = changed
+                with self.assertRaisesRegex(RuntimeError, "CPV hardware profile mismatch"):
+                    self.hardware._verify_cpv_profile("after_cpv_prime")
+                self.assertFalse(self.hardware._cpv_profile_cache["verification"]["ok"])
+            read.return_value = {"status": "partial", "values": {}}
+            with self.assertRaisesRegex(RuntimeError, "incomplete read-back"):
+                self.hardware._verify_cpv_profile("before_cpv_prime")
+            write.assert_not_called()
+
+    def test_cpv_prepare_never_primes_with_wrong_profile_and_revokes_on_post_prime_reset(self) -> None:
+        from unittest.mock import patch
+        from supervisor.authority import ArmWriter
+        with patch.object(self.hardware, "_require_operational_control"), \
+             patch.object(self.hardware, "_verify_cpv_profile", side_effect=RuntimeError("profile mismatch")), \
+             patch.object(self.hardware.robot, "call") as prime:
+            with self.assertRaisesRegex(RuntimeError, "profile mismatch"):
+                self.hardware.prepare_osc_hardware()
+            prime.assert_not_called()
+        for post_error in (RuntimeError("profile reset by mode entry"), RuntimeError("read failed")):
+            with patch.object(self.hardware, "_require_operational_control"), \
+                 patch.object(self.hardware, "_verify_cpv_profile", side_effect=[{}, post_error]) as verify, \
+                 patch.object(self.hardware.robot, "call", return_value={}) as prime:
+                with self.assertRaisesRegex(RuntimeError, str(post_error)):
+                    self.hardware.prepare_osc_hardware()
+                self.assertEqual([call.args[0] for call in verify.call_args_list],
+                                 ["before_cpv_prime", "after_cpv_prime"])
+                prime.assert_called_once()
+                self.assertEqual(self.hardware.supervisor.snapshot().writer, ArmWriter.NONE)
+
+    def test_cpv_prepare_checks_both_sides_of_prime_before_granting_tracking(self) -> None:
+        from unittest.mock import patch
+        events = []
+        with patch.object(self.hardware, "_require_operational_control"), \
+             patch.object(self.hardware, "_verify_cpv_profile", side_effect=lambda stage: events.append(stage)), \
+             patch.object(self.hardware.robot, "call", side_effect=lambda *a, **kw: events.append("prime") or {}):
+            self.hardware.prepare_osc_hardware()
+        self.assertEqual(events, ["before_cpv_prime", "prime", "after_cpv_prime"])
+
+    def test_cpv_profile_check_failure_does_not_clear_concurrent_safety_authority(self) -> None:
+        from unittest.mock import patch
+        from supervisor.authority import ArmWriter, ServoMode
+        def verify(stage):
+            if stage == "after_cpv_prime":
+                self.hardware._set_authority(ArmWriter.SAFETY, ServoMode.HOLDING,
+                                             "concurrent emergency", advance_epoch=True)
+                raise RuntimeError("query revoked")
+        with patch.object(self.hardware, "_require_operational_control"), \
+             patch.object(self.hardware, "_verify_cpv_profile", side_effect=verify), \
+             patch.object(self.hardware.robot, "call", return_value={}):
+            with self.assertRaisesRegex(RuntimeError, "query revoked"):
+                self.hardware.prepare_osc_hardware()
+        self.assertEqual(self.hardware.supervisor.snapshot().writer, ArmWriter.SAFETY)
 
     def test_start_remains_running_when_usb_can_connect_fails(self) -> None:
         self.hardware.close()

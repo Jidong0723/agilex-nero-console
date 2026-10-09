@@ -317,6 +317,24 @@ class RobotModeTests(unittest.TestCase):
         robot.read_cpv_parameter(1, "acc")
         self.assertFalse(sdk.auto_set_motion_mode)
 
+    def test_speed_only_profile_never_reads_or_writes_acceleration(self) -> None:
+        robot, sdk = self.make_robot()
+        sdk.cpv_profile["acc"] = [10.0] * 7
+        sdk.cpv_profile["dcc"] = [10.0] * 7
+        def forbidden(**kwargs):
+            self.fail("CV-only operation must not read or write ACC/DCC")
+        for name in ("acc", "dcc"):
+            setattr(sdk, f"get_cpv_{name}", forbidden)
+            setattr(sdk, f"set_cpv_{name}", forbidden)
+        events = list(sdk.events)
+        result = robot.configure_cpv_profile(2.0, None, None)
+        self.assertEqual(result["profile"], {"cv": 2.0})
+        self.assertEqual(sdk.cpv_profile["acc"], [10.0] * 7)
+        self.assertEqual(sdk.cpv_profile["dcc"], [10.0] * 7)
+        self.assertEqual(sdk.cpv_profile["cv"], [2.0] * 7)
+        self.assertEqual(sdk.events, events)
+        self.assertTrue(sdk.auto_set_motion_mode)
+
     def test_freedrive_state_uses_live_leader_angles(self) -> None:
         robot, sdk = self.make_robot()
         first = robot.read_state().joint_angles_rad

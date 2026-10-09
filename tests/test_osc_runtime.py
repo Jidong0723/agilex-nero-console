@@ -958,8 +958,13 @@ class CpvMailboxTests(unittest.TestCase):
             self.assertEqual(owner.wait_cpv_result(middle["mailbox_revision"], 0.1)["status"], "superseded")
             backend.release.set()
             self.assertEqual(owner.wait_cpv_result(first["mailbox_revision"], 0.8)["status"], "sent")
-            self.assertEqual(owner.wait_cpv_result(latest["mailbox_revision"], 0.8)["status"], "sent")
-            self.assertEqual(backend.sent, [[0.01] * 7, [0.03] * 7])
+            dispatched = owner.wait_cpv_result(latest["mailbox_revision"], 0.8)
+            self.assertEqual(dispatched["status"], "sent")
+            self.assertEqual(dispatched["control_sample_id"], 3)
+            # The latest command must win the mailbox, but missing explicit
+            # limits no longer mean unlimited speed between immediate sends.
+            self.assertEqual(backend.sent, [[0.01] * 7, dispatched["joint_target_rad"]])
+            self.assertTrue(all(abs(v) <= 2.0 for v in dispatched["joint_velocity_rad_s"]))
         finally:
             backend.release.set(); owner.close()
 

@@ -50,7 +50,7 @@
   ],
   "limits": {
     "angular_speed_rad_s": 0.45,
-    "joint_speed_rad_s": 5.0,
+    "joint_speed_rad_s": 2.0,
     "velocity_error_warning_rad_s": 0.1,
     "velocity_error_brake_rad_s": 0.25,
     "velocity_error_fault_rad_s": 0.45,
@@ -92,13 +92,13 @@
       1.5707963267948966
     ],
     "speed_rad_s": [
-      3.14,
-      3.14,
-      3.14,
-      3.14,
-      3.92,
-      3.92,
-      3.92
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0
     ],
     "acceleration_rad_s2": [
       10.0,

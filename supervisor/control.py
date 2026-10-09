@@ -313,12 +313,21 @@ class OperationalSpaceController:
                 if not result.get("ok"):
                     self._set_authority(ArmWriter.NONE, ServoMode.SUSPENDED, "FREEDRIVE exit failed")
                     raise RuntimeError(f"cannot exit FREEDRIVE: {result}")
+            # Read actual firmware settings, not the historical calibration
+            # snapshot. Mode/linkage changes may invalidate an earlier read.
+            self._verify_cpv_profile("before_cpv_prime")
             state = self._set_authority(ArmWriter.SERVO, ServoMode.HOLDING, "osc session prepared", advance_epoch=True)
             # Prime CPV while the session is still in HOLDING. The first
             # vendor CPV call may enable drives and switch motion mode; doing
             # that with a measured position hold prevents the first live pose
             # sample from being a partially-dispatched batch.
             epoch = int(state["control_epoch"])
+            def revoke_preparation():
+                with self._authority_epoch_lock:
+                    current = self.supervisor.snapshot()
+                    if current.epoch == epoch and current.writer == ArmWriter.SERVO:
+                        self._set_authority(ArmWriter.NONE, ServoMode.SUSPENDED,
+                                            "CPV preparation failed", advance_epoch=True)
             try:
                 prime_result = self.robot.call(
                     "p1", "prime_cpv_position_from_feedback",
@@ -329,9 +338,14 @@ class OperationalSpaceController:
                 )
                 if isinstance(prime_result, dict):
                     self._last_cpv_mode_entry = dict(prime_result.get("cpv_mode_entry") or {})
+                self._verify_cpv_profile("after_cpv_prime")
             except TimeoutError as exc:
+                revoke_preparation()
                 self._schedule_transport_reset(f"CPV position prime timeout: {exc}")
                 raise RuntimeError(f"CPV prime timed out; control service reset scheduled: {exc}") from exc
+            except Exception:
+                revoke_preparation()
+                raise
             return state
 
     def _schedule_transport_reset(self, reason: str) -> None:
@@ -471,6 +485,45 @@ class OperationalSpaceController:
             raise RuntimeError("CPV parameter query requires confirmed fresh-feedback HOLD")
         return {"ok": True, "cpv_parameters": self.read_osc_cpv_parameters()}
 
+    def _verify_cpv_profile(self, stage: str) -> dict[str, Any]:
+        """One-shot CPV startup guard; never write Flash or run in servo ticks."""
+        speed, acceleration = self._osc.cpv_limits()
+        expected = {"acc": acceleration, "dcc": acceleration, "cv": speed}
+        profile = self.read_osc_cpv_parameters()
+        values = profile.get("values") or {}
+        mismatches = []
+        for name, target in expected.items():
+            row = values.get(name) or []
+            if len(row) != 7:
+                mismatches.append(f"{name}: incomplete read-back")
+                continue
+            for joint, value in enumerate(row, 1):
+                if (not isinstance(value, (int, float)) or not math.isfinite(value)
+                        or abs(value - target) > 1e-6):
+                    mismatches.append(f"{name}:J{joint}={value}, expected {target}")
+        profile = {**profile, "verification": {
+            "stage": stage, "expected": expected, "mismatches": mismatches,
+            "ok": not mismatches,
+        }}
+        self._cpv_profile_cache = profile
+        self._log("cpv_profile_verification", stage=stage, profile=profile)
+        if mismatches:
+            raise RuntimeError("CPV hardware profile mismatch; remain stopped and explicitly "
+                               "sync parameters in HOLD: " + "; ".join(mismatches))
+        return profile
+
+    def _configure_cpv_profile(self, cv: float | None, acc: float | None, dcc: float | None) -> dict[str, Any]:
+        requested = {"cv_rad_s": cv, "acc_rad_s2": acc, "dcc_rad_s2": dcc}
+        self._log("cpv_profile_write_requested", requested=requested)
+        try:
+            result = self.robot.call("p0", "configure_cpv_profile", cv, acc, dcc,
+                                     category="cpv_profile_configuration")
+        except Exception as exc:
+            self._log("cpv_profile_write_failed", requested=requested, error=str(exc))
+            raise
+        self._log("cpv_profile_write_completed", requested=requested, result=result)
+        return result
+
     def osc_set_cpv_acceleration(self, acceleration: float) -> dict[str, Any]:
         """Explicit ACC/DCC-only maintenance; no CV, motion or calibration."""
         acceleration = float(acceleration)
@@ -480,8 +533,7 @@ class OperationalSpaceController:
         before = self.osc_readonly_cpv_parameters()["cpv_parameters"]
         if before.get("status") != "available":
             raise RuntimeError("complete CPV parameter read-back required before writing")
-        result = self.robot.call("p0", "configure_cpv_profile", None, acceleration, acceleration,
-                                 category="cpv_profile_configuration")
+        result = self._configure_cpv_profile(None, acceleration, acceleration)
         after = self.read_osc_cpv_parameters()
         if after.get("status") != "available":
             raise RuntimeError("ACC/DCC write completed but complete read-back is unavailable")
@@ -504,10 +556,7 @@ class OperationalSpaceController:
         if before.get("status") != "available":
             raise RuntimeError("complete CPV parameter read-back required before writing")
         values = before["values"]
-        if any(len(set(values[name])) != 1 for name in ("acc", "dcc")):
-            raise RuntimeError("CV-only maintenance requires uniform ACC/DCC to preserve them")
-        result = self.robot.call("p0", "configure_cpv_profile", speed, values["acc"][0], values["dcc"][0],
-                                 category="cpv_profile_configuration")
+        result = self._configure_cpv_profile(speed, None, None)
         after = self.read_osc_cpv_parameters()
         if after.get("status") != "available" or any(abs(float(v) - speed) > 1e-6 for v in after["values"]["cv"]):
             raise RuntimeError("CPV CV write completed but read-back is unavailable or mismatched")
@@ -545,8 +594,7 @@ class OperationalSpaceController:
                     f"{readiness.get('reason', 'minimal joint feedback unavailable')}"
                 )
         speed, acceleration = self._osc.cpv_limits()
-        result = self.robot.call("p0", "configure_cpv_profile", speed, acceleration, acceleration,
-                                 category="cpv_profile_configuration")
+        result = self._configure_cpv_profile(speed, acceleration, acceleration)
         profile = self.read_osc_cpv_parameters()
         if profile.get("status") != "available":
             raise RuntimeError(f"CPV profile was written but complete read-back is unavailable: {profile.get('missing')}")

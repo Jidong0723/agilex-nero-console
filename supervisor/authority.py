@@ -152,6 +152,7 @@ class HardwareTxOwner:
         self._cpv_last_finished_ns: int | None = None
         self._cpv_last_started_perf_ns: int | None = None
         self._impedance_reference = None
+        self._cpv_reference = None
         self._impedance_failed_epoch = None
         self._cpv_generation_barrier: dict[int, int] = {}
         self._cpv_stop_generation_barrier: dict[int, int] = {}
@@ -252,6 +253,7 @@ class HardwareTxOwner:
 
     def cpv_diagnostics(self) -> dict[str, Any]:
         with self._cpv_lock:
+            cpv_reference = self._cpv_reference
             pending = dict(self._cpv_mailbox) if self._cpv_mailbox else None
             if pending is not None:
                 pending.pop("execute_guard", None)
@@ -267,6 +269,7 @@ class HardwareTxOwner:
                 "last_result": dict(self._cpv_last_result) if self._cpv_last_result else None,
                 "last_success": dict(self._cpv_last_success) if self._cpv_last_success else None,
                 "impedance_reference": self._impedance_reference.snapshot() if self._impedance_reference else None,
+                "cpv_reference": cpv_reference.snapshot() if cpv_reference else None,
                 "generation_barriers": dict(self._cpv_generation_barrier),
                 "stop_generation_barriers": dict(self._cpv_stop_generation_barrier),
             }
@@ -493,6 +496,7 @@ class HardwareTxOwner:
                 previous_target, previous_velocity, last_finished_ns = None, None, None
             final_gate_limited = False
             reference_candidate = None
+            cpv_candidate = None
             if output_mode == "impedance":
                 if self._impedance_failed_epoch == int(entry["epoch"]):
                     raise RuntimeError("MIT batch failure latched; requires mode handoff")
@@ -508,12 +512,26 @@ class HardwareTxOwner:
                 values = reference_candidate["position_rad"]
                 velocity = reference_candidate["velocity_rad_s"]
                 final_gate_limited = reference_candidate["limited"]
+            elif entry.get("cpv_reference") is not None:
+                if not entry.get("gate_ok"):
+                    raise RuntimeError("CPV reference rejected by final safety gate")
+                from motion.osc_cpv_reference import CpvReference
+                if self._cpv_reference is None or prior_mode != output_mode:
+                    self._cpv_reference = CpvReference()
+                cpv_candidate = self._cpv_reference.prepare(
+                    entry["cpv_reference"], entry["joint_velocity_rad_s"],
+                    started_perf_ns=started_perf_ns, epoch=int(entry["epoch"]),
+                    max_speed=entry["max_joint_speed_rad_s"],
+                    max_acceleration=entry["max_joint_acceleration_rad_s2"])
+                values = cpv_candidate["position_rad"]
+                velocity = cpv_candidate["velocity_rad_s"]
+                final_gate_limited = cpv_candidate["limited"]
             elif last_finished_ns is not None and previous_target is not None and previous_velocity is not None:
                 actual_dt = (started_perf_ns - self._cpv_last_started_perf_ns) / 1e9
                 if not math.isfinite(actual_dt) or actual_dt <= 0:
                     raise RuntimeError(f"invalid CPV control interval: {actual_dt}")
                 velocity = [(target - previous) / actual_dt for target, previous in zip(values, previous_target)]
-                max_speed = float(entry.get("max_joint_speed_rad_s", float("inf")))
+                max_speed = float(entry.get("max_joint_speed_rad_s", 2.0))
                 max_acceleration = float(entry.get("max_joint_acceleration_rad_s2", float("inf")))
                 bounded_velocity = []
                 for desired, prior in zip(velocity, previous_velocity):
@@ -570,6 +588,11 @@ class HardwareTxOwner:
                            "joint_target_rad": list(values), "joint_velocity_rad_s": list(velocity),
                            "final_gate_limited": final_gate_limited})
             result["dispatch_started_perf_ns"] = started_perf_ns
+            if cpv_candidate is not None:
+                self._cpv_reference.commit(cpv_candidate)
+                result["cpv_reference"] = self._cpv_reference.snapshot()
+            else:
+                self._cpv_reference = None
             if reference_candidate is not None:
                 self._impedance_reference.commit(reference_candidate)
                 result["impedance_reference"] = self._impedance_reference.snapshot()

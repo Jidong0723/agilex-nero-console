@@ -144,6 +144,24 @@ class DirectCpvTests(unittest.TestCase):
         self.assertEqual(shadow_result["final_joint_velocity_rad_s"], hardware_result["final_joint_velocity_rad_s"])
         self.hardware.publish_servo_position.assert_not_called()
 
+    def test_shipped_joint_speed_is_shared_by_solver_sender_and_profile(self):
+        from motion.osc import DEFAULT_JOINT_SPEED_RAD_S
+        shipped = json.loads((ROOT / 'config/osc.json').read_text(encoding='utf-8'))
+        self.assertEqual(DEFAULT_JOINT_SPEED_RAD_S, 2.0)
+        self.assertEqual(shipped['limits']['joint_speed_rad_s'], 2.0)
+        self.assertEqual(shipped['hardware_limits']['speed_rad_s'], [2.0]*7)
+        self.servo.config['hardware_limits'] = shipped['hardware_limits']
+        self.servo.limits['joint_speed_rad_s'] = 2.0
+        authority = self.servo.authority.initialize_fixed()
+        self.servo.supervisor.configure(authority, [2.0]*7, [10.0]*7)
+        runtime = object.__new__(OscRuntime);runtime._servo = self.servo
+        self.assertEqual(runtime.cpv_limits()[0], 2.0)
+        requests=[];solve=self.servo.solver.solve_current
+        self.servo.solver.solve_current=lambda r,t: (requests.append(r) or solve(r,t))
+        self.step()
+        self.assertEqual(requests[0]['joint_speed_limit_rad_s'], [2.0]*7)
+        self.assertEqual(self.hardware.publish_servo_position.call_args.args[0]['max_joint_speed_rad_s'], 2.0)
+
     def test_missing_solver_brakes_with_existing_acceleration_limit(self):
         self.fresh_solver = False
         self.servo.last_sent_velocity = [0.1] * 7
@@ -161,7 +179,9 @@ class DirectCpvTests(unittest.TestCase):
         self.assertTrue(self.servo.last_result["ok"], self.servo.last_result)
         self.assertTrue(self.servo.last_result["gate_limited"])
         self.assertEqual(result["final_joint_velocity_rad_s"][0], 0.0)
-        self.assertEqual(result["final_joint_target_rad"][0], self.q[0])
+        # A safety-clipped velocity freezes the reference; it does not reset
+        # the command position to a different feedback sample.
+        self.assertEqual(result["final_joint_target_rad"][0], self.servo.trajectory["position_rad"][0])
 
     def test_hard_stale_feedback_publishes_zero_and_faults(self):
         self.feedback_age = 0.2
@@ -179,7 +199,8 @@ class DirectCpvTests(unittest.TestCase):
         self.assertEqual(self.servo.trajectory_state, "RUNNING")
         self.assertTrue(self.servo.last_result["ok"])
         self.assertLess(self.servo.last_result["supervisor"]["feedback_velocity_scale"], 1.0)
-        self.assertLess(self.servo.last_sent_velocity[0], 0.5)
+        self.assertLess(self.servo.last_output["final_joint_velocity_rad_s"][0], 0.5)
+        self.assertEqual(self.servo.last_sent_velocity[0], 0.5)  # Not sent yet.
 
     def test_revoked_authority_freezes_without_publication(self):
         self.hardware.servo_can_write.return_value = False
@@ -193,6 +214,20 @@ class DirectCpvTests(unittest.TestCase):
         self.servo.command = None
         self.servo.last_sent_velocity = [0.1] * 7
         self.servo.trajectory["velocity_rad_s"] = [0.1] * 7
+        from motion.osc_cpv_reference import CpvReference
+        reference = CpvReference()
+        reference.commit(dict(position_rad=list(self.q), velocity_rad_s=[.1]*7,
+            acceleration_rad_s2=[0.0]*7, epoch=self.servo.motion_epoch,
+            reference_id=self.servo._cpv_reference_id, started_perf_ns=0))
+        self.hardware.servo_transport_diagnostics.side_effect = lambda: {"cpv_reference": reference.snapshot()}
+        clock = [0]
+        def send(command, session_id, epoch):
+            clock[0] += 20_000_000
+            candidate = reference.prepare(command['cpv_reference'], command['joint_velocity_rad_s'],
+                started_perf_ns=clock[0], epoch=epoch, max_speed=1.0, max_acceleration=2.0)
+            reference.commit(candidate)
+            return {"mailbox_revision": clock[0]}
+        self.hardware.publish_servo_position.side_effect = send
         for _ in range(5):
             self.step()
             if self.servo.trajectory_state == "HOLD_READY":
@@ -203,6 +238,42 @@ class DirectCpvTests(unittest.TestCase):
         self.hardware.latch_osc_hold.assert_called_once_with("osc braking settled")
         methods = [call[0] for call in self.hardware.mock_calls]
         self.assertLess(methods.index("wait_for_servo_result"), methods.index("latch_osc_hold"))
+
+    def test_pending_publication_never_advances_reference_history(self):
+        requests = []
+        solve = self.servo.solver.solve_current
+        self.servo.solver.solve_current = lambda r,t: (requests.append(r) or solve(r,t))
+        for _ in range(3):
+            self.step()
+        self.assertEqual(self.servo.last_sent_velocity, [0.0]*7)
+        self.assertEqual(self.servo.trajectory['position_rad'], self.q)
+        self.assertTrue(all(r['last_sent_joint_velocity_rad_s']==[0.0]*7 for r in requests))
+
+    def test_solver_uses_confirmed_reference_not_feedback_prediction(self):
+        reference = dict(epoch=self.servo.motion_epoch, reference_id=self.servo._cpv_reference_id,
+            position_rad=[.2]*7, velocity_rad_s=[.03]*7, acceleration_rad_s2=[0.0]*7)
+        self.hardware.servo_transport_diagnostics.return_value = {'cpv_reference': reference}
+        requests = []
+        solve = self.servo.solver.solve_current
+        self.servo.solver.solve_current = lambda r,t: (requests.append(r) or solve(r,t))
+        self.step()
+        self.assertEqual(requests[0]['joint_angles_rad'], reference['position_rad'])
+        self.assertEqual(requests[0]['last_sent_joint_velocity_rad_s'], reference['velocity_rad_s'])
+        self.assertEqual(requests[0]['measured_joint_angles_rad'], self.q)
+        self.assertTrue(requests[0]['report_measured_error'])
+        self.assertEqual(self.servo.last_sent_velocity, reference['velocity_rad_s'])
+        self.assertEqual(self.servo.trajectory['position_rad'], reference['position_rad'])
+
+    def test_old_reference_cannot_cross_hold_reanchor_or_epoch(self):
+        old_id = self.servo._cpv_reference_id
+        self.servo._initialize_trajectory(self.q)
+        self.assertNotEqual(self.servo._cpv_reference_id, old_id)
+        self.hardware.servo_transport_diagnostics.return_value = {'cpv_reference': dict(
+            epoch=self.servo.motion_epoch, reference_id=old_id,
+            position_rad=[.9]*7, velocity_rad_s=[.5]*7)}
+        self.step()
+        self.assertEqual(self.servo.last_sent_velocity, [0.0]*7)
+        self.assertEqual(self.servo.trajectory['position_rad'], self.q)
 
 
 if __name__ == "__main__":

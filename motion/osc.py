@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+DEFAULT_JOINT_SPEED_RAD_S = 2.0
 
 
 class KinematicsUnavailable(RuntimeError):
@@ -755,7 +756,7 @@ class JointLimitAuthority:
         fixed = self.config.get("hardware_limits") or {
             "lower_rad": [-2.705260340591211, -1.7453292519943295, -2.7576202181510405, -1.0122909661567112, -2.7576202181510405, -0.7330382858376184, -1.5707963267948966],
             "upper_rad": [2.705260340591211, 1.7453292519943295, 2.7576202181510405, 2.1467549799530254, 2.7576202181510405, 0.9599310885968813, 1.5707963267948966],
-            "speed_rad_s": [3.14, 3.14, 3.14, 3.14, 3.92, 3.92, 3.92],
+            "speed_rad_s": [DEFAULT_JOINT_SPEED_RAD_S] * 7,
             "acceleration_rad_s2": [5.0] * 7,
         }
         lower = _finite_vector(fixed.get("lower_rad"), 7, "hardware_limits.lower_rad")
@@ -948,7 +949,7 @@ class ShadowCpvPlant:
         while self._dispatches and self._dispatches[0][0] <= now_s:
             _, self.target = self._dispatches.popleft()
         tau = max(0.001, float(self.config.get("position_time_constant_s", 0.06)))
-        max_speed = max(0.01, float(self.config.get("max_joint_speed_rad_s", 1.5)))
+        max_speed = max(0.01, float(self.config.get("max_joint_speed_rad_s", DEFAULT_JOINT_SPEED_RAD_S)))
         max_acc = max(0.01, float(self.config.get("max_joint_acceleration_rad_s2", 5.0)))
         desired = [max(-max_speed, min(max_speed, (target - value) / tau)) for target, value in zip(self.target, self.q)]
         max_delta = max_acc * max(0.001, dt_s)
@@ -1189,6 +1190,10 @@ class _OperationalSpaceServo:
         """Reset the CPV command state to measured joints at rest."""
         self.trajectory = {"position_rad": list(q), "velocity_rad_s": [0.0] * 7, "acceleration_rad_s2": [0.0] * 7}
         self.last_sent_velocity = [0.0] * 7
+        # New session / confirmed HOLD resume only, never a TCP target update.
+        self._cpv_reference_id = uuid.uuid4().hex
+        from motion.osc_cpv_reference import CpvReference
+        self._shadow_cpv_reference = CpvReference()
 
     def _hardware_preflight(self) -> dict[str, Any]:
         return self.authority.initialize_fixed()
@@ -1220,12 +1225,12 @@ class _OperationalSpaceServo:
             self._bump_state()
             try:
                 if execution_mode == "shadow":
-                    authority = {"status": "shadow", "effective_lower_rad": self.authority.hard_lower, "effective_upper_rad": self.authority.hard_upper, "controller_speed_rad_s": [float(self.limits.get("joint_speed_rad_s", 1.5))] * 7, "controller_acceleration_rad_s2": [float(self.config.get("solver", {}).get("joint_acceleration_limit_rad_s2", 5.0))] * 7}
+                    authority = {"status": "shadow", "effective_lower_rad": self.authority.hard_lower, "effective_upper_rad": self.authority.hard_upper, "controller_speed_rad_s": [float(self.limits.get("joint_speed_rad_s", DEFAULT_JOINT_SPEED_RAD_S))] * 7, "controller_acceleration_rad_s2": [float(self.config.get("solver", {}).get("joint_acceleration_limit_rad_s2", 5.0))] * 7}
                     self.authority.effective = authority
                 else:
                     self.hardware.require_operational_control()
                     authority = self._hardware_preflight()
-                self.supervisor.configure(authority, [float(self.limits.get("joint_speed_rad_s", 1.5))] * 7, [float(self.config.get("solver", {}).get("joint_acceleration_limit_rad_s2", 5.0))] * 7)
+                self.supervisor.configure(authority, [float(self.limits.get("joint_speed_rad_s", DEFAULT_JOINT_SPEED_RAD_S))] * 7, [float(self.config.get("solver", {}).get("joint_acceleration_limit_rad_s2", 5.0))] * 7)
                 # Always create a fresh Pink bridge for a fresh session.  A
                 # previous hard reset can leave a solver child alive with a
                 # stale anchor; merely changing motion_epoch cannot make that
@@ -1294,7 +1299,7 @@ class _OperationalSpaceServo:
                 shadow_config = dict(self.config.get("shadow_transport") or {})
                 # Shadow feedback follows the same controller limits as OSC;
                 # it must not introduce a second configurable limit.
-                shadow_config["max_joint_speed_rad_s"] = float(self.limits.get("joint_speed_rad_s", 1.5))
+                shadow_config["max_joint_speed_rad_s"] = float(self.limits.get("joint_speed_rad_s", DEFAULT_JOINT_SPEED_RAD_S))
                 shadow_config["max_joint_acceleration_rad_s2"] = float(self.config.get("solver", {}).get("joint_acceleration_limit_rad_s2", 5.0))
                 self.shadow_plant = (
                     ShadowCpvPlant(shadow_config, self.posture_reference)
@@ -1857,6 +1862,17 @@ class _OperationalSpaceServo:
                             "velocity_rad_s": list(reference["velocity_rad_s"]),
                             "acceleration_rad_s2": [0.0] * 7}
                         self.last_sent_velocity = list(reference["velocity_rad_s"])
+                else:
+                    reference = (self._shadow_cpv_reference.snapshot() if shadow else
+                                 self.hardware.servo_transport_diagnostics().get("cpv_reference"))
+                    if (not isinstance(reference, dict) or reference.get("epoch") != self.motion_epoch
+                            or reference.get("reference_id") != self._cpv_reference_id):
+                        reference = None
+                    if reference:
+                        # Sender-owned history: publishing is not sending.
+                        self.trajectory = {key: list(reference[key]) for key in
+                                           ("position_rad", "velocity_rad_s", "acceleration_rad_s2")}
+                        self.last_sent_velocity = list(reference["velocity_rad_s"])
                 soft_stale = feedback_age > float(self.limits.get("feedback_soft_stale_s", 0.06))
                 hard_stale = feedback_age > float(self.limits.get("feedback_hard_stale_s", 0.15))
                 age = float("inf") if not command else max(0.0, (time.monotonic_ns() - int(command["host_monotonic_ns"])) / 1e9)
@@ -1948,7 +1964,7 @@ class _OperationalSpaceServo:
                                 "output_mode": "impedance", "impedance_command": mit,
                                 "target_generation": self.target_generation,
                                 "control_sample_id": self.control_sample_id,
-                                "max_joint_speed_rad_s": float(self.limits.get("joint_speed_rad_s", 1.5)),
+                                "max_joint_speed_rad_s": float(self.limits.get("joint_speed_rad_s", DEFAULT_JOINT_SPEED_RAD_S)),
                                 "max_joint_acceleration_rad_s2": max(self.supervisor.limit_data["acceleration_rad_s2"]),
                             }, str(session.get("session_id")), epoch)
                     with self.lock:
@@ -1997,17 +2013,19 @@ class _OperationalSpaceServo:
                 now_ns = time.monotonic_ns()
                 self.pico_trace_logger.append({"record_type": "osc_sample", "monotonic_ns": now_ns, "control_sample_id": sample_id, "motion_epoch": epoch, "target_generation": target_generation})
                 dispatch_dt = actual_dt
-                planning_q = list(reference["position_rad"]) if reference and reference["action"] == "track" else measured_q
+                planning_q = (list(reference["position_rad"])
+                              if self.impedance_output and reference and reference["action"] == "track" else measured_q)
                 if not self.impedance_output:
-                    planning_q = q
+                    planning_q = list(self.trajectory["position_rad"])
                 # OSC accepts an absolute TCP setpoint.  Never extrapolate a
                 # jittery, paused, or discontinuous adapter stream beyond
                 # that setpoint; Pink receives exactly what the adapter sent.
                 solver_config = self.config.get("solver", {})
                 request = {"sequence": int((command or {}).get("sequence", session.get("sequence", 0))), "control_sample_id": sample_id, "target_generation": target_generation, "motion_epoch": epoch, "joint_angles_rad": q, "measured_joint_angles_rad": measured_q, "joint_state_monotonic_ns": now_ns, "target_position_m": target_pose["position_m"], "target_orientation_xyzw": target_pose["orientation_xyzw"], "command_target_position_m": target_pose["position_m"], "command_target_orientation_xyzw": target_pose["orientation_xyzw"], "last_sent_joint_velocity_rad_s": self.last_sent_velocity, "joint_speed_limit_rad_s": data["speed_rad_s"], "joint_acceleration_limit_rad_s2": data["acceleration_rad_s2"], "soft_lower_rad": data["soft_lower_rad"], "soft_upper_rad": data["soft_upper_rad"], "posture_reference_rad": self.posture_reference or q, "posture_cost": float(solver_config.get("posture_cost", 0.001)), "damping_cost": float(solver_config.get("damping_cost", 0.01)), "frame_position_cost": float(solver_config.get("frame_position_cost", 8.0)), "frame_orientation_cost": float(solver_config.get("frame_orientation_cost", 1.0)), "frame_gain": float(solver_config.get("frame_gain", 0.5)), "frame_lm_damping": float(solver_config.get("frame_lm_damping", 1.0)), "joint_center_cost": float(solver_config.get("joint_center_cost", 0.0003)), "joint_center_deadband": float(solver_config.get("joint_center_deadband", 0.70)), "feedback_limit_tolerance_rad": float(solver_config.get("feedback_limit_tolerance_rad", 0.03)), "dt_s": dispatch_dt}
                 request["joint_angles_rad"] = planning_q
-                if self.impedance_output:
-                    request["report_measured_error"] = True
+                # Planning uses the output reference; arrival/telemetry still
+                # describe the real arm, not completion of the reference alone.
+                request["report_measured_error"] = True
                 solve_current = getattr(self.solver, "solve_current", None)
                 if callable(solve_current):
                     pink = solve_current(request, float(self.config.get("solver", {}).get("synchronous_response_budget_s", 0.008)))
@@ -2046,8 +2064,8 @@ class _OperationalSpaceServo:
                             "measured_joint_velocity_rad_s": list(qd) if shadow else list((feedback or {}).get("velocities") or []),
                             "motor_feedback": (feedback or {}).get("motor_feedback"),
                             "arm_status_feedback": (feedback or {}).get("arm_status_feedback"),
-                            "estimated_joint_state_rad": list(q),
-                            "estimated_joint_velocity_rad_s": list(qd),
+                            "estimated_joint_state_rad": list(planning_q),
+                            "estimated_joint_velocity_rad_s": list(qd if self.impedance_output else self.last_sent_velocity),
                             "estimated_tcp_pose": estimated_tcp,
                             "measured_tcp_pose": measured_tcp,
                             "target_tcp": dict(target_pose),
@@ -2101,20 +2119,12 @@ class _OperationalSpaceServo:
                     if state != "RUNNING":
                         final_velocity = [0.0] * 7
                     settled = not hard_stale and max(abs(x) for x in qd) <= float(self.config["solver"].get("hold_velocity_epsilon_rad_s", .005))
-                # Integrate the final gated velocity once from current joints.
-                # Shadow and hardware use exactly the same CPV command state.
-                previous_velocity = list(self.trajectory["velocity_rad_s"])
+                # Position below is a proposal for diagnostics, not history.
+                # Only the sender integrates/commits the actual CPV reference.
                 position_target = list(planning_q) if self.impedance_output else [
                     float(current) + float(command) * actual_dt
-                    for current, command in zip(q, final_velocity)
+                    for current, command in zip(planning_q, final_velocity)
                 ]
-                if not self.impedance_output:
-                    self.trajectory["position_rad"] = list(position_target)
-                    self.trajectory["velocity_rad_s"] = list(final_velocity)
-                    self.trajectory["acceleration_rad_s2"] = [
-                        (float(command) - float(previous)) / actual_dt
-                        for command, previous in zip(final_velocity, previous_velocity)
-                    ]
                 output_fields = {}
                 if self.impedance_output:
                     if hard_stale:
@@ -2127,7 +2137,26 @@ class _OperationalSpaceServo:
                         feedback_velocity_rad_s=list(qd),
                         reference_gate_mask=[abs(a - b) > 1e-9 for a, b in zip(target_velocity, final_velocity)])
                     output_fields = {"output_mode": "impedance", "impedance_command": mit}
+                else:
+                    output_fields = {"cpv_reference": {
+                        "reference_id": self._cpv_reference_id,
+                        "anchor_position_rad": list(planning_q), "dt_s": actual_dt,
+                        "lower_rad": list(data["soft_lower_rad"]),
+                        "upper_rad": list(data["soft_upper_rad"]),
+                        "gate_mask": [abs(a-b)>1e-9 for a,b in zip(target_velocity,final_velocity)]}}
                 if shadow:
+                    if not self.impedance_output:
+                        candidate = self._shadow_cpv_reference.prepare(
+                            output_fields["cpv_reference"], final_velocity,
+                            started_perf_ns=time.perf_counter_ns(), epoch=epoch,
+                            max_speed=float(self.limits.get("joint_speed_rad_s", DEFAULT_JOINT_SPEED_RAD_S)),
+                            max_acceleration=max(data["acceleration_rad_s2"]))
+                        self._shadow_cpv_reference.commit(candidate)
+                        position_target = list(candidate["position_rad"])
+                        final_velocity = list(candidate["velocity_rad_s"])
+                        self.trajectory = {key: list(candidate[key]) for key in
+                                           ("position_rad", "velocity_rad_s", "acceleration_rad_s2")}
+                        self.last_sent_velocity = list(final_velocity)
                     # Build the identical CPV position target that hardware
                     # receives.  ShadowPlant applies it asynchronously; it is
                     # never promoted immediately to measured feedback.
@@ -2152,7 +2181,7 @@ class _OperationalSpaceServo:
                         "joint_target_rad": list(position_target),
                         "joint_velocity_rad_s": list(final_velocity),
                         "published_monotonic_ns": time.monotonic_ns(),
-                        "max_joint_speed_rad_s": float(self.limits.get("joint_speed_rad_s", 1.5)),
+                        "max_joint_speed_rad_s": float(self.limits.get("joint_speed_rad_s", DEFAULT_JOINT_SPEED_RAD_S)),
                         "max_joint_acceleration_rad_s2": max(float(value) for value in data["acceleration_rad_s2"]),
                         "gate_ok": gate_ok,
                         "gate_limited": gate_limited,
@@ -2169,8 +2198,6 @@ class _OperationalSpaceServo:
                     elif gate_limited:
                         result_reason = "CPV joint-position batch sent with final safety gate velocity limit"
                     self._set_result(gate_ok, result_reason, robot_commands_sent=False, solver=pink if pink and pink.get("ok") else None, supervisor=supervisor_report, gate_reason=gate_reason, gate_limited=gate_limited, final_joint_target_rad=list(position_target), final_joint_velocity_rad_s=list(final_velocity), cpv_mailbox=publication)
-                if not self.impedance_output:
-                    self.last_sent_velocity = list(final_velocity)
                 with self.lock:
                     arrival_position = float(self.config.get("osc", {}).get("arrival_position_tolerance_m", 0.0005))
                     arrival_orientation = float(self.config.get("osc", {}).get("arrival_orientation_tolerance_rad", math.radians(0.25)))
@@ -2191,7 +2218,7 @@ class _OperationalSpaceServo:
                         and float(arrival_sample.get("position_error_m", float("inf"))) <= arrival_position
                         and float(arrival_sample.get("orientation_error_rad", float("inf"))) <= arrival_orientation
                         and max((abs(value) for value in final_velocity), default=0.0) <= arrival_velocity
-                        and (not self.impedance_output or max(abs(v) for v in qd) <= arrival_velocity)
+                        and max(abs(v) for v in qd) <= arrival_velocity
                     )
                     arrival_now_ns = time.monotonic_ns()
                     if arrival_ok:
@@ -2393,7 +2420,7 @@ class OscRuntime:
 
     def cpv_limits(self) -> tuple[float, float]:
         return (
-            float(self._servo.limits.get("joint_speed_rad_s", 1.5)),
+            float(self._servo.limits.get("joint_speed_rad_s", DEFAULT_JOINT_SPEED_RAD_S)),
             float(self._servo.config.get("solver", {}).get("joint_acceleration_limit_rad_s2", 5.0)),
         )
 

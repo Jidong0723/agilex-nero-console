@@ -1233,7 +1233,7 @@ class NeroRobot:
             finally:
                 auto_set(previous_auto)
 
-    def configure_cpv_profile(self, cv_rad_s: float | None, acc_rad_s2: float, dcc_rad_s2: float) -> dict[str, Any]:
+    def configure_cpv_profile(self, cv_rad_s: float | None, acc_rad_s2: float | None, dcc_rad_s2: float | None) -> dict[str, Any]:
         """Set the official CPV profile and verify every SDK ACK/read-back.
 
         This only changes the vendor controller profile and never dispatches
@@ -1241,11 +1241,12 @@ class NeroRobot:
         in the motor controller's Flash, so values already matching the
         requested profile are deliberately not written again.
         """
-        values = {"acc": float(acc_rad_s2), "dcc": float(dcc_rad_s2)}
-        # None means leave every joint's existing CV untouched, not a default.
-        if cv_rad_s is not None:
-            values["cv"] = float(cv_rad_s)
-        if not all(math.isfinite(value) and value > 0.0 for value in values.values()):
+        # None means do not read/write this parameter. A CV-only request must
+        # not reapply a stale ACC/DCC snapshot taken before a mode transition.
+        values = {name: float(value) for name, value in
+                  (("acc", acc_rad_s2), ("dcc", dcc_rad_s2), ("cv", cv_rad_s))
+                  if value is not None}
+        if not values or not all(math.isfinite(value) and value > 0.0 for value in values.values()):
             raise ValueError("CPV cv, acc and dcc must be finite positive values")
         if self.robot is None:
             raise RuntimeError("robot is not connected")
