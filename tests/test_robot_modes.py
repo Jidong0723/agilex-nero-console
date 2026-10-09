@@ -277,6 +277,46 @@ class RobotModeTests(unittest.TestCase):
         self.assertEqual(sdk.cpv_profile["dcc"], [10.0] * 7)
         self.assertEqual(len(result["joints"]), 7)
 
+    def test_acceleration_only_profile_never_reads_or_writes_cv(self) -> None:
+        robot, sdk = self.make_robot()
+        original_cv = list(sdk.cpv_profile["cv"])
+        def forbidden(**kwargs):
+            self.fail("ACC/DCC-only operation must not read or write CV")
+        sdk.get_cpv_cv = forbidden
+        sdk.set_cpv_cv = forbidden
+        events = list(sdk.events)
+        result = robot.configure_cpv_profile(None, 10.0, 10.0)
+        self.assertEqual(sdk.cpv_profile["acc"], [10.0] * 7)
+        self.assertEqual(sdk.cpv_profile["dcc"], [10.0] * 7)
+        self.assertEqual(sdk.cpv_profile["cv"], original_cv)
+        self.assertEqual(result["profile"], {"acc": 10.0, "dcc": 10.0})
+        self.assertEqual(sdk.events, events)
+        self.assertTrue(sdk.auto_set_motion_mode)
+
+    def test_cpv_read_suppresses_auto_mode_and_restores_on_success_and_error(self) -> None:
+        robot, sdk = self.make_robot()
+        events_before = list(sdk.events)
+        def read(joint_index, timeout, min_interval):
+            self.assertFalse(sdk.auto_set_motion_mode)
+            self.assertEqual(timeout, 0.15)
+            return 10.0
+        sdk.get_cpv_acc = read
+        self.assertEqual(robot.read_cpv_parameter(1, "acc"), 10.0)
+        self.assertTrue(sdk.auto_set_motion_mode)
+        self.assertEqual(sdk.events, events_before)
+        def failing_read(**kwargs):
+            self.assertFalse(sdk.auto_set_motion_mode)
+            raise TimeoutError("test query timeout")
+        sdk.get_cpv_acc = failing_read
+        with self.assertRaises(TimeoutError):
+            robot.read_cpv_parameter(1, "acc")
+        self.assertTrue(sdk.auto_set_motion_mode)
+        self.assertEqual(sdk.events, events_before)
+        sdk.auto_set_motion_mode = False
+        sdk.get_cpv_acc = read
+        robot.read_cpv_parameter(1, "acc")
+        self.assertFalse(sdk.auto_set_motion_mode)
+
     def test_freedrive_state_uses_live_leader_angles(self) -> None:
         robot, sdk = self.make_robot()
         first = robot.read_state().joint_angles_rad

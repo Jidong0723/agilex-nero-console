@@ -1248,6 +1248,8 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 return self._json_ok(self.broker.osc_state())
             if parsed.path == "/api/osc/kinematics":
                 return self._json_ok(self.broker.osc_kinematics())
+            if parsed.path == "/api/osc/cpv-parameters/read-only":
+                return self._json_ok(self.broker.osc_readonly_cpv_parameters())
             if parsed.path == "/api/osc/telemetry/read-only":
                 query = parse_qs(parsed.query)
                 samples = int((query.get("samples") or [50])[0])
@@ -1307,6 +1309,10 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     str(body.get("client_id", "anonymous")),
                     str(body.get("session_id", "")),
                 ))
+            if self.path == "/api/osc/cpv-speed":
+                return self._json_ok(self.broker.osc_set_cpv_speed(float(body["speed_rad_s"])))
+            if self.path == "/api/osc/cpv-acceleration":
+                return self._json_ok(self.broker.osc_set_cpv_acceleration(float(body["acceleration_rad_s2"])))
             if self.path == "/api/osc/cpv-profile/sync":
                 return self._json_ok(self.broker.osc_sync_cpv_profile_to_osc_limits())
             if self.path == "/api/pi05/config":

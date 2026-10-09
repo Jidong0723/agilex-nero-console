@@ -1220,9 +1220,20 @@ class NeroRobot:
             # ``None`` before its response can arrive.  This is still a
             # read-only query; bound its wait so telemetry cannot monopolise
             # the transport owner.
-            return getter(joint_index=joint_index, timeout=0.15, min_interval=0.0)
+            auto_get = getattr(self.robot, "get_auto_set_motion_mode_enabled", None)
+            auto_set = getattr(self.robot, "set_auto_set_motion_mode_enabled", None)
+            if not callable(auto_get) or not callable(auto_set):
+                raise RuntimeError("cannot guarantee mode-preserving CPV query with this SDK")
+            previous_auto = auto_get()
+            try:
+                # SDK getters also call _maybe_set_motion_mode('cpv'). This
+                # flag is process-local: suppress that write, not hardware HOLD.
+                auto_set(False)
+                return getter(joint_index=joint_index, timeout=0.15, min_interval=0.0)
+            finally:
+                auto_set(previous_auto)
 
-    def configure_cpv_profile(self, cv_rad_s: float, acc_rad_s2: float, dcc_rad_s2: float) -> dict[str, Any]:
+    def configure_cpv_profile(self, cv_rad_s: float | None, acc_rad_s2: float, dcc_rad_s2: float) -> dict[str, Any]:
         """Set the official CPV profile and verify every SDK ACK/read-back.
 
         This only changes the vendor controller profile and never dispatches
@@ -1230,7 +1241,10 @@ class NeroRobot:
         in the motor controller's Flash, so values already matching the
         requested profile are deliberately not written again.
         """
-        values = {"acc": float(acc_rad_s2), "dcc": float(dcc_rad_s2), "cv": float(cv_rad_s)}
+        values = {"acc": float(acc_rad_s2), "dcc": float(dcc_rad_s2)}
+        # None means leave every joint's existing CV untouched, not a default.
+        if cv_rad_s is not None:
+            values["cv"] = float(cv_rad_s)
         if not all(math.isfinite(value) and value > 0.0 for value in values.values()):
             raise ValueError("CPV cv, acc and dcc must be finite positive values")
         if self.robot is None:
@@ -1262,7 +1276,7 @@ class NeroRobot:
                 # requested value and are independent of the CV profile.
                 # This also prevents a firmware-rejected CV from leaving the
                 # requested acceleration envelope only partly configured.
-                for name in ("acc", "dcc", "cv"):
+                for name in values:
                     for joint_index in range(1, 8):
                         before = current[joint_index]
                         value = values[name]

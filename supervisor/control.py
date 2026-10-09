@@ -458,6 +458,65 @@ class OperationalSpaceController:
         self._cpv_profile_cache = dict(profile)
         return profile
 
+    def osc_readonly_cpv_parameters(self) -> dict[str, Any]:
+        """Query actual firmware settings; never calibrate or persist config."""
+        state = self.osc_state()
+        authority = state.get("authority") or {}
+        if (state.get("session") or {}).get("id"):
+            raise RuntimeError("end the OSC session before reading CPV parameters")
+        if (authority.get("hardware_mode") != "HOLD"
+                or authority.get("safety_state") != "NORMAL"
+                or not authority.get("feedback_fresh")
+                or authority.get("arm_writer") == "MODE_TRANSITION"):
+            raise RuntimeError("CPV parameter query requires confirmed fresh-feedback HOLD")
+        return {"ok": True, "cpv_parameters": self.read_osc_cpv_parameters()}
+
+    def osc_set_cpv_acceleration(self, acceleration: float) -> dict[str, Any]:
+        """Explicit ACC/DCC-only maintenance; no CV, motion or calibration."""
+        acceleration = float(acceleration)
+        _, approved_acceleration = self._osc.cpv_limits()
+        if not math.isfinite(acceleration) or not 0.0 < acceleration <= approved_acceleration:
+            raise ValueError("CPV acceleration must be positive and within the configured OSC limit")
+        before = self.osc_readonly_cpv_parameters()["cpv_parameters"]
+        if before.get("status") != "available":
+            raise RuntimeError("complete CPV parameter read-back required before writing")
+        result = self.robot.call("p0", "configure_cpv_profile", None, acceleration, acceleration,
+                                 category="cpv_profile_configuration")
+        after = self.read_osc_cpv_parameters()
+        if after.get("status") != "available":
+            raise RuntimeError("ACC/DCC write completed but complete read-back is unavailable")
+        for name in ("acc", "dcc"):
+            if any(abs(float(value) - acceleration) > 1e-6 for value in after["values"][name]):
+                raise RuntimeError(f"CPV {name} read-back mismatch")
+        for name in ("cv", "pp", "kp", "ki"):
+            if after["values"][name] != before["values"][name]:
+                raise RuntimeError(f"unexpected change to untouched CPV parameter {name}")
+        return {"ok": True, "requested_acc_dcc_rad_s2": acceleration,
+                "before": before, "result": result, "readback": after}
+
+    def osc_set_cpv_speed(self, speed: float) -> dict[str, Any]:
+        """Explicit CV-only maintenance; preserve existing ACC/DCC and gains."""
+        speed = float(speed)
+        approved_speed, _ = self._osc.cpv_limits()
+        if not math.isfinite(speed) or not 0.0 < speed <= approved_speed:
+            raise ValueError("CPV speed must be positive and within the configured OSC limit")
+        before = self.osc_readonly_cpv_parameters()["cpv_parameters"]
+        if before.get("status") != "available":
+            raise RuntimeError("complete CPV parameter read-back required before writing")
+        values = before["values"]
+        if any(len(set(values[name])) != 1 for name in ("acc", "dcc")):
+            raise RuntimeError("CV-only maintenance requires uniform ACC/DCC to preserve them")
+        result = self.robot.call("p0", "configure_cpv_profile", speed, values["acc"][0], values["dcc"][0],
+                                 category="cpv_profile_configuration")
+        after = self.read_osc_cpv_parameters()
+        if after.get("status") != "available" or any(abs(float(v) - speed) > 1e-6 for v in after["values"]["cv"]):
+            raise RuntimeError("CPV CV write completed but read-back is unavailable or mismatched")
+        for name in ("acc", "dcc", "pp", "kp", "ki"):
+            if after["values"][name] != values[name]:
+                raise RuntimeError(f"unexpected change to untouched CPV parameter {name}")
+        return {"ok": True, "requested_cv_rad_s": speed,
+                "before": before, "result": result, "readback": after}
+
     def sync_cpv_profile_to_osc_limits(self) -> dict[str, Any]:
         """Apply current OSC limits only while the arm is safely idle/HOLD."""
         session = self._osc.status().get("session") or {}

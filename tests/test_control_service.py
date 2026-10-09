@@ -203,6 +203,80 @@ class BrokerPreemptionTests(unittest.TestCase):
         self.assertEqual(snapshot["values"]["acc"], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
         self.assertEqual(self.fake.execute_calls, 0)
 
+    def test_pure_cpv_query_requires_hold_and_never_calibrates(self) -> None:
+        from unittest.mock import patch
+        import copy
+        initial = {"session": {"id": None}, "authority": {
+            "hardware_mode": "HOLD", "safety_state": "NORMAL", "feedback_fresh": True}}
+        with patch.object(self.hardware, "osc_state", return_value=initial), \
+             patch.object(self.hardware, "osc_calibrate_readonly_hardware") as calibrate:
+            result = self.hardware.osc_readonly_cpv_parameters()
+            self.assertTrue(result["ok"])
+            self.assertEqual(len(self.fake.cpv_parameter_reads), 42)
+            calibrate.assert_not_called()
+        for change in ({"hardware_mode": "CPV"}, {"safety_state": "FAULT"},
+                       {"feedback_fresh": False}, {"arm_writer": "MODE_TRANSITION"}):
+            state = copy.deepcopy(initial)
+            state["authority"].update(change)
+            with patch.object(self.hardware, "osc_state", return_value=state):
+                with self.assertRaises(RuntimeError):
+                    self.hardware.osc_readonly_cpv_parameters()
+        state = copy.deepcopy(initial)
+        state["session"]["id"] = "active-owner"
+        with patch.object(self.hardware, "osc_state", return_value=state):
+            with self.assertRaises(RuntimeError):
+                self.hardware.osc_readonly_cpv_parameters()
+        self.assertEqual(len(self.fake.cpv_parameter_reads), 42)
+        self.assertEqual(self.fake.execute_calls, 0)
+
+    def test_acceleration_only_maintenance_preserves_other_parameters(self) -> None:
+        from unittest.mock import patch
+        import copy
+        before = {"status": "available", "values": {
+            "acc": [1.0] * 7, "dcc": [1.0] * 7, "cv": [1.5] * 7,
+            "pp": [5.0] * 7, "kp": [0.8] * 7, "ki": [60.0] * 7}}
+        after = copy.deepcopy(before)
+        after["values"].update(acc=[10.0] * 7, dcc=[10.0] * 7)
+        with patch.object(self.hardware._osc, "cpv_limits", return_value=(5.0, 10.0)), \
+             patch.object(self.hardware, "osc_readonly_cpv_parameters", return_value={"cpv_parameters": before}) as read, \
+             patch.object(self.hardware, "read_osc_cpv_parameters", return_value=after), \
+             patch.object(self.hardware.robot, "call", return_value={"ok": True}) as write:
+            result = self.hardware.osc_set_cpv_acceleration(10.0)
+            self.assertTrue(result["ok"])
+            write.assert_called_once_with("p0", "configure_cpv_profile", None, 10.0, 10.0,
+                                          category="cpv_profile_configuration")
+            for invalid in (0.0, -1.0, 11.0, float("nan")):
+                with self.assertRaises(ValueError):
+                    self.hardware.osc_set_cpv_acceleration(invalid)
+            self.assertEqual(read.call_count, 1)
+            write.reset_mock()
+            after["values"]["cv"][0] = 5.0
+            with self.assertRaisesRegex(RuntimeError, "untouched CPV parameter cv"):
+                self.hardware.osc_set_cpv_acceleration(10.0)
+
+    def test_speed_only_maintenance_preserves_acceleration_and_gains(self) -> None:
+        from unittest.mock import patch
+        import copy
+        before = {"status": "available", "values": {
+            "acc": [10.0] * 7, "dcc": [10.0] * 7, "cv": [1.5] * 7,
+            "pp": [5.0] * 7, "kp": [0.8] * 7, "ki": [60.0] * 7}}
+        after = copy.deepcopy(before)
+        after["values"]["cv"] = [5.0] * 7
+        with patch.object(self.hardware._osc, "cpv_limits", return_value=(5.0, 10.0)), \
+             patch.object(self.hardware, "osc_readonly_cpv_parameters", return_value={"cpv_parameters": before}) as read, \
+             patch.object(self.hardware, "read_osc_cpv_parameters", return_value=after), \
+             patch.object(self.hardware.robot, "call", return_value={"ok": True}) as write:
+            self.assertTrue(self.hardware.osc_set_cpv_speed(5.0)["ok"])
+            write.assert_called_once_with("p0", "configure_cpv_profile", 5.0, 10.0, 10.0,
+                                          category="cpv_profile_configuration")
+            for invalid in (0.0, -1.0, 5.1, float("nan")):
+                with self.assertRaises(ValueError):
+                    self.hardware.osc_set_cpv_speed(invalid)
+            self.assertEqual(read.call_count, 1)
+            after["values"]["acc"][0] = 1.0
+            with self.assertRaisesRegex(RuntimeError, "untouched CPV parameter acc"):
+                self.hardware.osc_set_cpv_speed(5.0)
+
     def test_start_remains_running_when_usb_can_connect_fails(self) -> None:
         self.hardware.close()
         self.fake.connect = lambda: (_ for _ in ()).throw(RuntimeError("USB-CAN channel 0 unavailable"))  # type: ignore[method-assign]
