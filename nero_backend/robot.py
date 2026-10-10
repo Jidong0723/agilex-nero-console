@@ -1291,7 +1291,10 @@ class NeroRobot:
                             setter = getattr(self.robot, f"set_cpv_{name}", None)
                             if setter is None:
                                 raise RuntimeError(f"NERO SDK does not expose set_cpv_{name}")
-                            acknowledgement = bool(setter(joint_index=joint_index, **{name: value}, timeout=1.0))
+                            # v120 may apply the value without the legacy 0xAC
+                            # ACK. Do not stall every joint for a whole second;
+                            # the unchanged bounded read-back below decides success.
+                            acknowledgement = bool(setter(joint_index=joint_index, **{name: value}, timeout=0.05))
                         # Some v120 firmware revisions apply a setting but do
                         # not emit the legacy 0xAC acknowledgement expected by
                         # the inherited v112 SDK.  Read-back is therefore the
