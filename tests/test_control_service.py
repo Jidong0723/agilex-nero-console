@@ -304,6 +304,7 @@ class BrokerPreemptionTests(unittest.TestCase):
         from supervisor.authority import ArmWriter
         with patch.object(self.hardware, "_require_operational_control"), \
              patch.object(self.hardware, "_verify_cpv_profile", side_effect=RuntimeError("profile mismatch")), \
+             patch.object(self.hardware, "_configure_cpv_profile", return_value={}), \
              patch.object(self.hardware.robot, "call") as prime:
             with self.assertRaisesRegex(RuntimeError, "profile mismatch"):
                 self.hardware.prepare_osc_hardware()
@@ -311,6 +312,7 @@ class BrokerPreemptionTests(unittest.TestCase):
         for post_error in (RuntimeError("profile reset by mode entry"), RuntimeError("read failed")):
             with patch.object(self.hardware, "_require_operational_control"), \
                  patch.object(self.hardware, "_verify_cpv_profile", side_effect=[{}, post_error]) as verify, \
+                 patch.object(self.hardware, "_configure_cpv_profile", return_value={}), \
                  patch.object(self.hardware.robot, "call", return_value={}) as prime:
                 with self.assertRaisesRegex(RuntimeError, str(post_error)):
                     self.hardware.prepare_osc_hardware()
@@ -324,9 +326,10 @@ class BrokerPreemptionTests(unittest.TestCase):
         events = []
         with patch.object(self.hardware, "_require_operational_control"), \
              patch.object(self.hardware, "_verify_cpv_profile", side_effect=lambda stage: events.append(stage)), \
+             patch.object(self.hardware, "_configure_cpv_profile", side_effect=lambda *a: events.append("profile")), \
              patch.object(self.hardware.robot, "call", side_effect=lambda *a, **kw: events.append("prime") or {}):
             self.hardware.prepare_osc_hardware()
-        self.assertEqual(events, ["before_cpv_prime", "prime", "after_cpv_prime"])
+        self.assertEqual(events, ["profile", "before_cpv_prime", "prime", "profile", "after_cpv_prime"])
 
     def test_cpv_profile_check_failure_does_not_clear_concurrent_safety_authority(self) -> None:
         from unittest.mock import patch

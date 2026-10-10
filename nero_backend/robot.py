@@ -675,6 +675,7 @@ class NeroRobot:
         width_m: float | None = None,
         force_n: float = 1.0,
         preserve_on_freedrive: bool = False,
+        inference_stream: bool = False,
     ) -> dict[str, Any]:
         self._require_connected()
         requested_preserve_on_freedrive = bool(preserve_on_freedrive)
@@ -737,7 +738,9 @@ class NeroRobot:
             or self._control_mode == "FREEDRIVE"
         )
         attempts = int(self.motion_config.get("gripper_enable_attempts", 3))
-        settle_s = float(self.motion_config.get("gripper_verify_settle_s", 0.25))
+        # Continuous policy commands must not sleep on the sole CAN TX owner.
+        # Manual/teleop callers retain the original delayed verification.
+        settle_s = 0.0 if inference_stream else float(self.motion_config.get("gripper_verify_settle_s", 0.25))
         after = before
         health = before_health
         for _ in range(max(1, attempts)):
@@ -760,7 +763,8 @@ class NeroRobot:
                         lambda: self.gripper.move_gripper_m(value=width_m, force=force_n),
                     )
             commands.append(command)
-            time.sleep(settle_s)
+            if settle_s > 0:
+                time.sleep(settle_s)
             after = self.read_gripper()
             verification_hold = (
                 {"mode": "grip", "force_n": force_n, "baseline_width_m": before.width_m}
@@ -1287,7 +1291,10 @@ class NeroRobot:
                             setter = getattr(self.robot, f"set_cpv_{name}", None)
                             if setter is None:
                                 raise RuntimeError(f"NERO SDK does not expose set_cpv_{name}")
-                            acknowledgement = bool(setter(joint_index=joint_index, **{name: value}, timeout=1.0))
+                            # v120 may apply the value without the legacy 0xAC
+                            # ACK. Do not stall every joint for a whole second;
+                            # the unchanged bounded read-back below decides success.
+                            acknowledgement = bool(setter(joint_index=joint_index, **{name: value}, timeout=0.05))
                         # Some v120 firmware revisions apply a setting but do
                         # not emit the legacy 0xAC acknowledgement expected by
                         # the inherited v112 SDK.  Read-back is therefore the

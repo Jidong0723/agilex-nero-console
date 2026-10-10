@@ -7,7 +7,7 @@
       "height": 480
     },
     "wrist": {
-      "index": 2,
+      "index": 1,
       "width": 640,
       "height": 480
     },
@@ -17,9 +17,9 @@
   "model": {
     "host": "127.0.0.1",
     "port": 8000,
-    "request_timeout_s": 30.0,
+    "request_timeout_s": 30,
     "prompt": "Pick up the yellow cube and move it to the P1 area.",
-    "checkpoint_label": "Nero LoRA checkpoint 6000"
+    "checkpoint_label": "NERO H20 20Hz LoRA step8000"
   },
   "connection": {
     "ssh_forward_host": "127.0.0.1",
@@ -29,17 +29,31 @@
   },
   "execution": {
     "period_s": 0.05,
-    "expected_chunk_steps": 10,
-    "replan_steps": 5,
-    "max_chunk_steps": 10,
+    "expected_chunk_steps": 20,
+    "replan_steps": 10,
+    "max_chunk_steps": 20,
     "osc_state_poll_s": 0.05,
     "startup_hold_s": 0.3,
-    "action_delta_scale": 1.0
+    "action_delta_scale": 1.0,
+    "arrival_wait_s": 0.15,
+    "arrival_position_tolerance_m": 0.003,
+    "arrival_orientation_tolerance_rad": 0.03490658503988659
   },
   "gripper": {
-    "min_width_m": 0.0,
+    "min_width_m": 0,
     "max_width_m": 0.095,
     "force_n": 0.8,
     "dedupe_tolerance_ratio": 0.01
+  },
+  "inference_profiles": {
+    "active": "local5090",
+    "autodl": {
+      "host": "127.0.0.1",
+      "port": 8001
+    },
+    "local5090": {
+      "host": "127.0.0.1",
+      "port": 8000
+    }
   }
 }

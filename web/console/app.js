@@ -142,8 +142,8 @@
     if (observation) row.append(observation);
     row.append(inferenceStack);
     panel.replaceChildren(row, connection, actionControls);
-    $("pi05-start").textContent = "开始 AutoDL云端推理";
-    $("pi05-stop").textContent = "停止 AutoDL云端推理";
+    $("pi05-start").textContent = "开始 " + ($("input-adapter")?.value === "pi05-local" ? "5090本地推理" : "AutoDL云端推理");
+    $("pi05-stop").textContent = "停止 " + ($("input-adapter")?.value === "pi05-local" ? "5090本地推理" : "AutoDL云端推理");
     [".sticks", ".intent-readout", ".keyboard-map", ".session-actions", "#pico-connection"].forEach((selector) => document.querySelector(selector)?.setAttribute("data-web-adapter", ""));
   }
 
@@ -364,7 +364,10 @@
     }
   }
 
-  const selectedAdapter = () => $("input-adapter")?.value || "web";
+  const selectedAdapter = () => {
+    const value = $("input-adapter")?.value || "web";
+    return value === "pi05-local" ? "pi05" : value;
+  };
   function applyAdapterSelection() {
     const pi = selectedAdapter() === "pi05";
     const pico = selectedAdapter() === "pico";
@@ -700,8 +703,8 @@
     if ($("pi05-cameras")) $("pi05-cameras").disabled = pi.state === "RUNNING";
     $("pi05-start").disabled = pi.execution_enabled === true || !pi.camera_ready;
     $("pi05-stop").disabled = pi.execution_enabled !== true;
-    $("pi05-start").textContent = "开始 AutoDL云端推理";
-    $("pi05-stop").textContent = "停止 AutoDL云端推理";
+    $("pi05-start").textContent = "开始 " + ($("input-adapter")?.value === "pi05-local" ? "5090本地推理" : "AutoDL云端推理");
+    $("pi05-stop").textContent = "停止 " + ($("input-adapter")?.value === "pi05-local" ? "5090本地推理" : "AutoDL云端推理");
     renderPi05Connections(pi.connections || {});
   }
 

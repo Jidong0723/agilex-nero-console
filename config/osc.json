@@ -29,14 +29,15 @@
     "arrival_timeout_s": 10.0
   },
   "state_estimator": {
-    "enabled": true
+    "enabled": true,
+    "max_prediction_s": 0.0307992
   },
   "shadow_transport": {
     "enabled": true,
     "dispatch_delay_s": 0.01,
     "dispatch_jitter_s": 0.002,
-    "feedback_delay_s": 0.010628799999999999,
-    "feedback_jitter_s": 2.8e-05,
+    "feedback_delay_s": 0.0102838,
+    "feedback_jitter_s": 1.1700000000000001e-05,
     "position_time_constant_s": 0.06
   },
   "shadow_initial_joints_rad": [
@@ -198,42 +199,42 @@
   "hardware_readonly_calibration": {
     "source": "read_only_idle_can_probe",
     "sample_count": 20,
-    "feedback_delay_s": 0.010628799999999999,
-    "feedback_jitter_s": 2.8e-05,
+    "feedback_delay_s": 0.0102838,
+    "feedback_jitter_s": 1.1700000000000001e-05,
     "actuator_response_identified": false,
     "actuator_response_note": "requires an explicitly authorized CPV position-response experiment",
-    "feedback_read_duration_p50_s": 1.41e-05,
-    "feedback_read_duration_p95_s": 4.21e-05,
-    "feedback_inter_request_p95_s": 0.0211734,
+    "feedback_read_duration_p50_s": 1.44e-05,
+    "feedback_read_duration_p95_s": 2.61e-05,
+    "feedback_inter_request_p95_s": 0.0205154,
     "cpv_parameters": {
       "status": "available",
       "values": {
         "acc": [
-          5.0,
-          5.0,
-          5.0,
-          5.0,
-          5.0,
-          5.0,
-          5.0
+          10.0,
+          10.0,
+          10.0,
+          10.0,
+          10.0,
+          10.0,
+          10.0
         ],
         "dcc": [
-          5.0,
-          5.0,
-          5.0,
-          5.0,
-          5.0,
-          5.0,
-          5.0
+          10.0,
+          10.0,
+          10.0,
+          10.0,
+          10.0,
+          10.0,
+          10.0
         ],
         "cv": [
-          1.5,
-          1.5,
-          1.5,
-          1.5,
-          1.5,
-          1.5,
-          1.5
+          2.0,
+          2.0,
+          2.0,
+          2.0,
+          2.0,
+          2.0,
+          2.0
         ],
         "pp": [
           5.0,
@@ -264,10 +265,10 @@
         ]
       },
       "missing": [],
-      "read_started_monotonic_ns": 76500828000000,
-      "read_finished_monotonic_ns": 76501171000000
+      "read_started_monotonic_ns": 6541921000000,
+      "read_finished_monotonic_ns": 6542281000000
     },
-    "applied_at": "2026-08-12T14:02:38"
+    "applied_at": "2026-10-10T20:35:07"
   },
   "tcp": {
     "offset_from_link7_m": [

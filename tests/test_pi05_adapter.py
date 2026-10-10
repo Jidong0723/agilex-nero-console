@@ -24,9 +24,9 @@ class _Policy:
 
     def infer(self, observation):
         self.observations.append(observation)
-        # Ten-step Nero chunk. Every step is converted against one shared
+        # H20 Nero chunk. Every step is converted against one shared
         # pre-inference feedback pose; only the first five are executed.
-        return {"actions": np.asarray([[.01, 0., 0., 0., 0., 0., 1.]] * 10, dtype=np.float32)}
+        return {"actions": np.asarray([[.01, 0., 0., 0., 0., 0., 1.]] * 20, dtype=np.float32)}
 
     def close(self):
         pass
@@ -55,11 +55,11 @@ class _Broker:
 
     def track_tcp(self, session_id, client_id, sequence, target_pose):
         if self.fail_control: raise RuntimeError("simulated OSC outage")
-        started_at = time.monotonic()
+        started_at = time.perf_counter()
         if self.track_delay_s:
             time.sleep(self.track_delay_s)
         self.commands.append({"session_id": session_id, "client_id": client_id, "sequence": sequence, "type": "track_tcp", "payload": {"target_pose": target_pose},
-                              "started_at": started_at, "completed_at": time.monotonic()})
+                              "started_at": started_at, "completed_at": time.perf_counter()})
         return {"ok": True, "result": {"accepted": True}}
     def gripper(self, session_id, client_id, sequence, payload):
         self.commands.append({"session_id": session_id, "client_id": client_id, "sequence": sequence, "type": "gripper", "payload": payload})
@@ -168,7 +168,7 @@ class Pi05AdapterTests(unittest.TestCase):
         """A tiny float32 endpoint overshoot must not stop AutoDL control."""
         class BoundaryPolicy(_Policy):
             def infer(self, observation):
-                return {"actions": np.asarray([[.01, 0., 0., 0., 0., 0., 1.0005]] * 10, dtype=np.float32)}
+                return {"actions": np.asarray([[.01, 0., 0., 0., 0., 0., 1.0005]] * 20, dtype=np.float32)}
 
         broker = _Broker()
         adapter = Pi05InputAdapter(broker, Path(__file__).resolve().parents[1] / "config" / "pi05.json")
@@ -215,7 +215,7 @@ class Pi05AdapterTests(unittest.TestCase):
     def test_workspace_preflight_rejects_whole_chunk_before_first_dispatch(self):
         class OutsideWorkspacePolicy(_Policy):
             def infer(self, observation):
-                return {"actions": np.asarray([[1., 0., 0., 0., 0., 0., .5]] * 10, dtype=np.float32)}
+                return {"actions": np.asarray([[1., 0., 0., 0., 0., 0., .5]] * 20, dtype=np.float32)}
 
         broker = _Broker()
         original_state = broker.state
@@ -303,8 +303,8 @@ class Pi05AdapterTests(unittest.TestCase):
         # feedback pose captured for the inference observation.
         for item in motions:
             self.assertAlmostEqual(item["payload"]["target_pose"]["position_m"][0], .01, places=6)
-        self.assertEqual(snapshot["action_chunk_length"], 10)
-        self.assertEqual(len(snapshot["absolute_tcp_chunk"]), 10)
+        self.assertEqual(snapshot["action_chunk_length"], 20)
+        self.assertEqual(len(snapshot["absolute_tcp_chunk"]), 20)
         self.assertEqual(snapshot["inference_base_tcp"]["position_m"], [0., 0., .3])
 
     def test_slow_inference_does_not_burst_action_chunk_dispatches(self):
@@ -314,7 +314,7 @@ class Pi05AdapterTests(unittest.TestCase):
             def infer(self, observation):
                 time.sleep(.06)
                 response = super().infer(observation)
-                type(self).inference_completed_at = time.monotonic()
+                type(self).inference_completed_at = time.perf_counter()
                 return response
 
         broker = _Broker()

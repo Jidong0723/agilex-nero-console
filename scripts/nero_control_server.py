@@ -1256,6 +1256,16 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 return self._json_ok(self.broker.osc_calibrate_readonly_hardware(samples))
             if parsed.path == "/api/pi05/state":
                 return self._json_ok(self.runtime.require_adapters().pi05_state())
+            if parsed.path == "/api/pi05/log/export":
+                filename, payload = self.runtime.require_adapters().pi05.export_last_run_log()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             if parsed.path == "/api/cameras/state":
                 return self._json_ok(self.runtime.require_adapters().camera_state())
             if parsed.path == "/api/dataset/state":

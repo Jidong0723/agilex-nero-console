@@ -313,8 +313,9 @@ class OperationalSpaceController:
                 if not result.get("ok"):
                     self._set_authority(ArmWriter.NONE, ServoMode.SUSPENDED, "FREEDRIVE exit failed")
                     raise RuntimeError(f"cannot exit FREEDRIVE: {result}")
-            # Read actual firmware settings, not the historical calibration
-            # snapshot. Mode/linkage changes may invalidate an earlier read.
+            # Apply the explicitly configured profile while output is stopped.
+            cv, acc = self._osc.cpv_limits()
+            self._configure_cpv_profile(cv, acc, acc)
             self._verify_cpv_profile("before_cpv_prime")
             state = self._set_authority(ArmWriter.SERVO, ServoMode.HOLDING, "osc session prepared", advance_epoch=True)
             # Prime CPV while the session is still in HOLDING. The first
@@ -338,6 +339,10 @@ class OperationalSpaceController:
                 )
                 if isinstance(prime_result, dict):
                     self._last_cpv_mode_entry = dict(prime_result.get("cpv_mode_entry") or {})
+                # Firmware mode entry can restore its default speed. Restore
+                # the operator's CV/ACC/DCC, then retain the upstream verifier.
+                cv, acc = self._osc.cpv_limits()
+                self._configure_cpv_profile(cv, acc, acc)
                 self._verify_cpv_profile("after_cpv_prime")
             except TimeoutError as exc:
                 revoke_preparation()
@@ -1246,11 +1251,20 @@ class OperationalSpaceController:
             )
         elif command_type == "gripper":
             width = payload.get("width_m")
+            inference_stream = payload.get("inference_stream") is True
+            if inference_stream:
+                session = self._osc.status().get("session") or {}
+                if session.get("state") != "ACTIVE" or session.get("id") != body.get("session_id") or session.get("client_id") != body.get("client_id"):
+                    raise PermissionError("inference gripper requires the caller's active OSC session")
+                if session.get("execution_mode") == "shadow":
+                    return {"ok": True, "result": {"ok": True, "sent": False,
+                        "robot_commands_sent": False, "shadow": True, "target_width_m": width}}
             result = self.command_gripper(
                 str(payload.get("mode", "")),
                 float(width) if width is not None else None,
                 float(payload.get("force_n", 1.0)),
                 bool(payload.get("preserve_on_freedrive", False)),
+                **({"inference_stream": True} if inference_stream else {}),
             )
         else:
             raise ValueError("OSC command type must be track_tcp, move_tcp, hold, stop, freedrive, or gripper")
@@ -1920,6 +1934,7 @@ class OperationalSpaceController:
         force_n: float,
         preserve_on_freedrive: bool,
         resume_osc: bool = False,
+        inference_stream: bool = False,
     ) -> dict[str, Any]:
         # HOLD is the safety escape from a tracking session. Hardware status
         # polling is deliberately paused while CPV owns the transport, so a
@@ -1956,6 +1971,7 @@ class OperationalSpaceController:
                 width_m=width_m,
                 force_n=force_n,
                 preserve_on_freedrive=preserve_on_freedrive,
+                **({"inference_stream": True} if inference_stream else {}),
             )
             result["arm_hold"] = arm_hold
             return result
