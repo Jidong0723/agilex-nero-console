@@ -78,6 +78,14 @@ class CameraPair:
                 self.sources[key] = None
         if not self.captures:
             raise RuntimeError("cannot open any configured camera")
+        # Query fixed device properties at activation, not during HTTP polls
+        # that share the frame lock with inference and the recorder.
+        self._device_properties = {}
+        for source in ("external", "wrist"):
+            try:
+                self._device_properties[source] = self._query_diagnostics(source)
+            except Exception as exc:
+                self._device_properties[source] = {"backend": "opencv", "diagnostics_error": str(exc)}
         self.read_pool = ThreadPoolExecutor(max_workers=len(self.captures), thread_name_prefix="nero-camera-read")
         self.pending_reads: dict[int, Future[Any]] = {
             index: self.read_pool.submit(self._read_one, index, capture)
@@ -132,6 +140,9 @@ class CameraPair:
         return self.sources.get(source) is not None
 
     def diagnostics(self, source: str) -> dict[str, Any]:
+        return copy.deepcopy(self._device_properties.get(source, {"backend": None}))
+
+    def _query_diagnostics(self, source: str) -> dict[str, Any]:
         capture = self.sources.get(source)
         if capture is None or isinstance(capture, RealSenseRgbCapture):
             return {"backend": "librealsense" if capture is not None else None}
