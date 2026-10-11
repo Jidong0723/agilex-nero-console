@@ -686,6 +686,9 @@ class NeroRobot:
                 "click HOLD before operating the gripper"
             )
         mode = str(mode).lower()
+        inference_position = mode == "position_inference"
+        if inference_position:
+            mode = "position"
         if mode not in {"open", "grip", "position"}:
             raise ValueError(f"unsupported gripper mode: {mode}")
         if mode == "open":
@@ -709,6 +712,29 @@ class NeroRobot:
 
         before = self.read_gripper()
         before_health = self._gripper_health(before)
+        if inference_position:
+            # Called by the existing sole hardware sender. Return a dispatch
+            # receipt, not an arrival confirmation; never sleep on that sender.
+            ready = (bool(self._cpv_stream_started) and self._control_mode != "FREEDRIVE"
+                     and not self._gripper_requires_enable_clear and before_health.get("ok", False))
+            command = None
+            if ready:
+                with self._command_lock:
+                    command = call_safe("move_gripper_m", lambda: self.gripper.move_gripper_m(value=width_m, force=force_n))
+            sent = bool(command and command.get("ok") and command.get("value") is not False)
+            reason = ("sent; feedback confirmation pending" if sent else
+                      str(command.get("error", "gripper send failed")) if command else
+                      "active CPV and a healthy enabled gripper are required; recover in HOLD")
+            return {
+                "ok": sent, "sent": sent, "mode": mode, "requested_mode": "position_inference",
+                "target_width_m": width_m, "force_n": force_n, "reason": reason,
+                "feedback_pending": sent, "feedback_confirmed": False, "target_reached": None,
+                "command": command, "commands": [command] if command else [],
+                "before": before.to_dict(), "gripper": before.to_dict(), "health": before_health,
+                "recovered_from_disabled": False, "preserve_on_freedrive": False,
+                "requested_preserve_on_freedrive": requested_preserve_on_freedrive,
+                "gripper_hold": self.get_gripper_hold_state(),
+            }
         recoverable_faults = {"driver_disabled", "feedback_unavailable"}
         blocking_faults = [
             fault for fault in before_health.get("faults", [])
@@ -1287,7 +1313,10 @@ class NeroRobot:
                             setter = getattr(self.robot, f"set_cpv_{name}", None)
                             if setter is None:
                                 raise RuntimeError(f"NERO SDK does not expose set_cpv_{name}")
-                            acknowledgement = bool(setter(joint_index=joint_index, **{name: value}, timeout=1.0))
+                            # v120 can apply the parameter without emitting the
+                            # legacy ACK. Bound only that optional ACK wait;
+                            # the unchanged read-back below remains mandatory.
+                            acknowledgement = bool(setter(joint_index=joint_index, **{name: value}, timeout=0.1))
                         # Some v120 firmware revisions apply a setting but do
                         # not emit the legacy 0xAC acknowledgement expected by
                         # the inherited v112 SDK.  Read-back is therefore the

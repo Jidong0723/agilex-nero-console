@@ -19,7 +19,7 @@
     "port": 8000,
     "request_timeout_s": 30.0,
     "prompt": "Pick up the yellow cube and move it to the P1 area.",
-    "checkpoint_label": "Nero LoRA checkpoint 6000"
+    "checkpoint_label": "NERO 11649 H10"
   },
   "connection": {
     "ssh_forward_host": "127.0.0.1",
@@ -34,7 +34,23 @@
     "max_chunk_steps": 10,
     "osc_state_poll_s": 0.05,
     "startup_hold_s": 0.3,
-    "action_delta_scale": 1.0
+    "action_delta_scale": 1.0,
+    "arrival_wait_s": 0.1
+  },
+  "inference_profiles": {
+    "active": "local5090",
+    "autodl": {
+      "host": "127.0.0.1",
+      "port": 8001,
+      "checkpoint_label": "Nero LoRA checkpoint 6000"
+    },
+    "local5090": {
+      "host": "127.0.0.1",
+      "port": 8000,
+      "checkpoint_label": "NERO 11649 H10",
+      "expected_chunk_steps": 10,
+      "replan_steps": 5
+    }
   },
   "gripper": {
     "min_width_m": 0.0,
