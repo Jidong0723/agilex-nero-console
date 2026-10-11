@@ -983,6 +983,9 @@ class _OperationalSpaceServo:
         self.impedance_output = None
         self.limits, self.runtime = config.get("limits", {}), config.get("runtime", {})
         self._validate_tuning_config()
+        from motion.osc_tuning import OscTuning
+        self.tuning = OscTuning(config, project_root / "config" / "osc.json")
+        self._cycle_tuning_revision = -1
         # Import lazily: supervisor.control imports this module, while the
         # trace writer itself lives in supervisor.logging.
         from supervisor.logging import AsyncJsonlTraceLogger
@@ -1808,6 +1811,11 @@ class _OperationalSpaceServo:
             next_tick = tick + period
             actual_dt = period if previous_tick is None else tick - previous_tick; previous_tick = tick
             try:
+                tuning_revision, tuning = self.tuning.snapshot()
+                if tuning_revision != self._cycle_tuning_revision:
+                    self._arrival_since_monotonic_ns = 0
+                    self._arrival_reached = False
+                    self._cycle_tuning_revision = tuning_revision
                 with self.lock:
                     session = dict(self.session) if self.session else None; command = dict(self.command) if self.command else None; self.loop_count += 1
                 if not session or session.get("state") != "ACTIVE": continue
@@ -2020,9 +2028,10 @@ class _OperationalSpaceServo:
                 # OSC accepts an absolute TCP setpoint.  Never extrapolate a
                 # jittery, paused, or discontinuous adapter stream beyond
                 # that setpoint; Pink receives exactly what the adapter sent.
-                solver_config = self.config.get("solver", {})
+                solver_config = {**self.config.get("solver", {}), **tuning}
                 request = {"sequence": int((command or {}).get("sequence", session.get("sequence", 0))), "control_sample_id": sample_id, "target_generation": target_generation, "motion_epoch": epoch, "joint_angles_rad": q, "measured_joint_angles_rad": measured_q, "joint_state_monotonic_ns": now_ns, "target_position_m": target_pose["position_m"], "target_orientation_xyzw": target_pose["orientation_xyzw"], "command_target_position_m": target_pose["position_m"], "command_target_orientation_xyzw": target_pose["orientation_xyzw"], "last_sent_joint_velocity_rad_s": self.last_sent_velocity, "joint_speed_limit_rad_s": data["speed_rad_s"], "joint_acceleration_limit_rad_s2": data["acceleration_rad_s2"], "soft_lower_rad": data["soft_lower_rad"], "soft_upper_rad": data["soft_upper_rad"], "posture_reference_rad": self.posture_reference or q, "posture_cost": float(solver_config.get("posture_cost", 0.001)), "damping_cost": float(solver_config.get("damping_cost", 0.01)), "frame_position_cost": float(solver_config.get("frame_position_cost", 8.0)), "frame_orientation_cost": float(solver_config.get("frame_orientation_cost", 1.0)), "frame_gain": float(solver_config.get("frame_gain", 0.5)), "frame_lm_damping": float(solver_config.get("frame_lm_damping", 1.0)), "joint_center_cost": float(solver_config.get("joint_center_cost", 0.0003)), "joint_center_deadband": float(solver_config.get("joint_center_deadband", 0.70)), "feedback_limit_tolerance_rad": float(solver_config.get("feedback_limit_tolerance_rad", 0.03)), "dt_s": dispatch_dt}
                 request["joint_angles_rad"] = planning_q
+                request["tuning_revision"] = tuning_revision
                 # Planning uses the output reference; arrival/telemetry still
                 # describe the real arm, not completion of the reference alone.
                 request["report_measured_error"] = True
@@ -2035,6 +2044,8 @@ class _OperationalSpaceServo:
                         pink = self.solver.poll(epoch, target_generation, 0)
                     except TypeError:
                         pink = self.solver.poll(epoch, target_generation)
+                if pink and pink.get("tuning_revision", tuning_revision) != tuning_revision:
+                    pink = None
                 if pink and pink.get("ok"):
                     self._solver_reuse_count = 0
                 solver_age = None if not pink else max(0.0, (time.monotonic_ns() - int(pink.get("joint_state_monotonic_ns") or pink.get("solver_monotonic_ns", time.monotonic_ns()))) / 1e9)
@@ -2054,6 +2065,7 @@ class _OperationalSpaceServo:
                     with self.lock:
                         self.execution_sample = {
                             "sample_id": sample_id,
+                            "tuning_revision": tuning_revision,
                             "feedback_revision": int((feedback or {}).get("revision", 0)),
                             "target_generation": target_generation,
                             "sample_monotonic_ns": int(pink.get("joint_state_monotonic_ns") or now_ns),
@@ -2199,10 +2211,10 @@ class _OperationalSpaceServo:
                         result_reason = "CPV joint-position batch sent with final safety gate velocity limit"
                     self._set_result(gate_ok, result_reason, robot_commands_sent=False, solver=pink if pink and pink.get("ok") else None, supervisor=supervisor_report, gate_reason=gate_reason, gate_limited=gate_limited, final_joint_target_rad=list(position_target), final_joint_velocity_rad_s=list(final_velocity), cpv_mailbox=publication)
                 with self.lock:
-                    arrival_position = float(self.config.get("osc", {}).get("arrival_position_tolerance_m", 0.0005))
-                    arrival_orientation = float(self.config.get("osc", {}).get("arrival_orientation_tolerance_rad", math.radians(0.25)))
-                    arrival_velocity = float(self.config.get("osc", {}).get("arrival_joint_velocity_tolerance_rad_s", 0.005))
-                    arrival_dwell_s = float(self.config.get("osc", {}).get("arrival_dwell_s", 0.25))
+                    arrival_position = tuning["arrival_position_tolerance_m"]
+                    arrival_orientation = tuning["arrival_orientation_tolerance_rad"]
+                    arrival_velocity = tuning["arrival_joint_velocity_tolerance_rad_s"]
+                    arrival_dwell_s = tuning["arrival_dwell_s"]
                     # A late solver reply is deliberately rejected for output,
                     # but it must not break an already-stable arrival dwell.
                     # Use only an execution sample that belongs to the current
@@ -2212,6 +2224,7 @@ class _OperationalSpaceServo:
                     arrival_matches_target = bool(
                         arrival_sample
                         and int(arrival_sample.get("target_generation", -1)) == target_generation
+                        and arrival_sample.get("tuning_revision", tuning_revision) == tuning_revision
                     )
                     arrival_ok = bool(
                         arrival_matches_target
@@ -2424,6 +2437,20 @@ class OscRuntime:
             float(self._servo.config.get("solver", {}).get("joint_acceleration_limit_rad_s2", 5.0)),
         )
 
+    def tuning_state(self) -> dict[str, Any]:
+        return self._servo.tuning.public()
+
+    def apply_tuning(self, values: dict, save: bool = False, expected_revision: int | None = None) -> dict[str, Any]:
+        return self._servo.tuning.apply(values, save, expected_revision)
+
+    def persist_configuration(self, path: Path) -> None:
+        # Serialize calibration saves with tuning saves, so an older
+        # calibration snapshot cannot overwrite newly saved startup tuning.
+        with self._servo.tuning.apply_lock:
+            temporary = path.with_suffix(".json.tmp")
+            temporary.write_text(self.configuration_json(), encoding="utf-8")
+            temporary.replace(path)
+
     def apply_hardware_calibration(self, calibration: dict[str, Any], feedback: dict[str, Any], cpv_parameters: dict[str, Any]) -> dict[str, Any]:
         shadow = self._servo.config.setdefault("shadow_transport", {})
         estimator = self._servo.config.setdefault("state_estimator", {})
@@ -2451,4 +2478,8 @@ class OscRuntime:
         }
 
     def configuration_json(self) -> str:
-        return json.dumps(self._servo.config, ensure_ascii=False, indent=2) + "\n"
+        from motion.osc_tuning import FIELDS
+        config = json.loads(json.dumps(self._servo.config))
+        for key, value in self.tuning_state()["startup"].items():
+            config.setdefault(FIELDS[key][0], {})[key] = value
+        return json.dumps(config, ensure_ascii=False, indent=2) + "\n"

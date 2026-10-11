@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -24,9 +26,9 @@ class _Policy:
 
     def infer(self, observation):
         self.observations.append(observation)
-        # H20 Nero chunk. Every step is converted against one shared
+        # Ten-step Nero chunk. Every step is converted against one shared
         # pre-inference feedback pose; only the first five are executed.
-        return {"actions": np.asarray([[.01, 0., 0., 0., 0., 0., 1.]] * 20, dtype=np.float32)}
+        return {"actions": np.asarray([[.01, 0., 0., 0., 0., 0., 1.]] * 10, dtype=np.float32)}
 
     def close(self):
         pass
@@ -55,11 +57,11 @@ class _Broker:
 
     def track_tcp(self, session_id, client_id, sequence, target_pose):
         if self.fail_control: raise RuntimeError("simulated OSC outage")
-        started_at = time.perf_counter()
+        started_at = time.monotonic()
         if self.track_delay_s:
             time.sleep(self.track_delay_s)
         self.commands.append({"session_id": session_id, "client_id": client_id, "sequence": sequence, "type": "track_tcp", "payload": {"target_pose": target_pose},
-                              "started_at": started_at, "completed_at": time.perf_counter()})
+                              "started_at": started_at, "completed_at": time.monotonic()})
         return {"ok": True, "result": {"accepted": True}}
     def gripper(self, session_id, client_id, sequence, payload):
         self.commands.append({"session_id": session_id, "client_id": client_id, "sequence": sequence, "type": "gripper", "payload": payload})
@@ -74,6 +76,18 @@ class _Broker:
 
 class Pi05AdapterTests(unittest.TestCase):
     def setUp(self):
+        self._fixture_dir = tempfile.TemporaryDirectory()
+        original_path = Path(__file__).resolve().parents[1] / "config" / "pi05.json"
+        fixture_path = Path(self._fixture_dir.name) / "config" / "pi05.json"
+        fixture_path.parent.mkdir()
+        configuration = json.loads(original_path.read_text(encoding="utf-8"))
+        configuration['execution'].update(expected_chunk_steps=10,replan_steps=5,max_chunk_steps=10)
+        fixture_path.write_text(json.dumps(configuration),encoding="utf-8")
+        original_init = Pi05InputAdapter.__init__
+        def isolated_init(adapter, osc, config_path, camera_resource=None):
+            return original_init(adapter,osc,fixture_path if Path(config_path)==original_path else config_path,camera_resource)
+        self._fixture_patch = patch.object(Pi05InputAdapter,'__init__',isolated_init)
+        self._fixture_patch.start()
         # Pi05InputAdapter starts its connection owner during construction.
         # Never let that thread pick up an operator's real 127.0.0.1:8000
         # tunnel before an individual test explicitly installs its own policy.
@@ -82,6 +96,8 @@ class Pi05AdapterTests(unittest.TestCase):
 
     def tearDown(self):
         self._initial_policy_patch.stop()
+        self._fixture_patch.stop()
+        self._fixture_dir.cleanup()
 
     def test_openpi_msgpack_packer_preserves_rgb_array_shapes(self):
         """The live OpenPI server requires Packer's binary ndarray markers."""
@@ -168,7 +184,7 @@ class Pi05AdapterTests(unittest.TestCase):
         """A tiny float32 endpoint overshoot must not stop AutoDL control."""
         class BoundaryPolicy(_Policy):
             def infer(self, observation):
-                return {"actions": np.asarray([[.01, 0., 0., 0., 0., 0., 1.0005]] * 20, dtype=np.float32)}
+                return {"actions": np.asarray([[.01, 0., 0., 0., 0., 0., 1.0005]] * 10, dtype=np.float32)}
 
         broker = _Broker()
         adapter = Pi05InputAdapter(broker, Path(__file__).resolve().parents[1] / "config" / "pi05.json")
@@ -215,7 +231,7 @@ class Pi05AdapterTests(unittest.TestCase):
     def test_workspace_preflight_rejects_whole_chunk_before_first_dispatch(self):
         class OutsideWorkspacePolicy(_Policy):
             def infer(self, observation):
-                return {"actions": np.asarray([[1., 0., 0., 0., 0., 0., .5]] * 20, dtype=np.float32)}
+                return {"actions": np.asarray([[1., 0., 0., 0., 0., 0., .5]] * 10, dtype=np.float32)}
 
         broker = _Broker()
         original_state = broker.state
@@ -293,18 +309,18 @@ class Pi05AdapterTests(unittest.TestCase):
         motions = [item for item in broker.commands if item["type"] == "track_tcp"][:5]
         self.assertEqual(len(motions), 5)
         motion = motions[0]
-        gripper = next(item for item in broker.commands if item["type"] == "gripper")
+        # Shadow inference must never call the physical gripper port.
+        self.assertFalse(any(item["type"] == "gripper" for item in broker.commands))
         self.assertEqual(motion["type"], "track_tcp")
         # AutoDL values are physical Nero metres; no LIBERO sign or scale is applied.
         self.assertAlmostEqual(motion["payload"]["target_pose"]["position_m"][0], .01, places=6)
-        self.assertEqual(gripper["type"], "gripper")
-        self.assertAlmostEqual(gripper["payload"]["width_m"], .095)
+        self.assertAlmostEqual(adapter._last_gripper_target, .095)
         # Targets are not cumulative inside the chunk: all five use the same
         # feedback pose captured for the inference observation.
         for item in motions:
             self.assertAlmostEqual(item["payload"]["target_pose"]["position_m"][0], .01, places=6)
-        self.assertEqual(snapshot["action_chunk_length"], 20)
-        self.assertEqual(len(snapshot["absolute_tcp_chunk"]), 20)
+        self.assertEqual(snapshot["action_chunk_length"], 10)
+        self.assertEqual(len(snapshot["absolute_tcp_chunk"]), 10)
         self.assertEqual(snapshot["inference_base_tcp"]["position_m"], [0., 0., .3])
 
     def test_slow_inference_does_not_burst_action_chunk_dispatches(self):
@@ -314,7 +330,7 @@ class Pi05AdapterTests(unittest.TestCase):
             def infer(self, observation):
                 time.sleep(.06)
                 response = super().infer(observation)
-                type(self).inference_completed_at = time.perf_counter()
+                type(self).inference_completed_at = time.monotonic()
                 return response
 
         broker = _Broker()

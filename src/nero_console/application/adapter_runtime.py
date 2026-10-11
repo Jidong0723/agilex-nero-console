@@ -24,6 +24,7 @@ class OscClientPort(Protocol):
     """The complete robot-facing surface available to input adapters."""
 
     def state(self) -> dict[str, Any]: ...
+    def inference_gripper_feedback(self) -> dict[str, Any]: ...
     def sensor_sample(self, target_monotonic_ns: int, wait_s: float = 0.0) -> dict[str, Any] | None: ...
     def sensor_samples_after(self, revision: int, wait_s: float = 0.0, max_items: int = 128) -> list[dict[str, Any]]: ...
     def input_context(self) -> dict[str, Any]: ...
@@ -45,6 +46,13 @@ class OscClient:
 
     def state(self) -> dict[str, Any]:
         return self._broker.osc_state()
+
+    def inference_gripper_feedback(self) -> dict[str, Any]:
+        # The backend already binds this getter for read-only dataset sampling.
+        # Reuse it without changing OSC/status caching or creating a CAN query.
+        # SDK get_gripper_status only reads the parser's latest received message.
+        feedback = self._broker._dataset_read_gripper()
+        return feedback.to_dict() if hasattr(feedback,'to_dict') else dict(feedback)
 
     def sensor_sample(self, target_monotonic_ns: int, wait_s: float = 0.0) -> dict[str, Any] | None:
         return self._broker.osc_sensor_sample(int(target_monotonic_ns), float(wait_s))

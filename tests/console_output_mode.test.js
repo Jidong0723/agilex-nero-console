@@ -22,6 +22,7 @@ function fixture(mode = "cpv") {
     return nodes.get(id);
   };
   const requests = [];
+  for (const id of ["cpv-speed-input", "cpv-acceleration-input", "cpv-save-startup"]) element(id);
   const context = vm.createContext({
     document: { getElementById: element, querySelector: () => null, querySelectorAll: () => [] },
     sessionStorage: { getItem: () => "browser-test" },
@@ -38,7 +39,8 @@ function fixture(mode = "cpv") {
     drawWorkspace = renderHierarchy = renderPi05 = renderPico = renderDataset = renderCameraControls = () => {};
     globalThis.consoleTest = { state, render, updateOscState, connectWebAdapter, disconnectWebAdapter,
       reanchorWebAdapter, sendIntent, heartbeat, refresh, selectOutputMode, resetWebAdapter,
-      renderDataset: renderCollection, datasetPreview, startDataset };
+      renderDataset: renderCollection, datasetPreview, startDataset, renderOscTuning, applyOscTuning,
+      renderCpvProfile, applyCpvProfile };
   })();`, context);
   const app = context.consoleTest;
   let handler = async (url) => url === "/api/osc/state" ? app.state.osc : {};
@@ -59,6 +61,67 @@ function deferred() {
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
+
+test("CPV table separates hardware readback, drafts and startup values", () => {
+  const f = fixture();
+  f.app.state.osc.transport = {
+    cpv_parameters: { status: "available", values: { cv: Array(7).fill(1), acc: Array(7).fill(3), dcc: Array(7).fill(4) } },
+    cpv_profile_defaults: { cv_rad_s: 2, acc_rad_s2: 10, dcc_rad_s2: 10 },
+  };
+  f.app.renderCpvProfile();
+  assert.equal(f.nodes.get("cpv-running-speed").textContent, "1.000");
+  assert.equal(f.nodes.get("cpv-running-acceleration").textContent, "ACC 3.000 / DCC 4.000");
+  assert.equal(f.nodes.get("cpv-startup-speed").textContent, "2.000");
+  f.nodes.get("cpv-speed-input").value = "1.75";
+  f.app.renderCpvProfile();
+  assert.equal(f.nodes.get("cpv-speed-input").value, "1.75");
+});
+
+test("CPV single setting sends whole group with explicit save choice", async () => {
+  for (const save of [false, true]) {
+    const f = fixture();
+    f.app.renderCpvProfile();
+    f.nodes.get("cpv-speed-input").value = "1.5";
+    f.nodes.get("cpv-acceleration-input").value = "8";
+    f.nodes.get("cpv-save-startup").checked = save;
+    f.route(async () => ({ saved_startup: save, readback: { status: "available", values: { cv: Array(7).fill(1.5) } },
+      cpv_profile_defaults: { cv_rad_s: save ? 1.5 : 2, acc_rad_s2: save ? 8 : 10, dcc_rad_s2: save ? 8 : 10 } }));
+    await f.app.applyCpvProfile();
+    assert.deepEqual(f.requests, [{ url: "/api/osc/cpv-parameters", body: { values: { cv_rad_s: 1.5, acc_dcc_rad_s2: 8 }, save_startup: save } }]);
+    assert.equal(f.nodes.get("cpv-startup-speed").textContent, save ? "1.500" : "2.000");
+    assert.equal(f.nodes.get("cpv-running-speed").textContent, "1.500");
+    assert.match(f.nodes.get("cpv-maintenance-result").textContent, save ? /保存为启动配置/ : /启动配置未改变/);
+  }
+});
+
+test("CPV rejects invalid groups and suppresses concurrent double-clicks", async () => {
+  const f = fixture();
+  f.app.renderCpvProfile();
+  f.nodes.get("cpv-speed-input").value = "2";
+  f.nodes.get("cpv-acceleration-input").value = "11";
+  await f.app.applyCpvProfile();
+  assert.equal(f.requests.length, 0);
+  f.nodes.get("cpv-acceleration-input").value = "10";
+  const pending = deferred();
+  f.route(() => pending.promise);
+  const call = f.app.applyCpvProfile();
+  await f.app.applyCpvProfile();
+  assert.equal(f.requests.length, 1);
+  pending.resolve({ saved_startup: false, readback: {} });
+  await call;
+  assert.equal(f.nodes.get("apply-cpv-profile").disabled, false);
+});
+
+test("CPV explicit refresh reads only and preserves draft", async () => {
+  const f = fixture();
+  f.app.renderCpvProfile();
+  f.nodes.get("cpv-speed-input").value = "1.75";
+  f.route(async () => ({ cpv_parameters: { status: "available", values: { cv: Array(7).fill(1) } } }));
+  await f.app.applyCpvProfile(true);
+  assert.deepEqual(f.requests, [{ url: "/api/osc/cpv-parameters/read-only", body: null }]);
+  assert.equal(f.nodes.get("cpv-running-speed").textContent, "1.000");
+  assert.equal(f.nodes.get("cpv-speed-input").value, "1.75");
+});
 
 for (const mode of ["cpv", "impedance"]) {
   test(`${mode}: connect and joystick submit the same mode-neutral requests`, async () => {
@@ -269,4 +332,39 @@ test("collection start does not use the selected UI tab as provenance", async ()
   await f.app.startDataset();
   const request = f.requests.find(r => r.url === "/api/dataset/start");
   assert.equal("control_source" in request.body, false);
+});
+
+test("OSC tuning converts display units and submits one group with explicit save option", async () => {
+  const f = fixture();
+  const tuning = { revision: 3, fields: {
+    frame_gain: { label: "增益", min: .3, max: .8, scale: 1, unit: "" },
+    arrival_position_tolerance_m: { label: "位置", min: .0001, max: .005, scale: 1000, unit: "mm" },
+    arrival_orientation_tolerance_rad: { label: "姿态", min: .001, max: .04, scale: 180 / Math.PI, unit: "°" },
+  }, running: { frame_gain: .8, arrival_position_tolerance_m: .0005, arrival_orientation_tolerance_rad: Math.PI / 720 } };
+  tuning.startup = { ...tuning.running };
+  f.app.state.osc.transport = { osc_tuning: tuning };
+  f.app.renderOscTuning();
+  // The lightweight fake DOM doesn't parse generated table markup.
+  f.app.render();
+  // Render creates readout nodes; editor nodes are normally created by HTML.
+  const node = (id, value) => f.nodes.set(id, { value, checked: false });
+  node("tuning-edit-frame_gain", "0.6");
+  node("tuning-edit-arrival_position_tolerance_m", "1");
+  node("tuning-edit-arrival_orientation_tolerance_rad", "0.5");
+  node("osc-tuning-save", "");
+  f.nodes.get("osc-tuning-save").checked = true;
+  f.route(async (url, body) => ({ tuning: { ...tuning, revision: 4, running: body.values, startup: body.values } }));
+  await f.app.applyOscTuning();
+  assert.equal(f.requests.length, 1);
+  const { url, body } = f.requests[0];
+  assert.equal(url, "/api/osc/tuning");
+  assert.equal(body.save_startup, true);
+  assert.equal(body.expected_revision, 3);
+  assert.equal(body.values.frame_gain, .6);
+  assert.equal(body.values.arrival_position_tolerance_m, .001);
+  assert.ok(Math.abs(body.values.arrival_orientation_tolerance_rad - Math.PI / 360) < 1e-12);
+  f.nodes.get("tuning-edit-frame_gain").value = "100";
+  await f.app.applyOscTuning();
+  assert.equal(f.requests.length, 1);
+  assert.match(f.nodes.get("osc-tuning-result").textContent, /设置失败/);
 });

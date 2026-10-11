@@ -30,6 +30,50 @@ def timeline():
             for cycle in range(10) for step in range(5)]
 
 
+def write_z_plot(folder: Path, result: dict, commands: list[dict], samples: list[dict]) -> None:
+    """Write a dependency-free SVG comparison plot using the shared QPC clock."""
+    t0 = result.get('t0_perf_ns')
+    if not isinstance(t0, (int, float)):
+        return
+    target = [((row['send_perf_ns'] - t0) / 1e9, float(row['target_z_m']))
+              for row in commands if row.get('send_perf_ns') is not None]
+    measured = []
+    for row in samples:
+        position = row.get('measured_tcp_m')
+        poll_ns = row.get('poll_perf_ns')
+        if isinstance(position, (list, tuple)) and len(position) == 3 and isinstance(poll_ns, (int, float)):
+            measured.append(((poll_ns - t0) / 1e9, float(position[2])))
+    points = target + measured
+    if not points:
+        return
+    width, height = 1000, 520
+    left, right, top, bottom = 76, 24, 28, 58
+    plot_w, plot_h = width - left - right, height - top - bottom
+    xmin, xmax = 0.0, max(8.0, max(point[0] for point in points))
+    ymin, ymax = min(point[1] for point in points), max(point[1] for point in points)
+    padding = max(0.005, (ymax - ymin) * 0.12)
+    ymin, ymax = ymin - padding, ymax + padding
+    def xy(point):
+        x, y = point
+        return (left + (x - xmin) / (xmax - xmin) * plot_w,
+                top + (ymax - y) / (ymax - ymin) * plot_h)
+    def polyline(values):
+        return ' '.join(f'{xy(point)[0]:.1f},{xy(point)[1]:.1f}' for point in values)
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+<rect width="100%" height="100%" fill="#081012"/>
+<text x="{left}" y="20" fill="#e8f0ed" font-family="Segoe UI,Microsoft YaHei,sans-serif" font-size="16">TCP Z 增量测试：目标与实测</text>
+<line x1="{left}" y1="{top + plot_h}" x2="{left + plot_w}" y2="{top + plot_h}" stroke="#6d8582"/>
+<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_h}" stroke="#6d8582"/>
+<polyline points="{polyline(target)}" fill="none" stroke="#f0c56c" stroke-width="2"/>
+<polyline points="{polyline(measured)}" fill="none" stroke="#59d9a2" stroke-width="2"/>
+<text x="{left + plot_w - 170}" y="{top + 18}" fill="#f0c56c" font-size="12">目标 TCP Z</text>
+<text x="{left + plot_w - 170}" y="{top + 36}" fill="#59d9a2" font-size="12">实测 TCP Z</text>
+<text x="{left + plot_w / 2 - 35}" y="{height - 15}" fill="#a8bbb8" font-size="12">时间（s）</text>
+<text x="18" y="{top + plot_h / 2}" fill="#a8bbb8" font-size="12" transform="rotate(-90 18 {top + plot_h / 2})">TCP Z（m）</text>
+</svg>'''
+    (folder / 'tcp-z-comparison.svg').write_text(svg, encoding='utf-8')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--execute', action='store_true')
@@ -198,7 +242,7 @@ def main():
         if np.max(np.abs(np.array(fresh['joint_position_rad']) - q0)) > .002:
             raise RuntimeError('robot moved during preflight; refuse stale anchoring')
         started = request('/api/osc/session/start', {'client_id': client,
-                          'execution_mode': 'hardware', 'input_source': 'tcp_z_increment_test'})
+                          'execution_mode': 'hardware', 'input_source': 'tcp_z_increment_test'}, timeout=15)
         session_id = started['session']['id']
         check_state(request('/api/osc/state'))
         for worker in (recorder, watchdog):
@@ -241,7 +285,7 @@ def main():
                 current = request('/api/osc/state')
                 states.append({'perf_ns': time.perf_counter_ns(), 'state': current})
                 if (current.get('session') or {}).get('client_id') == client:
-                    held = request('/api/osc/session/stop', {'reason': 'TCP Z probe complete/abort'})
+                    held = request('/api/osc/session/stop', {'reason': 'TCP Z probe complete/abort'}, timeout=15)
                     result['stop_result'] = held
                     time.sleep(.3)
                     final = request('/api/osc/state')
@@ -272,6 +316,7 @@ def main():
         # FK is deferred until after HOLD, so it cannot disturb live timing.
         for sample in samples:
             sample['measured_tcp_m'] = solver.fk(sample['joint_position_rad'])['position_m']
+        write_z_plot(folder, result, commands, samples)
         for name, rows in (('commands', commands), ('feedback', samples), ('states', states)):
             with (folder / (name + '.jsonl')).open('w', encoding='utf-8') as stream:
                 for row in rows:

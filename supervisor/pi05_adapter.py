@@ -18,7 +18,7 @@ import threading
 import time
 from typing import Any
 from .camera_resource import SharedCameraResource
-from .inference_extensions import InferenceJournal, connection_config, wait_for_arrival, wait_deadline
+from .inference_recording import RunCapture, await_target
 
 
 LOGGER = logging.getLogger(__name__)
@@ -86,7 +86,8 @@ class OpenPIClient:
         from websockets.sync.client import connect
         uri = host if host.startswith(("ws://", "wss://")) else f"ws://{host}:{port}"
         self.socket = connect(uri, compression=None, max_size=None, open_timeout=timeout_s, close_timeout=2)
-        self.socket.recv(timeout=timeout_s)  # policy metadata handshake
+        handshake = self.socket.recv(timeout=timeout_s)
+        self.metadata = msgpack.unpackb(handshake, object_hook=_unpack_array) if isinstance(handshake, bytes) else {}
         # Match OpenPI's ``msgpack_numpy.Packer`` rather than ``packb``.  The
         # streaming packer preserves the binary ndarray marker keys required
         # by the server's object hook; packb makes valid RGB arrays arrive as
@@ -192,14 +193,26 @@ class Pi05InputAdapter:
         # the HTTP-process shared camera resource.
         self.cameras: Any | None = None if camera_resource else None
         self._last_connection_probe = 0.0
+        self._forward_listener = False
+        self._camera_status_snapshot: dict[str, Any] | None = None
         self._connections: dict[str, Any] = {}
         self._osc_snapshot: dict[str, Any] = {}
+        # Logging has an independent immutable publication. Its reader never
+        # waits for inference/UI state locks and never requests hardware data.
+        self._log_feedback_snapshot: dict[str, Any] = {}
         self._last_gripper_target: str | None = None
+        self._connection_revision = 0
+        self._run_revision = 0
+        self._changing_connection = False
+        self._switch_lock = threading.Lock()
+        self._row_lock = threading.RLock()
+        self._wait_cancel = threading.Event()
+        self._capture: RunCapture | None = None
+        self._completed_capture: RunCapture | None = None
+        self._pending_gripper: dict[str, Any] | None = None
+        self._gripper_observation_identity = None
+        self._gripper_observation_cache: dict[str, Any] | None = None
         self.state: dict[str, Any] = self._new_state()
-        self._journal = None
-        self._completed_journal = None
-        self._profile_lock = threading.Lock()
-        self._profile_switching = False
         self._connection_thread.start()
         self._osc_state_thread.start()
 
@@ -250,16 +263,136 @@ class Pi05InputAdapter:
                                          "state": describe(observation.get("observation/state"))}
 
     def snapshot(self) -> dict[str, Any]:
+        # Camera diagnostics can wait for capture locks/driver calls. Never
+        # hold the inference state lock across that external operation.
+        with self.lock:
+            active = bool(self.state.get('execution_enabled') or self.state.get('priming'))
+        shared = self._camera_ui_snapshot(active)
         with self.lock:
             self._refresh_connections_locked()
             result = copy.deepcopy(self.state); result["config"] = copy.deepcopy(self.config)
-            shared = self.camera_resource.snapshot() if self.camera_resource else {"ready": self.cameras is not None, "frame_version": 0}
             result["camera_ready"] = shared["ready"]; result["frame_version"] = shared["frame_version"]
             result["camera"] = shared
-            result["run_log"] = (self._journal or self._completed_journal).summary() if (self._journal or self._completed_journal) else None
-            result["log_export_ready"] = bool(self._completed_journal and self._completed_journal.closed and not self._completed_journal.error)
             result["connections"] = copy.deepcopy(self._connections)
+            capture = self._capture or self._completed_capture
+            result['inference_log'] = capture.status() if capture else None
+            result['log_export_ready'] = bool(self._completed_capture and self._completed_capture.status()['export_ready'])
+            result['policy_metadata'] = copy.deepcopy(getattr(self._policy,'metadata',{}))
+            result['connection_switching'] = self._changing_connection
             return result
+
+    def _camera_ui_snapshot(self, active: bool) -> dict[str, Any]:
+        resource = self.camera_resource
+        if resource is None:
+            return {"ready": self.cameras is not None, "frame_version": 0}
+        if not active or not hasattr(resource,'frame_times_ns'):
+            # Idle diagnostics retain the original full driver properties.
+            result = resource.snapshot()
+            self._camera_status_snapshot = copy.deepcopy(result)
+            return result
+        # During output, use existing frame/cache metadata only. The full
+        # camera snapshot queries OpenCV properties while holding its cache
+        # lock, which also blocks observation.read(); never do that here.
+        result = copy.deepcopy(self._camera_status_snapshot or {})
+        with resource.lock:
+            ready = resource.cameras is not None
+            frames = dict(resource.frame_times_ns)
+            versions = resource.frame_version
+            config = copy.deepcopy(resource.config)
+            histories = {k:[x[0] for x in resource.dataset_frame_history.get(k,[])] for k in ('external','wrist')}
+            sizes = dict(resource.dataset_frame_sizes)
+            last_error = resource.last_error
+        now = time.perf_counter_ns()
+        result.update(ready=ready,state='READY' if ready else 'IDLE',frame_version=versions,config=config,last_error=last_error,
+                      capture_properties_source='last_idle_diagnostics')
+        sources = result.setdefault('sources',{})
+        for key in ('external','wrist'):
+            entry = sources.setdefault(key,{})
+            times = histories[key]
+            entry.update(available=ready and key in frames,frame_available=key in frames,
+                timestamp_monotonic_ns=frames.get(key),
+                last_frame_age_ms=(now-frames[key])/1e6 if key in frames else None,
+                dataset_size=list(sizes[key]) if key in sizes else None,
+                capture_hz=(len(times)-1)*1e9/(times[-1]-times[0]) if len(times)>1 and times[-1]>times[0] else None)
+        return result
+
+    def _cached_feedback(self) -> dict[str, Any]:
+        # Read only the already-published cache: no additional OSC/CAN requests.
+        with self.lock:
+            source = self._osc_snapshot
+            selected = {k:source.get(k) for k in ('session','execution','command','gripper')}
+            selected['last_cpv_dispatch'] = (source.get('transport') or {}).get('last_cpv_dispatch')
+        return copy.deepcopy(selected)
+
+    def _publish_logging_feedback(self, source: dict[str, Any]) -> None:
+        selected = {k:source.get(k) for k in ('session','execution','command','gripper','gripper_observation')}
+        selected['last_cpv_dispatch'] = (source.get('transport') or {}).get('last_cpv_dispatch')
+        selected['cache_published_perf_ns'] = time.perf_counter_ns()
+        self._log_feedback_snapshot = copy.deepcopy(selected)
+
+    def _logging_feedback(self) -> dict[str, Any]:
+        # Publication is replacement-only; keep one stable reference throughout
+        # the copy. No adapter lock, RPC, CAN call or target mutation here.
+        snapshot = self._log_feedback_snapshot
+        result = copy.deepcopy(snapshot)
+        published = snapshot.get('cache_published_perf_ns')
+        result['logging_cache_age_ms'] = (time.perf_counter_ns()-published)/1e6 if published is not None else None
+        return result
+
+    def _event(self, event: str, **fields: Any) -> None:
+        capture = self._capture
+        if capture: capture.emit(event,**fields)
+
+    def _finish_capture(self, reason: str) -> None:
+        with self.lock:
+            capture,self._capture = self._capture,None
+        if capture:
+            capture.finish(reason)
+            with self.lock: self._completed_capture = capture
+
+    def export_inference_log(self) -> tuple[str, bytes]:
+        if self._completed_capture is None: raise RuntimeError('No completed inference run')
+        return self._completed_capture.zip_bytes()
+
+    def _change_connection(self, name: str, endpoint: Any = None) -> None:
+        profiles = self.config.get('inference_profiles') or {}
+        if name not in ('autodl','local5090') or name not in profiles: raise ValueError('Unknown inference profile')
+        destination = dict(profiles[name])
+        if endpoint is not None:
+            if not isinstance(endpoint,dict): raise ValueError('Endpoint must be an object')
+            destination['host'] = str(endpoint.get('host',destination['host'])).strip()
+            destination['port'] = int(endpoint.get('port',destination['port']))
+            if not destination['host'] or not 1<=destination['port']<=65535: raise ValueError('Invalid policy address/port')
+        horizon = int(destination.get('expected_chunk_steps',20 if name=='local5090' else 10))
+        prefix = int(destination.get('replan_steps',horizon//2))
+        if horizon not in (10,20) or prefix != horizon//2:
+            raise ValueError('Inference profile requires H10/H5 or H20/H10')
+        with self._switch_lock:
+            self.stop('inference connection changed')
+            with self.lock:
+                self._changing_connection = True
+                self._connection_revision += 1
+                previous,self._policy = self._policy,None
+                self.stop_event.set()
+                old_worker = self.worker
+            if previous: previous.close()
+            if old_worker and old_worker is not threading.current_thread(): old_worker.join(timeout=3)
+            with self.lock:
+                if old_worker and old_worker.is_alive():
+                    self._changing_connection = False
+                    raise RuntimeError('Old inference is still exiting; retry after it ends')
+                self.config['inference_profiles'][name] = destination
+                self.config['inference_profiles']['active'] = name
+                self.config['model'].update(host=destination['host'],port=destination['port'],checkpoint_label=destination['checkpoint_label'])
+                self.config['connection'].update(policy_host=destination['host'],policy_port=destination['port'],ssh_forward_port=destination['port'])
+                self.config['execution'].update(expected_chunk_steps=horizon,max_chunk_steps=horizon,replan_steps=prefix)
+                self._policy_retry_at = 0
+                self.state.update(state='IDLE',model_state='DISCONNECTED',websocket_error=None)
+                self._last_connection_probe = 0
+                self._persist_config_locked()
+                self._changing_connection = False
+            self._connection_wakeup.set()
+            if self.camera_resource and self.camera_resource.snapshot().get('ready'): self._ensure_worker()
 
     def _next_sequence(self) -> int:
         """Allocate one strictly increasing sequence across TCP, gripper and HOLD.
@@ -323,6 +456,17 @@ class Pi05InputAdapter:
                 model = dict(self.config["model"])
                 worker_active = self.worker is not None and self.worker.is_alive()
                 retry_at = self._policy_retry_at
+                revision = self._connection_revision
+                changing = self._changing_connection
+            if changing:
+                self._connection_wakeup.wait(.05); self._connection_wakeup.clear()
+                continue
+            # UI status consumes this cached listener result. netstat must not
+            # execute under the lock shared with target dispatch/feedback.
+            listening = self._local_forward_listening(int(model['port']))
+            with self.lock:
+                if revision == self._connection_revision:
+                    self._forward_listener = listening
             # The synchronous WebSocket client serializes send/recv/ping.
             # Never issue a health ping concurrently with inference on the
             # same socket; inference failures are the active-session liveness
@@ -344,16 +488,18 @@ class Pi05InputAdapter:
                             self._record_websocket_event("connect_attempt")
                             policy = OpenPIClient(str(model["host"]), int(model["port"]), float(model["request_timeout_s"]))
                             with self.lock:
-                                if self._connection_stop.is_set() or (model["host"], model["port"]) != (self.config["model"]["host"], self.config["model"]["port"]):
+                                if self._connection_stop.is_set() or self._changing_connection or revision != self._connection_revision:
                                     policy.close()
                                 else:
                                     self._policy = policy
                                     self._policy_generation += 1
                                     self.state.update({"model_state": "CONNECTED", "websocket_error": None, "updated_at": time.time()})
                                     self._record_websocket_event("connect_success")
-                                    if self.camera_resource and self.camera_resource.snapshot().get("ready"):
-                                        self._ensure_worker()
+                            if self.camera_resource and self.camera_resource.snapshot().get("ready"):
+                                self._ensure_worker()
                         except Exception as exc:
+                            with self.lock:
+                                if revision != self._connection_revision: continue
                             self._record_websocket_event("connect_failure", f"{type(exc).__name__}: {exc}")
                             with self.lock:
                                 self.state.update({"model_state": "DISCONNECTED", "websocket_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
@@ -374,16 +520,77 @@ class Pi05InputAdapter:
     def _osc_state_loop(self) -> None:
         """Refresh OSC feedback independently from inference and UI state reads."""
         period_s = max(0.02, float((self.config.get("execution") or {}).get("osc_state_poll_s", 0.05)))
+        deadline = time.perf_counter()
+        previous_poll_ns = None
         while not self._osc_state_stop.is_set():
+            poll_ns = time.perf_counter_ns()
             try:
                 snapshot = self.osc.state()
+                returned_ns = time.perf_counter_ns()
+                snapshot = self._refresh_gripper_observation(snapshot)
+                self._publish_logging_feedback(snapshot)
+                published = copy.deepcopy(snapshot)
+                lock_started_ns = time.perf_counter_ns()
                 with self.lock:
-                    self._osc_snapshot = copy.deepcopy(snapshot)
+                    lock_acquired_ns = time.perf_counter_ns()
+                    self._osc_snapshot = published
                     self.state.update({"osc_error": None, "updated_at": time.time()})
+                    self.state['gripper_observation'] = copy.deepcopy(snapshot.get('gripper_observation'))
+                self._observe_inference_gripper(snapshot)
+                self._event('feedback_cache_poll',rpc_ms=(returned_ns-poll_ns)/1e6,
+                    publish_lock_wait_ms=(lock_acquired_ns-lock_started_ns)/1e6,
+                    poll_started_perf_ns=poll_ns,poll_returned_perf_ns=returned_ns,
+                    poll_interval_ms=(poll_ns-previous_poll_ns)/1e6 if previous_poll_ns is not None else None)
             except Exception as exc:
                 with self.lock:
                     self.state.update({"osc_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
-            self._osc_state_stop.wait(period_s)
+            previous_poll_ns = poll_ns
+            deadline += period_s
+            now = time.perf_counter()
+            if deadline < now:
+                deadline += (int((now-deadline)/period_s)+1)*period_s
+            self._osc_state_stop.wait(max(0.,deadline-time.perf_counter()))
+
+    def _refresh_gripper_observation(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        session = snapshot.get('session') or {}
+        identity = (session.get('id'),session.get('client_id'))
+        with self.lock:
+            participates = (identity == (self.state.get('session_id'),self.state.get('client_id'))
+                and bool(self.state.get('execution_enabled') or self.state.get('priming')))
+        if not participates or session.get('state') != 'ACTIVE' or session.get('execution_mode') != 'hardware':
+            self._gripper_observation_cache = None
+            self._gripper_observation_identity = None
+            return snapshot
+        reader = getattr(self.osc,'inference_gripper_feedback',None)
+        if not callable(reader): return snapshot
+        if identity != self._gripper_observation_identity:
+            self._gripper_observation_cache = None
+            self._gripper_observation_identity = identity
+        diagnostic = {'source':'sdk_receive_cache','session_id':identity[0],'new_sdk_feedback':False}
+        started_ns = time.perf_counter_ns()
+        try:
+            candidate = reader()
+            marker = self._gripper_sdk_marker(candidate)
+            width = candidate.get('width_m')
+            if marker is None or not isinstance(width,(int,float)) or not math.isfinite(width):
+                raise ValueError('SDK gripper cache has no valid timestamp/width')
+            old_marker = self._gripper_sdk_marker(self._gripper_observation_cache or {})
+            if old_marker is None or marker > old_marker:
+                self._gripper_observation_cache = copy.deepcopy(candidate)
+                diagnostic['new_sdk_feedback'] = True
+            elif marker < old_marker:
+                diagnostic['error'] = 'SDK gripper timestamp regressed; previous feedback retained'
+            diagnostic['sdk_timestamp'] = self._gripper_sdk_marker(self._gripper_observation_cache or {})
+            diagnostic['width_m'] = (self._gripper_observation_cache or {}).get('width_m')
+        except Exception as exc:
+            diagnostic['error'] = f'{type(exc).__name__}: {exc}'
+            self._event('gripper_observation_error',**diagnostic)
+        diagnostic['cache_read_ms'] = (time.perf_counter_ns()-started_ns)/1e6
+        result = dict(snapshot)
+        if self._gripper_observation_cache is not None:
+            result['gripper'] = copy.deepcopy(self._gripper_observation_cache)
+        result['gripper_observation'] = diagnostic
+        return result
 
     def _policy_client(self) -> OpenPIClient:
         """Wait for the single connection-owner thread to publish a client.
@@ -406,8 +613,6 @@ class Pi05InputAdapter:
 
     def _ensure_worker(self) -> None:
         with self.lock:
-            if self._profile_switching:
-                return
             if self.worker and self.worker.is_alive():
                 return
             self.stop_event = threading.Event()
@@ -430,8 +635,7 @@ class Pi05InputAdapter:
         # which OpenPI correctly logs as an invalid handshake (EOF while
         # reading the request line).  The real WebSocket worker is the source
         # of truth for policy connectivity.
-        is_local = (self.config.get("inference_profiles") or {}).get("active") == "local5090"
-        local_forward_listening = False if is_local else self._local_forward_listening(port)
+        local_forward_listening = self._forward_listener
         policy_connected = self.state.get("model_state") == "CONNECTED"
         # Do not synchronously query OSC while serving pi05 state. A stalled
         # control backend must not block inference telemetry or Action Chunks.
@@ -442,11 +646,10 @@ class Pi05InputAdapter:
             "ssh_forward": {"state": "ok" if local_forward_listening else "bad", "label": "SSH 本地转发", "endpoint": f"127.0.0.1:{port}", "message": "本地转发端口已监听" if local_forward_listening else "本地转发端口未监听"},
             "policy": {"state": "ok" if policy_connected else "bad", "label": "AutoDL Policy WebSocket", "endpoint": "OpenPI policy server", "message": "AutoDL Policy WebSocket 已连接" if policy_connected else (str(self.state.get("websocket_error")) if self.state.get("websocket_error") else "AutoDL Policy WebSocket 未连接")},
         }
-        if is_local:
-            status = "ok" if policy_connected else "bad"
-            endpoint = f"{host}:{port}"
-            self._connections["ssh_forward"] = {"state":status,"label":"5090本地直连","endpoint":endpoint,"message":"无需SSH转发"}
-            self._connections["policy"] = {"state":status,"label":"5090 Policy WebSocket","endpoint":endpoint,"message":"已连接" if policy_connected else "等待本地模型服务"}
+        if (self.config.get('inference_profiles') or {}).get('active') == 'local5090':
+            self._connections['ssh_forward'].update(label='5090本地连接',endpoint=f'{host}:{port}',
+                state='ok' if policy_connected else 'bad',message='直接连接本地服务，无需SSH转发')
+            self._connections['policy']['label'] = '5090本地 Policy WebSocket'
 
     def camera_devices(self) -> list[dict[str, Any]]:
         if self.camera_resource: return self.camera_resource.devices()
@@ -468,18 +671,16 @@ class Pi05InputAdapter:
         with self.lock: self._camera_devices = devices; return copy.deepcopy(devices)
 
     def update_config(self, value: dict[str, Any]) -> dict[str, Any]:
-        if isinstance(value, dict) and "inference_profile" in value:
-            self._change_inference_profile(value["inference_profile"])
+        if isinstance(value,dict) and ('inference_profile' in value or 'policy_endpoint' in value):
+            self._change_connection(value.get('inference_profile',(self.config.get('inference_profiles') or {}).get('active','autodl')),value.get('policy_endpoint'))
         with self.lock:
             model = value.get("model") if isinstance(value, dict) else None
             cameras = value.get("cameras") if isinstance(value, dict) else None
             execution = value.get("execution") if isinstance(value, dict) else None
-            if isinstance(execution, dict) and "arrival_wait_s" in execution:
-                raw = execution["arrival_wait_s"]
-                wait = float(raw)
-                if isinstance(raw, bool) or not math.isfinite(wait) or not 0 <= wait <= 5:
-                    raise ValueError("Maximum arrival wait must be within 0–5 seconds")
-                self.config["execution"]["arrival_wait_s"] = wait
+            if isinstance(execution,dict) and 'arrival_wait_s' in execution:
+                seconds = float(execution['arrival_wait_s'])
+                if not math.isfinite(seconds) or not 0<=seconds<=5: raise ValueError('Arrival wait must be 0-5 seconds')
+                self.config['execution']['arrival_wait_s'] = seconds
             if isinstance(model, dict) and "prompt" in model:
                 prompt = str(model["prompt"]).strip()
                 if not 1 <= len(prompt) <= 500: raise ValueError("prompt must contain 1-500 characters")
@@ -506,7 +707,7 @@ class Pi05InputAdapter:
                     raise ValueError("external and wrist cameras must be different")
             self._persist_config_locked()
             self.state["updated_at"] = time.time()
-            return self.snapshot()
+        return self.snapshot()
 
     def _persist_config_locked(self) -> None:
         """Atomically retain operator-facing prompt and test settings across restart."""
@@ -514,64 +715,6 @@ class Pi05InputAdapter:
         with temporary.open("w", encoding="utf-8", newline="\n") as stream:
             stream.write(json.dumps(self.config, ensure_ascii=False, indent=2) + "\n")
         os.replace(temporary, self.config_path)
-
-    def _change_inference_profile(self, request) -> None:
-        with self._profile_lock:
-            with self.lock:
-                if self.state.get("execution_enabled") or self.state.get("priming"):
-                    raise RuntimeError("Stop inference output before switching model connections")
-                previous = self.config
-                updated = connection_config(previous, request)
-                if updated == previous:
-                    return
-                self._profile_switching = True
-                self.stop_event.set()
-                worker, policy = self.worker, self._policy
-                self._policy = None
-                self.config = updated
-                self.state.update(model_state="DISCONNECTED", websocket_error=None)
-                self._policy_retry_at = 0
-            try:
-                if policy:
-                    policy.close()
-                if worker and worker is not threading.current_thread():
-                    worker.join(timeout=3)
-                    if worker.is_alive():
-                        raise RuntimeError("Previous inference call is still ending; retry connection switch")
-                with self.lock:
-                    self._persist_config_locked()
-                    self._last_connection_probe = 0
-            except Exception:
-                with self.lock:
-                    self.config = previous
-                raise
-            finally:
-                with self.lock:
-                    self._profile_switching = False
-                self._connection_wakeup.set()
-            if self.camera_resource and self.camera_resource.snapshot()["ready"]:
-                self._ensure_worker()
-
-    def _record_inference(self, kind, **fields) -> None:
-        with self.lock:
-            journal = self._journal
-        if journal:
-            journal.append(kind, **fields)
-
-    def _finish_inference_journal(self, reason) -> None:
-        with self.lock:
-            journal, self._journal = self._journal, None
-        if journal:
-            journal.finish(reason)
-            with self.lock:
-                self._completed_journal = journal
-
-    def export_last_run_log(self):
-        with self.lock:
-            journal = self._completed_journal
-        if journal is None:
-            raise RuntimeError("No completed inference run; start and stop inference first")
-        return journal.export()
 
     def activate_cameras(self) -> dict[str, Any]:
         if self.camera_resource:
@@ -592,24 +735,41 @@ class Pi05InputAdapter:
             return self.snapshot()
 
     def start(self, session_id: str, client_id: str) -> dict[str, Any]:
+        previous_worker = self.worker
+        if self.stop_event.is_set() and previous_worker and previous_worker.is_alive():
+            previous_worker.join(timeout=1)
+            if previous_worker.is_alive(): raise RuntimeError('Previous inference is still exiting')
         with self.lock:
-            if (self.camera_resource is not None and not self.camera_resource.snapshot()["ready"]) or (self.camera_resource is None and self.cameras is None): raise RuntimeError("activate the external and wrist cameras first")
-            try:
-                osc = self.osc.state()
-            except Exception as exc:
+            if self._changing_connection: raise RuntimeError('Policy connection is switching')
+            if self._capture is not None: raise RuntimeError('Inference output already started')
+            startup_revision = self._run_revision
+        if not self._camera_ui_snapshot(True)['ready']:
+            raise RuntimeError("activate the external and wrist cameras first")
+        try:
+            osc = self.osc.state()
+        except Exception as exc:
+            with self.lock:
                 self.state["osc_error"] = f"{type(exc).__name__}: {exc}"
                 self.state["updated_at"] = time.time()
-                raise
-            self._osc_snapshot = copy.deepcopy(osc)
+            raise
+        published = copy.deepcopy(osc)
+        with self.lock:
+            if self._changing_connection or startup_revision != self._run_revision:
+                raise RuntimeError('Inference startup cancelled or connection changed')
+            if self._capture is not None: raise RuntimeError('Inference output already started')
+            self._osc_snapshot = published
+            self._publish_logging_feedback(osc)
             session = osc.get("session") or {}
             if session.get("state") != "ACTIVE" or session.get("id") != session_id or session.get("client_id") != client_id:
                 raise PermissionError("AutoDL cloud inference requires the caller's active OSC session")
             self._last_gripper_target = None
-            self._finish_inference_journal("new inference run")
-            self._journal = InferenceJournal(self.config_path.parent.parent / "runtime/logs/autodl_runs",
-                {"session_id":session_id,"client_id":client_id,"execution_mode":session.get("execution_mode"),
-                 "prompt":self.config["model"]["prompt"],"config":copy.deepcopy(self.config)})
-            self._journal.start_sampling(self.osc.state)
+            self._run_revision += 1
+            self._wait_cancel = threading.Event()
+            self.state['log_error'] = None
+            try:
+                self._capture = RunCapture(self.config_path.parent.parent/'runtime/logs/inference_runs',
+                    {'session':session,'config':copy.deepcopy(self.config)},self._logging_feedback)
+            except Exception as exc: self.state['log_error'] = f'{type(exc).__name__}: {exc}'
             needs_priming = session.get("execution_mode") == "hardware"
             self.state.update({"state": "PRIMING" if needs_priming else "RUNNING",
                                "execution_enabled": not needs_priming, "priming": needs_priming,
@@ -620,7 +780,7 @@ class Pi05InputAdapter:
             self._connection_wakeup.set()
             if needs_priming:
                 threading.Thread(target=self._prime_control_worker, args=(session_id, client_id), name="nero-pi05-osc-prime", daemon=True).start()
-            return self.snapshot()
+        return self.snapshot()
 
     def _prime_control_worker(self, session_id: str, client_id: str) -> None:
         """Run hardware priming independently from policy inference."""
@@ -632,9 +792,12 @@ class Pi05InputAdapter:
 
     def stop(self, reason: str = "AutoDL cloud inference stopped") -> dict[str, Any]:
         with self.lock:
+            self._run_revision += 1
+            self._wait_cancel.set()
+            self._cancel_pending_gripper(reason)
             self.state.update({"state": "RUNNING" if self.state.get("state") == "PRIMING" else self.state.get("state"),
                                "execution_enabled": False, "priming": False, "updated_at": time.time()})
-        self._finish_inference_journal(reason)
+        with self._row_lock: self._finish_capture(reason)
         return self.snapshot()
 
     def _prime_startup_hold(self, session_id: str, client_id: str) -> bool:
@@ -704,7 +867,9 @@ class Pi05InputAdapter:
         tolerance is therefore deliberately small: values outside it still
         reject the complete chunk and request HOLD.
         """
-        tolerance = float(self.config["gripper"].get("ratio_boundary_tolerance", 0.001))
+        # Default allowance: 0.5% of opening range, 0.475mm at 95mm.
+        # Only the command is clipped; raw model outputs remain in the log.
+        tolerance = float(self.config["gripper"].get("ratio_boundary_tolerance", 0.005))
         if not math.isfinite(tolerance) or tolerance < 0.0:
             raise RuntimeError("AutoDL gripper ratio boundary tolerance must be finite and non-negative")
         if 0.0 <= ratio <= 1.0:
@@ -787,31 +952,104 @@ class Pi05InputAdapter:
         if isinstance(self._last_gripper_target, (int, float)) and abs(float(self._last_gripper_target) - target_width) <= tolerance:
             return
         sequence = self._next_sequence()
-        self._record_inference("gripper_command_requested",sequence=sequence,ratio=action_value,width_m=target_width)
-        result = self.osc.gripper(session_id, client_id, sequence, {
-            "inference_stream": True,
-            "mode": "position", "width_m": target_width,
+        started_ns = time.perf_counter_ns()
+        with self.lock:
+            shadow = self.state.get('execution_mode') == 'shadow'
+            revision = self._run_revision
+        self._event('gripper_request',sequence=sequence,width_m=target_width,opening_ratio=action_value,
+                    mode='simulated' if shadow else 'position_inference')
+        result = {'ok':True,'result':{'sent':False,'simulated':True,'feedback_pending':False}} if shadow else self.osc.gripper(session_id, client_id, sequence, {
+            "mode": "position_inference", "width_m": target_width,
             "force_n": self.config["gripper"]["force_n"],
         })
+        self._event('gripper_return',sequence=sequence,width_m=target_width,result=result,
+                    started_perf_ns=started_ns,duration_ms=(time.perf_counter_ns()-started_ns)/1e6)
         if not result.get("ok"):
             raise RuntimeError(f"AutoDL gripper command rejected: {result}")
-        self._last_gripper_target = target_width
-        self._record_inference("gripper_dispatch",sequence=sequence,ratio=action_value,width_m=target_width,
-                               result={"ok":result.get("ok")})
+        receipt = result.get('result') or {}
+        if not shadow and not receipt.get('sent'):
+            raise RuntimeError(f"AutoDL gripper was not sent: {result}")
+        with self.lock:
+            if revision != self._run_revision or not self.state.get('execution_enabled'): return
+            self._cancel_pending_gripper('replaced by new target')
+            self._last_gripper_target = target_width
+            confirmation = {'sequence':sequence,'target_width_m':target_width,'sent_perf_ns':started_ns,
+                'status':'simulated' if shadow else 'pending_feedback','health_confirmed':False,
+                'target_reached':None,'session_id':session_id,'client_id':client_id,'run_revision':revision,
+                'last_sdk_marker':self._gripper_sdk_marker(receipt.get('before') or {})}
+            self.state['gripper_confirmation'] = copy.deepcopy(confirmation)
+            if not shadow: self._pending_gripper = confirmation
+
+    @staticmethod
+    def _gripper_sdk_marker(gripper: dict[str, Any]) -> Any:
+        # The outer gripper timestamp is generated on every read. Only the
+        # timestamp on the SDK's received CAN message proves a new sample.
+        raw = gripper.get('raw') or {}
+        value = raw.get('value') if isinstance(raw,dict) else None
+        marker = value.get('timestamp') if isinstance(value,dict) else None
+        return marker if isinstance(marker,(int,float)) and math.isfinite(marker) and marker>0 else None
+
+    def _cancel_pending_gripper(self, reason: str) -> None:
+        pending,self._pending_gripper = self._pending_gripper,None
+        if pending:
+            self._event('gripper_feedback_cancelled',sequence=pending['sequence'],reason=reason)
+            self.state['gripper_confirmation'] = {**pending,'status':'cancelled','reason':reason}
+
+    def _observe_inference_gripper(self, snapshot: dict[str, Any]) -> None:
+        fault = None; revision = None
+        with self.lock:
+            pending = self._pending_gripper
+            if not pending: return
+            session = snapshot.get('session') or {}
+            if (not self.state.get('execution_enabled') or pending['run_revision'] != self._run_revision
+                or session.get('state') != 'ACTIVE' or session.get('id') != pending['session_id']
+                or session.get('client_id') != pending['client_id']):
+                self._cancel_pending_gripper('output or session changed'); return
+            gripper = snapshot.get('gripper') or {}
+            marker = self._gripper_sdk_marker(gripper)
+            previous = pending.get('last_sdk_marker')
+            if marker is None or (previous is not None and marker<=previous): return
+            status = gripper.get('status') or {}
+            foc = status.get('foc_status') if isinstance(status,dict) else None
+            if not isinstance(foc,dict): return
+            faults = [k for k in ('voltage_too_low','motor_overheating','driver_overcurrent','driver_overheating','driver_error_status') if foc.get(k)]
+            if not foc.get('driver_enable_status'): faults.append('driver_disabled')
+            width = gripper.get('width_m')
+            width_error = abs(float(width)-pending['target_width_m']) if isinstance(width,(int,float)) and math.isfinite(width) else None
+            pending.update(last_sdk_marker=marker,status='feedback_fault' if faults else 'feedback_received',
+                health_confirmed=not faults,actual_width_m=width,target_error_m=width_error,
+                # Width error is diagnostic, not a new reached/grasp gate.
+                target_reached=None,faults=faults,feedback_observed_perf_ns=time.perf_counter_ns())
+            self.state['gripper_confirmation'] = copy.deepcopy(pending)
+            self._event('gripper_feedback',**pending)
+            if faults:
+                fault = 'AutoDL gripper feedback fault: '+', '.join(faults)
+                revision = pending['run_revision']
+                self.state['execution_enabled'] = False
+                self._pending_gripper = None
+        if fault:
+            with self._row_lock:
+                with self.lock:
+                    if revision != self._run_revision: return
+                self._reject_chunk(pending['session_id'],pending['client_id'],fault)
 
     def _reject_chunk(self, session_id: str | None, client_id: str | None, reason: str) -> None:
         """Fail closed: no later row from a bad AutoDL chunk may execute."""
+        self._event('execution_error',reason=reason)
         sequence = self._next_sequence()
         with self.lock:
             self.state.update({"state": "ERROR", "execution_enabled": False,
                                "last_error": reason, "last_rejection": reason,
                                "updated_at": time.time()})
+            self._cancel_pending_gripper(reason)
         if session_id and client_id:
             try:
                 self.osc.hold(str(session_id), str(client_id), sequence, reason)
             except Exception:
                 pass
         self.stop_event.set()
+        self._wait_cancel.set()
+        self._finish_capture(reason)
 
     def _run(self) -> None:
         policy = None
@@ -829,12 +1067,15 @@ class Pi05InputAdapter:
                             self.state.update({"state": "RUNNING", "websocket_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
                         self.stop_event.wait(.1)
                         continue
-                observation_started = time.perf_counter_ns()
                 with self.lock:
-                    osc = copy.deepcopy(self._osc_snapshot)
-                    session = dict(osc.get("session") or {})
+                    osc_source = self._osc_snapshot
                     session_id, client_id = self.state["session_id"], self.state["client_id"]
                     execution_enabled = bool(self.state.get("execution_enabled"))
+                    revision,run_revision = self._connection_revision,self._run_revision
+                    capture = self._capture
+                osc = copy.deepcopy(osc_source)
+                session = dict(osc.get("session") or {})
+                observation_ns = time.perf_counter_ns()
                 active_session = session.get("state") == "ACTIVE" and session.get("id") == session_id and session.get("client_id") == client_id
                 if active_session:
                     try:
@@ -861,20 +1102,24 @@ class Pi05InputAdapter:
                 observation = self._observation(osc, external, wrist)
                 self._record_inference_input(external, wrist, observation)
                 try:
-                    inference_started = time.perf_counter()
+                    inference_ns = time.perf_counter_ns()
+                    inference_started = time.monotonic()
                     response = policy.infer(observation)
-                    inference_ms = (time.perf_counter() - inference_started) * 1000.0
+                    inference_finished_ns = time.perf_counter_ns()
+                    inference_ms = (inference_finished_ns-inference_ns)/1e6
                 except Exception as exc:
                     self._record_websocket_event("inference_failure", f"{type(exc).__name__}: {exc}")
+                    self._event('inference_error',error=f'{type(exc).__name__}: {exc}')
                     self._invalidate_policy(policy, f"OpenPI WebSocket inference failed: {type(exc).__name__}: {exc}")
                     policy = None
                     self.stop_event.wait(.05)
                     continue
+                with self.lock:
+                    obsolete = revision != self._connection_revision or run_revision != self._run_revision or self._changing_connection
+                if obsolete:
+                    policy = None
+                    continue
                 base = self._feedback_pose(osc)
-                self._record_inference("model_action_chunk",chunk_id=int(self.state.get("chunk_sequence",0))+1,
-                    observation_started_perf_counter_ns=observation_started,inference_ms=inference_ms,
-                    observation_state=observation["observation/state"].tolist(),prompt=observation["prompt"],
-                    inference_base_tcp=base,action_chunk=(response.get("actions").tolist() if hasattr(response.get("actions"),"tolist") else response.get("actions")) if isinstance(response,dict) else response)
                 if base is None and (not execution_enabled or not active_session):
                     # Preview inference may continue after the operator stops
                     # forwarding or closes the OSC session.  Without a live
@@ -888,6 +1133,13 @@ class Pi05InputAdapter:
                     if actions is None: raise RuntimeError("AutoDL response does not contain actions")
                     rows = actions.tolist() if hasattr(actions, "tolist") else actions
                     if not isinstance(rows, list) or not rows: raise RuntimeError("AutoDL action chunk is empty")
+                    chunk_id = int(self.state.get('chunk_sequence',0))+1
+                    if capture:
+                        capture.emit('model_chunk',chunk_id=chunk_id,actions=rows,base_tcp=base,
+                            observation_state=observation['observation/state'],prompt=observation.get('prompt'),
+                            observation_started_perf_ns=observation_ns,inference_started_perf_ns=inference_ns,
+                            inference_finished_perf_ns=inference_finished_ns,
+                            observation_preparation_ms=(inference_ns-observation_ns)/1e6,inference_ms=inference_ms)
                     expected_steps = int(self.config["execution"].get("expected_chunk_steps", 10))
                     if len(rows) != expected_steps:
                         raise RuntimeError(f"AutoDL action chunk must contain exactly {expected_steps} steps, got {len(rows)}")
@@ -922,7 +1174,6 @@ class Pi05InputAdapter:
                     self.stop_event.wait(float(self.config["execution"]["period_s"]))
                     continue
                 period_s = float(self.config["execution"]["period_s"])
-                last_sent_target = None
                 last_dispatch_completed_at: float | None = None
                 for index, ((target, gripper), _action) in enumerate(zip(decoded[:limit], rows[:limit])):
                     if self.stop_event.is_set(): break
@@ -933,10 +1184,13 @@ class Pi05InputAdapter:
                     # longer than one period; in that case we stretch the
                     # chunk instead of trying to catch up with a burst.
                     if last_dispatch_completed_at is not None:
-                        if wait_deadline(self.stop_event, last_dispatch_completed_at + period_s):
+                        wait_s = max(0.0, last_dispatch_completed_at + period_s - time.monotonic())
+                        if self.stop_event.wait(wait_s):
                             break
+                    dispatch_preparation_ns = time.perf_counter_ns()
                     with self.lock:
                         execution_enabled = bool(self.state.get("execution_enabled"))
+                        execution_enabled = execution_enabled and run_revision == self._run_revision and revision == self._connection_revision
                     if not execution_enabled:
                         # The operator may stop AutoDL forwarding while this
                         # chunk is between rows.  Do not let a deliberately
@@ -945,15 +1199,21 @@ class Pi05InputAdapter:
                         break
                     sequence = self._next_sequence()
                     try:
-                        self._record_inference("tcp_command_requested",chunk_id=int(self.state["chunk_sequence"]),
-                            action_index=index,sequence=sequence,target_tcp=target,gripper_ratio=gripper)
-                        result = self.osc.track_tcp(session_id, client_id, sequence, target)
-                        self._record_inference("tcp_dispatch",chunk_id=int(self.state["chunk_sequence"]),
-                            action_index=index,sequence=sequence,target_tcp=target,gripper_ratio=gripper,
-                            result={"ok":result.get("ok")})
-                        if not result.get("ok"): raise RuntimeError(f"OSC target rejected: {result}")
-                        last_sent_target = target
-                        self._send_gripper_if_needed(session_id, client_id, gripper)
+                        with self._row_lock:
+                            with self.lock:
+                                if not self.state.get('execution_enabled') or run_revision != self._run_revision: break
+                            previous_id = (self._cached_feedback().get('execution') or {}).get('control_sample_id')
+                            request_ns = time.perf_counter_ns()
+                            self._event('tcp_request',chunk_id=chunk_id,step=index,sequence=sequence,target_tcp=target,gripper_ratio=gripper,
+                                dispatch_preparation_ms=(request_ns-dispatch_preparation_ns)/1e6,
+                                since_inference_return_ms=(request_ns-inference_finished_ns)/1e6)
+                            result = self.osc.track_tcp(session_id, client_id, sequence, target)
+                            tcp_return_ns = time.perf_counter_ns()
+                            self._event('tcp_return',chunk_id=chunk_id,step=index,sequence=sequence,target_tcp=target,result=result,
+                                started_perf_ns=request_ns,duration_ms=(tcp_return_ns-request_ns)/1e6)
+                            if not result.get("ok"): raise RuntimeError(f"OSC target rejected: {result}")
+                            with self.lock: enabled = self.state.get('execution_enabled') and run_revision == self._run_revision
+                            if enabled: self._send_gripper_if_needed(session_id, client_id, gripper)
                     except Exception as exc:
                         with self.lock:
                             execution_enabled = bool(self.state.get("execution_enabled"))
@@ -961,14 +1221,22 @@ class Pi05InputAdapter:
                             break
                         self._reject_chunk(session_id, client_id, f"AutoDL chunk execution rejected: {type(exc).__name__}: {exc}")
                         break
-                    last_dispatch_completed_at = time.perf_counter()
+                    last_dispatch_completed_at = time.monotonic()
                     with self.lock: self.state["executed_steps"] += 1; self.state["updated_at"] = time.time()
-                if last_sent_target is not None and not self.stop_event.is_set():
-                    wait_for_arrival(self,last_sent_target,session_id,client_id)
+                    if index == limit-1:
+                        seconds = float(self.config['execution'].get('arrival_wait_s',0))
+                        self._event('arrival_start',chunk_id=chunk_id,target_tcp=target,sequence=sequence,
+                            budget_started_perf_ns=tcp_return_ns,maximum_wait_s=seconds)
+                        arrival = await_target(self._cached_feedback,target,(session_id,client_id),sequence,previous_id,
+                            tcp_return_ns/1e9+seconds,self._wait_cancel) if seconds>0 else {'outcome':'disabled','blocking_ms':0}
+                        arrival['since_tcp_return_ms'] = (time.perf_counter_ns()-tcp_return_ns)/1e6
+                        self._event('arrival_end',chunk_id=chunk_id,**arrival)
+                        with self.lock: self.state['arrival_result'] = arrival
         except Exception as exc:
+            self._event('worker_error',error=f'{type(exc).__name__}: {exc}')
             with self.lock: self.state.update({"state": "ERROR", "last_error": f"{type(exc).__name__}: {exc}", "updated_at": time.time()})
         finally:
-            self._finish_inference_journal("inference worker ended")
+            self._finish_capture('inference worker exited')
             with self.lock:
                 session_id, client_id = self.state.get("session_id"), self.state.get("client_id")
                 if self.stop_event.is_set() and self.state.get("state") != "ERROR":

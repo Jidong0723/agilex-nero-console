@@ -168,6 +168,19 @@ class OperationalSpaceController:
             safety_config.get("allow_electronic_emergency_stop", False)
         )
         service_config = config_data.get("control_service", {})
+        self._runtime_config_path = (
+            Path(config).resolve() if isinstance(config, (str, Path)) else None
+        )
+        saved_profile = service_config.get("cpv_profile_defaults") or {}
+        self._cpv_profile_defaults: dict[str, float] = {
+            name: float(saved_profile[name])
+            for name in ("cv_rad_s", "acc_rad_s2", "dcc_rad_s2")
+            if isinstance(saved_profile.get(name), (int, float))
+            and math.isfinite(float(saved_profile[name]))
+            and float(saved_profile[name]) > 0.0
+        }
+        self._cpv_profile_defaults_lock = threading.RLock()
+        self._cpv_running_profile: dict[str, float] = {}
         self.leases = LeaseManager(float(service_config.get("lease_ttl_s", 30.0)))
         log_dir = Path(service_config.get("log_dir", "logs/control"))
         stamp = time.strftime("%Y%m%dT%H%M%S")
@@ -313,9 +326,8 @@ class OperationalSpaceController:
                 if not result.get("ok"):
                     self._set_authority(ArmWriter.NONE, ServoMode.SUSPENDED, "FREEDRIVE exit failed")
                     raise RuntimeError(f"cannot exit FREEDRIVE: {result}")
-            # Apply the explicitly configured profile while output is stopped.
-            cv, acc = self._osc.cpv_limits()
-            self._configure_cpv_profile(cv, acc, acc)
+            # Read actual firmware settings, not the historical calibration
+            # snapshot. Mode/linkage changes may invalidate an earlier read.
             self._verify_cpv_profile("before_cpv_prime")
             state = self._set_authority(ArmWriter.SERVO, ServoMode.HOLDING, "osc session prepared", advance_epoch=True)
             # Prime CPV while the session is still in HOLDING. The first
@@ -339,10 +351,7 @@ class OperationalSpaceController:
                 )
                 if isinstance(prime_result, dict):
                     self._last_cpv_mode_entry = dict(prime_result.get("cpv_mode_entry") or {})
-                # Firmware mode entry can restore its default speed. Restore
-                # the operator's CV/ACC/DCC, then retain the upstream verifier.
-                cv, acc = self._osc.cpv_limits()
-                self._configure_cpv_profile(cv, acc, acc)
+                self._restore_cpv_profile_after_mode_entry()
                 self._verify_cpv_profile("after_cpv_prime")
             except TimeoutError as exc:
                 revoke_preparation()
@@ -483,17 +492,77 @@ class OperationalSpaceController:
         authority = state.get("authority") or {}
         if (state.get("session") or {}).get("id"):
             raise RuntimeError("end the OSC session before reading CPV parameters")
+        control = self.status().get("control") or {}
+        if control.get("mode") != "HOLD":
+            raise RuntimeError(
+                "CPV parameter operation failed: arm must be in HOLD "
+                f"(current mode={control.get('mode', 'unknown')})"
+            )
         if (authority.get("hardware_mode") != "HOLD"
                 or authority.get("safety_state") != "NORMAL"
                 or not authority.get("feedback_fresh")
                 or authority.get("arm_writer") == "MODE_TRANSITION"):
-            raise RuntimeError("CPV parameter query requires confirmed fresh-feedback HOLD")
+            raise RuntimeError("CPV parameter operation failed: confirmed fresh-feedback HOLD is required")
         return {"ok": True, "cpv_parameters": self.read_osc_cpv_parameters()}
 
+    def _persist_cpv_profile_defaults(self, **updates: float) -> dict[str, float]:
+        """Persist the operator-approved CPV profile for the next service start."""
+        with self._cpv_profile_defaults_lock:
+            profile = dict(self._cpv_profile_defaults)
+            profile.update({name: float(value) for name, value in updates.items()})
+            path = self._runtime_config_path
+            if path is None:
+                self._cpv_profile_defaults = profile
+                return dict(profile)
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+            data.setdefault("control_service", {})["cpv_profile_defaults"] = dict(profile)
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(path)
+            self._cpv_profile_defaults = profile
+            self._log("cpv_profile_defaults_persisted", profile=profile)
+            return dict(profile)
+
+    def _restore_saved_cpv_profile_after_startup(self) -> dict[str, Any] | None:
+        """Apply saved CPV values after reconnect, while the arm is in HOLD."""
+        with self._cpv_profile_defaults_lock:
+            profile = dict(self._cpv_profile_defaults)
+        if not profile:
+            return None
+        control = self.status().get("control") or {}
+        if control.get("mode") != "HOLD":
+            self._log("cpv_profile_startup_restore_skipped", reason="not_hold", mode=control.get("mode"))
+            return None
+        requested = {
+            "cv_rad_s": profile.get("cv_rad_s"),
+            "acc_rad_s2": profile.get("acc_rad_s2"),
+            "dcc_rad_s2": profile.get("dcc_rad_s2"),
+        }
+        try:
+            result = self._configure_cpv_profile(
+                requested["cv_rad_s"], requested["acc_rad_s2"], requested["dcc_rad_s2"]
+            )
+            readback = self.read_osc_cpv_parameters()
+            if readback.get("status") != "available":
+                raise RuntimeError(f"CPV startup restore read-back incomplete: {readback.get('missing')}")
+            self._log("cpv_profile_startup_restored", requested=requested, readback=readback)
+            return {"ok": True, "requested": requested, "result": result, "readback": readback}
+        except Exception as exc:
+            self._log("cpv_profile_startup_restore_failed", requested=requested,
+                      error=f"{type(exc).__name__}: {exc}")
+            return {"ok": False, "requested": requested, "error": str(exc)}
+
     def _verify_cpv_profile(self, stage: str) -> dict[str, Any]:
-        """One-shot CPV startup guard; never write Flash or run in servo ticks."""
-        speed, acceleration = self._osc.cpv_limits()
-        expected = {"acc": acceleration, "dcc": acceleration, "cv": speed}
+        """Read and report the CPV profile without blocking OSC on a mismatch.
+
+        The CPV values are a hardware diagnostic, not a prerequisite for
+        binding the web joystick.  In particular, firmware may report its
+        defaults (for example 1/1/1) after a reconnect.  A complete readback
+        is still required for safety diagnostics, but a complete profile that
+        differs from the configured OSC limits must not reject the session.
+        """
+        effective = self._effective_cpv_profile()
+        expected = {"acc": effective["acc_rad_s2"], "dcc": effective["dcc_rad_s2"], "cv": effective["cv_rad_s"]}
         profile = self.read_osc_cpv_parameters()
         values = profile.get("values") or {}
         mismatches = []
@@ -512,10 +581,25 @@ class OperationalSpaceController:
         }}
         self._cpv_profile_cache = profile
         self._log("cpv_profile_verification", stage=stage, profile=profile)
-        if mismatches:
-            raise RuntimeError("CPV hardware profile mismatch; remain stopped and explicitly "
-                               "sync parameters in HOLD: " + "; ".join(mismatches))
+        if mismatches and profile.get("status") != "available":
+            raise RuntimeError("CPV hardware profile read-back unavailable; remain stopped: "
+                               + "; ".join(mismatches))
         return profile
+
+    def _effective_cpv_profile(self) -> dict[str, float]:
+        speed, acceleration = self._osc.cpv_limits()
+        return {"cv_rad_s": speed, "acc_rad_s2": acceleration, "dcc_rad_s2": acceleration,
+                **self._cpv_profile_defaults, **self._cpv_running_profile}
+
+    def _restore_cpv_profile_after_mode_entry(self) -> dict[str, Any]:
+        """Restore configured CPV limits after firmware CPV mode entry.
+
+        NERO v120 can restore CV to its firmware default while accepting the
+        CPV mode command. The service reset itself never calls this method;
+        it runs only after an explicit hardware CPV handoff.
+        """
+        profile = self._effective_cpv_profile()
+        return self._configure_cpv_profile(profile["cv_rad_s"], profile["acc_rad_s2"], profile["dcc_rad_s2"])
 
     def _configure_cpv_profile(self, cv: float | None, acc: float | None, dcc: float | None) -> dict[str, Any]:
         requested = {"cv_rad_s": cv, "acc_rad_s2": acc, "dcc_rad_s2": dcc}
@@ -527,7 +611,54 @@ class OperationalSpaceController:
             self._log("cpv_profile_write_failed", requested=requested, error=str(exc))
             raise
         self._log("cpv_profile_write_completed", requested=requested, result=result)
+        self._cpv_running_profile = {**self._cpv_running_profile,
+                                     **{key: value for key, value in requested.items() if value is not None}}
         return result
+
+    def osc_set_cpv_parameters(self, values: dict, save_startup: bool = False) -> dict[str, Any]:
+        """Validate the whole profile before a serialized, idle-HOLD write."""
+        if not isinstance(values, dict) or set(values) != {"cv_rad_s", "acc_dcc_rad_s2"}:
+            raise ValueError("CPV 设置必须包含完整的 CV 和 ACC/DCC 两项参数")
+        if not isinstance(save_startup, bool):
+            raise ValueError("save_startup 必须是布尔值")
+        speed_limit, acceleration_limit = self._osc.cpv_limits()
+        for key, upper in (("cv_rad_s", speed_limit), ("acc_dcc_rad_s2", acceleration_limit)):
+            value = values[key]
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or not 0 < value <= upper):
+                raise ValueError(f"{key} 必须为正数且不超过 {upper}")
+        speed, acceleration = float(values["cv_rad_s"]), float(values["acc_dcc_rad_s2"])
+        with self._handoff_lock:
+            before = self.osc_readonly_cpv_parameters()["cpv_parameters"]
+            if before.get("status") != "available":
+                raise RuntimeError("CPV 设置失败：需要完整硬件读回")
+            previous_running = dict(self._cpv_running_profile)
+            try:
+                result = self._configure_cpv_profile(speed, acceleration, acceleration)
+                after = self.read_osc_cpv_parameters()
+                for name, target in (("cv", speed), ("acc", acceleration), ("dcc", acceleration)):
+                    row = (after.get("values") or {}).get(name) or []
+                    if (after.get("status") != "available" or len(row) != 7
+                            or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                                   or not math.isfinite(v) or abs(v - target) > 1e-6 for v in row)):
+                        raise RuntimeError(f"CPV 设置失败：{name} 七关节读回不匹配")
+                for name in ("pp", "kp", "ki"):
+                    if after["values"].get(name) != before["values"].get(name):
+                        raise RuntimeError(f"CPV 设置失败：未请求的 {name} 发生变化")
+            except Exception:
+                self._cpv_running_profile = previous_running
+                # Firmware writes are sequential, not transactional. Preserve
+                # a fresh diagnostic after a partial failure; never save it.
+                try:
+                    self.read_osc_cpv_parameters()
+                except Exception:
+                    self._cpv_profile_cache = {"status": "not_read"}
+                raise
+            if save_startup:
+                self._persist_cpv_profile_defaults(cv_rad_s=speed, acc_rad_s2=acceleration, dcc_rad_s2=acceleration)
+            return {"ok": True, "readback": after,
+                    "result": result, "saved_startup": save_startup,
+                    "cpv_profile_defaults": dict(self._cpv_profile_defaults)}
 
     def osc_set_cpv_acceleration(self, acceleration: float) -> dict[str, Any]:
         """Explicit ACC/DCC-only maintenance; no CV, motion or calibration."""
@@ -548,8 +679,12 @@ class OperationalSpaceController:
         for name in ("cv", "pp", "kp", "ki"):
             if after["values"][name] != before["values"][name]:
                 raise RuntimeError(f"unexpected change to untouched CPV parameter {name}")
+        defaults = self._persist_cpv_profile_defaults(
+            acc_rad_s2=acceleration, dcc_rad_s2=acceleration
+        )
         return {"ok": True, "requested_acc_dcc_rad_s2": acceleration,
-                "before": before, "result": result, "readback": after}
+                "before": before, "result": result, "readback": after,
+                "cpv_profile_defaults": defaults}
 
     def osc_set_cpv_speed(self, speed: float) -> dict[str, Any]:
         """Explicit CV-only maintenance; preserve existing ACC/DCC and gains."""
@@ -568,8 +703,10 @@ class OperationalSpaceController:
         for name in ("acc", "dcc", "pp", "kp", "ki"):
             if after["values"][name] != values[name]:
                 raise RuntimeError(f"unexpected change to untouched CPV parameter {name}")
+        defaults = self._persist_cpv_profile_defaults(cv_rad_s=speed)
         return {"ok": True, "requested_cv_rad_s": speed,
-                "before": before, "result": result, "readback": after}
+                "before": before, "result": result, "readback": after,
+                "cpv_profile_defaults": defaults}
 
     def sync_cpv_profile_to_osc_limits(self) -> dict[str, Any]:
         """Apply current OSC limits only while the arm is safely idle/HOLD."""
@@ -603,8 +740,11 @@ class OperationalSpaceController:
         profile = self.read_osc_cpv_parameters()
         if profile.get("status") != "available":
             raise RuntimeError(f"CPV profile was written but complete read-back is unavailable: {profile.get('missing')}")
+        defaults = self._persist_cpv_profile_defaults(
+            cv_rad_s=speed, acc_rad_s2=acceleration, dcc_rad_s2=acceleration
+        )
         return {"ok": True, "requested": {"cv_rad_s": speed, "acc_rad_s2": acceleration, "dcc_rad_s2": acceleration},
-                "result": result, "readback": profile}
+                "result": result, "readback": profile, "cpv_profile_defaults": defaults}
 
     @staticmethod
     def _telemetry_percentile(values: list[float], fraction: float) -> float | None:
@@ -856,6 +996,11 @@ class OperationalSpaceController:
                     "service_health": self.health(),
                     "feedback_ready": {"ok": False, "reason": "USB-CAN connection is unavailable"},
                 })
+        if self._hardware_transport_available:
+            # Reconnect/reset can restore the controller's firmware defaults.
+            # Reapply only the explicitly saved maintenance profile, and only
+            # after the startup snapshot has confirmed a stationary HOLD.
+            self._restore_saved_cpv_profile_after_startup()
         self._watchdog = threading.Thread(target=self._watchdog_loop, name="nero-lease-watchdog", daemon=True)
         self._watchdog.start()
         if self._hardware_transport_available:
@@ -1145,6 +1290,11 @@ class OperationalSpaceController:
     def osc_kinematics(self) -> dict[str, Any]:
         return self._osc.kinematics()
 
+    def osc_apply_tuning(self, values: dict, save_startup: bool = False, expected_revision: int | None = None) -> dict[str, Any]:
+        tuning = self._osc.apply_tuning(values, save_startup, expected_revision)
+        self._log("osc_tuning_applied", tuning=tuning, save_startup=save_startup)
+        return {"ok": True, "tuning": tuning}
+
     # ---- Public OSC facade -------------------------------------------------
     # OSC accepts only base-frame absolute targets and mode/end-effector
     # commands. Clutch and relative-pose handling live in legacy input
@@ -1251,20 +1401,11 @@ class OperationalSpaceController:
             )
         elif command_type == "gripper":
             width = payload.get("width_m")
-            inference_stream = payload.get("inference_stream") is True
-            if inference_stream:
-                session = self._osc.status().get("session") or {}
-                if session.get("state") != "ACTIVE" or session.get("id") != body.get("session_id") or session.get("client_id") != body.get("client_id"):
-                    raise PermissionError("inference gripper requires the caller's active OSC session")
-                if session.get("execution_mode") == "shadow":
-                    return {"ok": True, "result": {"ok": True, "sent": False,
-                        "robot_commands_sent": False, "shadow": True, "target_width_m": width}}
             result = self.command_gripper(
                 str(payload.get("mode", "")),
                 float(width) if width is not None else None,
                 float(payload.get("force_n", 1.0)),
                 bool(payload.get("preserve_on_freedrive", False)),
-                **({"inference_stream": True} if inference_stream else {}),
             )
         else:
             raise ValueError("OSC command type must be track_tcp, move_tcp, hold, stop, freedrive, or gripper")
@@ -1498,6 +1639,9 @@ class OperationalSpaceController:
                 "last_cpv_dispatch": None if shadow else (cpv_mailbox.get("last_success") or (recent_batches[-1] if recent_batches else None)),
                 "last_cpv_mode_entry": None if shadow else self._last_cpv_mode_entry,
                 "cpv_parameters": dict(self._cpv_profile_cache or raw_diagnostics.get("cpv_parameters", {"status": "not_read"})),
+                "cpv_profile_defaults": dict(self._cpv_profile_defaults),
+                "cpv_maintenance_limits": dict(zip(("cv_rad_s", "acc_dcc_rad_s2"), self._osc.cpv_limits())),
+                "osc_tuning": self._osc.tuning_state(),
                 "hardware_tx_owner": tx_owner,
                 "cpv_mailbox": cpv_mailbox,
             },
@@ -1586,9 +1730,7 @@ class OperationalSpaceController:
             calibration, feedback, dict(telemetry["cpv_parameters"])
         )
         config_path = Path(__file__).resolve().parents[1] / "config" / "osc.json"
-        temporary = config_path.with_suffix(".json.tmp")
-        temporary.write_text(self._osc.configuration_json(), encoding="utf-8")
-        temporary.replace(config_path)
+        self._osc.persist_configuration(config_path)
         return {"ok": True, "telemetry": telemetry, "applied": {
             "shadow_transport": applied_runtime["shadow_transport"],
             "cpv_profile_limits": {"max_joint_speed_rad_s": cpv_speed, "max_joint_acceleration_rad_s2": cpv_acceleration},
@@ -1934,7 +2076,6 @@ class OperationalSpaceController:
         force_n: float,
         preserve_on_freedrive: bool,
         resume_osc: bool = False,
-        inference_stream: bool = False,
     ) -> dict[str, Any]:
         # HOLD is the safety escape from a tracking session. Hardware status
         # polling is deliberately paused while CPV owns the transport, so a
@@ -1971,7 +2112,6 @@ class OperationalSpaceController:
                 width_m=width_m,
                 force_n=force_n,
                 preserve_on_freedrive=preserve_on_freedrive,
-                **({"inference_stream": True} if inference_stream else {}),
             )
             result["arm_hold"] = arm_hold
             return result
