@@ -187,9 +187,12 @@ class BackendProcessProxy:
                     "args": args,
                     "kwargs": kwargs,
                 })
-                if not self.connection.poll(self.call_timeout_s):
+                # Whole-profile maintenance includes 21 firmware writes plus
+                # full pre/post readback; legacy firmware can omit ACKs.
+                timeout_s = max(self.call_timeout_s, 60.0) if method == "osc_set_cpv_parameters" else self.call_timeout_s
+                if not self.connection.poll(timeout_s):
                     raise ControlServiceUnavailable(
-                        f"hardware backend call {method} exceeded {self.call_timeout_s:.0f}s; use Reset to release it"
+                        f"hardware backend call {method} exceeded {timeout_s:.0f}s; use Reset to release it"
                     )
                 response = self.connection.recv()
             except (BrokenPipeError, EOFError, OSError) as exc:
@@ -1311,6 +1314,12 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 ))
             if self.path == "/api/osc/cpv-speed":
                 return self._json_ok(self.broker.osc_set_cpv_speed(float(body["speed_rad_s"])))
+            if self.path == "/api/osc/cpv-parameters":
+                return self._json_ok(self.broker.osc_set_cpv_parameters(
+                    body.get("values"), body.get("save_startup", False)))
+            if self.path == "/api/osc/tuning":
+                return self._json_ok(self.broker.osc_apply_tuning(
+                    body.get("values"), body.get("save_startup", False), body.get("expected_revision")))
             if self.path == "/api/osc/cpv-acceleration":
                 return self._json_ok(self.broker.osc_set_cpv_acceleration(float(body["acceleration_rad_s2"])))
             if self.path == "/api/osc/cpv-profile/sync":

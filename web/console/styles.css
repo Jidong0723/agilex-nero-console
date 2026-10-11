@@ -266,3 +266,15 @@
 @media(max-width:720px){.osc-panel .pi05-help .help-content{grid-template-columns:1fr}}
 .dataset-alert { color: #ff717b !important; background: #47232a; border-radius: 4px; padding: 2px 4px; }
 .dataset-warning { color: #f1c567 !important; }
+/* CPV maintenance controls */
+.maintenance>div>h3,.osc-tuning-maintenance{flex-basis:100%;width:100%}
+.osc-tuning-maintenance{padding-top:12px;border-top:1px solid var(--line)}
+.osc-tuning-scroll{overflow-x:auto;margin:12px 0}
+.maintenance>div>.osc-tuning-scroll,.maintenance>div>.osc-tuning-save{flex-basis:100%;min-width:0}
+.maintenance #cpv-maintenance-result{flex-basis:100%;margin:0}
+.osc-tuning-table{width:100%;border-collapse:collapse;min-width:680px;text-align:left;font-size:12px}
+.osc-tuning-table th,.osc-tuning-table td{padding:7px;border-bottom:1px solid var(--line)}
+.osc-tuning-table small{display:block;color:var(--muted)}
+.osc-tuning-table input{min-width:100px;max-width:160px}
+.osc-tuning-save{display:flex;gap:8px;align-items:center;margin:10px 0;color:var(--muted);font-size:12px}
+.osc-tuning-save input{width:auto}

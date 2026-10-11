@@ -100,6 +100,31 @@ class DirectCpvTests(unittest.TestCase):
         self.assertEqual(published["joint_target_rad"], result["final_joint_target_rad"])
         self.assertEqual(published["max_joint_acceleration_rad_s2"], 2.0)
 
+    def test_tuning_during_solve_takes_effect_as_one_group_next_cycle(self):
+        self.raw_velocity = [0.] * 7
+        old = self.servo.tuning.public()["running"]
+        new = {**old, "frame_gain": .5, "posture_cost": .002,
+               "arrival_position_tolerance_m": .003}
+        requests = []
+        solve = self.solve_current
+        def capture(request, timeout):
+            requests.append(request)
+            self.servo.tuning.apply(new)
+            result = solve(request, timeout)
+            result.update(position_error_m=.001, orientation_error_rad=0.)
+            return result
+        self.servo.solver.solve_current = capture
+        self.step()
+        self.assertEqual(requests[0]["frame_gain"], old["frame_gain"])
+        self.assertEqual(requests[0]["posture_cost"], old["posture_cost"])
+        # This cycle still uses the old position tolerance, so cannot start
+        # the arrival timer even though the new tolerance was published.
+        self.assertEqual(self.servo._arrival_since_monotonic_ns, 0)
+        self.step()
+        self.assertEqual(requests[1]["frame_gain"], new["frame_gain"])
+        self.assertEqual(requests[1]["posture_cost"], new["posture_cost"])
+        self.assertGreater(self.servo._arrival_since_monotonic_ns, 0)
+
     def test_shipped_acceleration_reaches_solver_dispatch_and_profile_sync(self):
         shipped = json.loads((ROOT / "config/osc.json").read_text(encoding="utf-8"))
         acceleration = shipped["solver"]["joint_acceleration_limit_rad_s2"]

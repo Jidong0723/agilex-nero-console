@@ -288,6 +288,130 @@
     return state.osc?.session || { state: "IDLE", id: null, client_id: null, mode: null, execution_mode: null, input_source: null };
   }
 
+  let cpvDraftInitialized = false;
+  let cpvBusy = false;
+  function renderCpvProfile() {
+    const transport = state.osc?.transport || {};
+    const values = transport.cpv_parameters?.status === "available" ? transport.cpv_parameters.values || {} : {};
+    const defaults = transport.cpv_profile_defaults || {};
+    const summary = (row) => {
+      if (!Array.isArray(row) || row.length !== 7 || !row.every(v => typeof v === "number" && Number.isFinite(v))) return "--";
+      const lo = Math.min(...row), hi = Math.max(...row);
+      return lo === hi ? lo.toFixed(3) : `${lo.toFixed(3)}–${hi.toFixed(3)}`;
+    };
+    const saved = value => typeof value === "number" && Number.isFinite(value) ? value.toFixed(3) : "--";
+    $("cpv-running-speed").textContent = summary(values.cv);
+    $("cpv-running-acceleration").textContent = `ACC ${summary(values.acc)} / DCC ${summary(values.dcc)}`;
+    $("cpv-startup-speed").textContent = saved(defaults.cv_rad_s);
+    $("cpv-startup-acceleration").textContent = `ACC ${saved(defaults.acc_rad_s2)} / DCC ${saved(defaults.dcc_rad_s2)}`;
+    const limits = transport.cpv_maintenance_limits;
+    if (limits) {
+      $("cpv-speed-input").max = limits.cv_rad_s;
+      $("cpv-acceleration-input").max = limits.acc_dcc_rad_s2;
+      $("cpv-speed-range").textContent = `0 < CV ≤ ${limits.cv_rad_s}`;
+      $("cpv-acceleration-range").textContent = `0 < ACC/DCC ≤ ${limits.acc_dcc_rad_s2}`;
+    }
+    if (!cpvDraftInitialized && Number.isFinite(defaults.cv_rad_s) && Number.isFinite(defaults.acc_rad_s2)) {
+      // Initialise only once; periodic status updates must not replace edits.
+      if (!$("cpv-speed-input").value) $("cpv-speed-input").value = defaults.cv_rad_s.toFixed(3);
+      if (!$("cpv-acceleration-input").value) $("cpv-acceleration-input").value = defaults.acc_rad_s2.toFixed(3);
+      cpvDraftInitialized = true;
+    }
+  }
+
+  async function applyCpvProfile(readOnly = false) {
+    if (cpvBusy) return;
+    cpvBusy = true;
+    const output = $("cpv-maintenance-result");
+    $("apply-cpv-profile").disabled = $("read-cpv-profile").disabled = true;
+    try {
+      let result;
+      if (readOnly) {
+        output.textContent = "正在读取硬件 CPV 参数…";
+        result = await api("/api/osc/cpv-parameters/read-only", "GET", null, 45000);
+      } else {
+        const values = {};
+        for (const [key, id, fallback] of [["cv_rad_s", "cpv-speed-input", 2], ["acc_dcc_rad_s2", "cpv-acceleration-input", 10]]) {
+          const raw = $(id).value;
+          const value = Number(raw);
+          const upper = Number(state.osc?.transport?.cpv_maintenance_limits?.[key] ?? fallback);
+          if (!raw.trim() || !Number.isFinite(value) || value <= 0 || value > upper) throw new Error(`${key} 必须大于 0 且不超过 ${upper}`);
+          values[key] = value;
+        }
+        output.textContent = "正在设置整组硬件参数并核验七关节读回…";
+        result = await api("/api/osc/cpv-parameters", "POST", { values, save_startup: Boolean($("cpv-save-startup").checked) }, 75000);
+      }
+      state.osc.transport ||= {};
+      state.osc.transport.cpv_parameters = readOnly ? result.cpv_parameters : result.readback;
+      if (result.cpv_profile_defaults) state.osc.transport.cpv_profile_defaults = result.cpv_profile_defaults;
+      renderCpvProfile();
+      output.textContent = readOnly ? "硬件读回值已刷新" : result.saved_startup
+        ? "整组硬件参数已应用并核验，已保存为启动配置"
+        : "整组硬件参数已应用并核验；服务启动配置未改变";
+    } catch (error) {
+      output.textContent = `${readOnly ? "读取" : "设置"}失败：${error.message}${readOnly ? "" : "。硬件顺序写入不支持原子回滚，请刷新读回确认实际值"}`;
+    } finally {
+      cpvBusy = false;
+      $("apply-cpv-profile").disabled = $("read-cpv-profile").disabled = false;
+    }
+  }
+
+  let tuningEditRevision = null;
+  let tuningBusy = false;
+  function renderOscTuning(resetDraft = false) {
+    const tuning = state.osc?.transport?.osc_tuning;
+    const container = $("osc-tuning-fields");
+    if (!container || !tuning?.fields) return;
+    const display = (value, scale) => Number((Number(value) * scale).toPrecision(8));
+    if (tuningEditRevision === null || resetDraft) {
+      container.innerHTML = Object.entries(tuning.fields).map(([key, spec]) => {
+        const min = display(spec.min, spec.scale), max = display(spec.max, spec.scale);
+        return `<tr><td>${escapeHtml(spec.label)}<small>${escapeHtml(key)}</small></td>` +
+          `<td id="tuning-running-${key}"></td><td><input id="tuning-edit-${key}" type="number" step="any" min="${min}" max="${max}" value="${display(tuning.running[key], spec.scale)}" aria-label="${escapeHtml(spec.label)}编辑值"></td>` +
+          `<td>${min}–${max} ${escapeHtml(spec.unit)}</td><td id="tuning-startup-${key}"></td></tr>`;
+      }).join("");
+      tuningEditRevision = tuning.revision;
+    }
+    for (const [key, spec] of Object.entries(tuning.fields)) {
+      const running = $("tuning-running-" + key), startup = $("tuning-startup-" + key);
+      if (running) running.textContent = `${display(tuning.running[key], spec.scale)} ${spec.unit}`;
+      if (startup) startup.textContent = `${display(tuning.startup[key], spec.scale)} ${spec.unit}`;
+    }
+  }
+
+  async function applyOscTuning() {
+    if (tuningBusy) return;
+    const tuning = state.osc?.transport?.osc_tuning;
+    const output = $("osc-tuning-result");
+    if (!tuning) { output.textContent = "设置失败：等待控制服务加载 OSC 参数"; return; }
+    tuningBusy = true;
+    $("apply-osc-tuning").disabled = true;
+    try {
+      const values = {};
+      for (const [key, spec] of Object.entries(tuning.fields)) {
+        const raw = $("tuning-edit-" + key).value;
+        const value = Number(raw) / spec.scale;
+        if (!raw.trim() || !Number.isFinite(value) || value < spec.min - 1e-12 || value > spec.max + 1e-12) {
+          throw new Error(`${spec.label}超出建议范围`);
+        }
+        values[key] = Math.min(spec.max, Math.max(spec.min, value));
+      }
+      output.textContent = "正在应用整组参数…";
+      const save = Boolean($("osc-tuning-save").checked);
+      const result = await api("/api/osc/tuning", "POST", {
+        values, save_startup: save, expected_revision: tuningEditRevision,
+      });
+      state.osc.transport.osc_tuning = result.tuning;
+      renderOscTuning(true);
+      output.textContent = save ? "整组参数已应用到当前运行，并保存为启动配置" : "整组参数已应用到当前运行；启动配置未改变";
+    } catch (error) {
+      output.textContent = `设置失败：${error.message}`;
+    } finally {
+      tuningBusy = false;
+      $("apply-osc-tuning").disabled = false;
+    }
+  }
+
   const isShadowSession = (current) => (current.execution_mode || current.mode) === "shadow";
 
   function canSendNonzero(allowHoldReadyResume = false) {
@@ -1176,6 +1300,8 @@
     $("hardware-cpv-cv").textContent = cpvSummary("cv", "rad/s");
     $("hardware-cpv-acc").textContent = cpvSummary("acc", "rad/s²");
     $("hardware-cpv-dcc").textContent = cpvSummary("dcc", "rad/s²");
+    renderOscTuning();
+    renderCpvProfile();
     const hardwareSource = hardwareFeedback.tcp_source || "none";
     const feedbackAgeMs = Number.isFinite(hardwareFeedbackAge) ? hardwareFeedbackAge : executionFeedbackAge;
     const feedbackSourceText = hardwareSource === "sdk_tcp_from_leader_fk" ? "SDK TCP · Leader FK" : hardwareSource === "sdk_tcp_from_follower_feedback" ? "SDK TCP · Follower" : "反馈未就绪";
@@ -1709,6 +1835,8 @@
   $("gripper-open").onclick = () => oscCommand("gripper", { mode: "open", force_n: Number($("gripper-force-input").value) });
   $("gripper-grip").onclick = () => oscCommand("gripper", { mode: "grip", force_n: Number($("gripper-force-input").value) });
   $("gripper-position").onclick = () => oscCommand("gripper", { mode: "position", width_m: Number($("gripper-width-input").value) / 1000, force_n: Number($("gripper-force-input").value) });
+  $("apply-cpv-profile").onclick = () => void applyCpvProfile();
+  $("read-cpv-profile").onclick = () => void applyCpvProfile(true);
   $("reset-control").onclick = async () => {
     try {
       state.resetPendingUntil = Date.now() + 10000;
@@ -1730,6 +1858,8 @@
       $("maintenance-result").textContent = `\u91cd\u7f6e\u5931\u8d25\uff1a${error.message}`;
     }
   };
+  $("apply-osc-tuning").onclick = applyOscTuning;
+  $("reload-osc-tuning").onclick = () => renderOscTuning(true);
   updateRightLabels();
   updateInputView();
   applyAdapterSelection();

@@ -5,9 +5,10 @@ import threading
 import unittest
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from scripts.nero_control_server import (
+    BackendProcessProxy,
     ControlRequestHandler,
     ExclusiveThreadingHTTPServer,
     ServiceRuntime,
@@ -84,6 +85,32 @@ class ControlHttpBootstrapTests(unittest.TestCase):
         self.assertIn('"\\u786c\\u4ef6\\u5df2\\u8fde\\u63a5"', app)
         self.assertIn('"\\u786c\\u4ef6\\u672a\\u8fde\\u63a5"', app)
         self.assertNotIn('control.connected ? "服务在线" : "服务离线"', app)
+
+    def test_cpv_group_http_forwards_complete_values_and_explicit_save(self) -> None:
+        from unittest.mock import Mock, patch
+        broker = Mock()
+        broker.osc_set_cpv_parameters.return_value = {"saved_startup": False}
+        values = {"cv_rad_s": 2, "acc_dcc_rad_s2": 10}
+        with patch.object(self.runtime, "require_broker", return_value=broker):
+            request = Request(f"{self.base_url}/api/osc/cpv-parameters",
+                              data=json.dumps({"values": values}).encode(),
+                              headers={"Content-Type": "application/json"})
+            with urlopen(request, timeout=1) as response:
+                self.assertFalse(json.load(response)["data"]["saved_startup"])
+            broker.osc_set_cpv_parameters.assert_called_once_with(values, False)
+
+    def test_cpv_group_rpc_budget_accounts_for_sequential_firmware_acks(self) -> None:
+        from unittest.mock import Mock
+        connection = Mock()
+        connection.recv.side_effect = [
+            {"kind": "result", "id": 1, "result": {}},
+            {"kind": "result", "id": 2, "result": {}},
+        ]
+        proxy = BackendProcessProxy(Mock(), connection)
+        proxy.call("osc_set_cpv_parameters", {"cv_rad_s": 2, "acc_dcc_rad_s2": 10}, False)
+        connection.poll.assert_called_with(60.0)
+        proxy.call("osc_state")
+        connection.poll.assert_called_with(30.0)
 
 
 if __name__ == "__main__":

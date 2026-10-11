@@ -1,4 +1,4 @@
-﻿{
+{
   "schema_version": 1,
   "created_for": "phase3_lightweight_runtime",
   "sdk": {
@@ -49,6 +49,11 @@
   "control_service": {
     "url": "http://127.0.0.1:8765",
     "lease_ttl_s": 30.0,
+    "cpv_profile_defaults": {
+      "cv_rad_s": 2.0,
+      "acc_rad_s2": 10.0,
+      "dcc_rad_s2": 10.0
+    },
     "startup_connect_timeout_s": 12.0,
     "log_dir": "runtime/logs/control",
     "osc_diagnostics_hz": 20

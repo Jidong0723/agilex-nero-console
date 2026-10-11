@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+import json
 from pathlib import Path
 from typing import Any
 
@@ -229,6 +230,103 @@ class BrokerPreemptionTests(unittest.TestCase):
         self.assertEqual(len(self.fake.cpv_parameter_reads), 42)
         self.assertEqual(self.fake.execute_calls, 0)
 
+    def test_cpv_parameter_operation_rejects_non_hold_before_hardware_write(self) -> None:
+        from unittest.mock import patch
+        state = {"session": {"id": None}, "authority": {
+            "hardware_mode": "HOLD", "safety_state": "NORMAL", "feedback_fresh": True}}
+        with patch.object(self.hardware, "osc_state", return_value=state), \
+             patch.object(self.hardware, "status", return_value={"control": {"mode": "FREEDRIVE"}}), \
+             patch.object(self.hardware, "read_osc_cpv_parameters") as read:
+            with self.assertRaisesRegex(RuntimeError, "must be in HOLD"):
+                self.hardware.osc_readonly_cpv_parameters()
+            read.assert_not_called()
+
+    def test_cpv_profile_defaults_persist_and_restore_after_startup_hold(self) -> None:
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "runtime.json"
+            path.write_text(json.dumps({"control_service": {}}), encoding="utf-8")
+            self.hardware._runtime_config_path = path
+            self.hardware._cpv_profile_defaults = {
+                "cv_rad_s": 2.0, "acc_rad_s2": 10.0, "dcc_rad_s2": 10.0,
+            }
+            saved = self.hardware._persist_cpv_profile_defaults(cv_rad_s=1.75)
+            self.assertEqual(saved["cv_rad_s"], 1.75)
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["control_service"]["cpv_profile_defaults"]["cv_rad_s"], 1.75)
+            with patch.object(self.hardware, "status", return_value={"control": {"mode": "HOLD"}}), \
+                 patch.object(self.hardware, "_configure_cpv_profile", return_value={"ok": True}) as configure, \
+                 patch.object(self.hardware, "read_osc_cpv_parameters", return_value={"status": "available", "values": {}}):
+                result = self.hardware._restore_saved_cpv_profile_after_startup()
+            self.assertTrue(result["ok"])
+            configure.assert_called_once_with(1.75, 10.0, 10.0)
+
+    def test_cpv_group_validates_all_values_before_any_hardware_access(self) -> None:
+        from unittest.mock import patch
+        invalid = [None, {}, {"cv_rad_s": 2}, {"cv_rad_s": 2, "acc_dcc_rad_s2": 11},
+                   {"cv_rad_s": True, "acc_dcc_rad_s2": 10},
+                   {"cv_rad_s": float("nan"), "acc_dcc_rad_s2": 10},
+                   {"cv_rad_s": 0, "acc_dcc_rad_s2": 10},
+                   {"cv_rad_s": "2", "acc_dcc_rad_s2": 10}]
+        with patch.object(self.hardware._osc, "cpv_limits", return_value=(2, 10)), \
+             patch.object(self.hardware, "osc_readonly_cpv_parameters") as read, \
+             patch.object(self.hardware.robot, "call") as write:
+            for values in invalid:
+                with self.subTest(values=values), self.assertRaises(ValueError):
+                    self.hardware.osc_set_cpv_parameters(values)
+            with self.assertRaises(ValueError):
+                self.hardware.osc_set_cpv_parameters({"cv_rad_s": 2, "acc_dcc_rad_s2": 10}, "false")
+            read.assert_not_called()
+            write.assert_not_called()
+
+    def test_cpv_group_runtime_and_saved_profiles_are_distinct(self) -> None:
+        from unittest.mock import patch
+        before = {"status": "available", "values": {key: [1.0] * 7 for key in ("cv", "acc", "dcc", "pp", "kp", "ki")}}
+        after = {"status": "available", "values": {**before["values"], "cv": [1.5] * 7, "acc": [8.] * 7, "dcc": [8.] * 7}}
+        self.hardware._cpv_profile_defaults = {"cv_rad_s": 2., "acc_rad_s2": 10., "dcc_rad_s2": 10.}
+        with patch.object(self.hardware._osc, "cpv_limits", return_value=(2, 10)), \
+             patch.object(self.hardware, "osc_readonly_cpv_parameters", return_value={"cpv_parameters": before}), \
+             patch.object(self.hardware, "read_osc_cpv_parameters", return_value=after), \
+             patch.object(self.hardware.robot, "call", return_value={"ok": True}) as write:
+            result = self.hardware.osc_set_cpv_parameters({"cv_rad_s": 1.5, "acc_dcc_rad_s2": 8})
+            self.assertFalse(result["saved_startup"])
+            self.assertEqual(result["cpv_profile_defaults"]["cv_rad_s"], 2.)
+            write.assert_called_once_with("p0", "configure_cpv_profile", 1.5, 8., 8., category="cpv_profile_configuration")
+            self.hardware._restore_cpv_profile_after_mode_entry()
+            self.assertEqual(write.call_args.args[2:], (1.5, 8., 8.))
+            saved = self.hardware.osc_set_cpv_parameters({"cv_rad_s": 1.5, "acc_dcc_rad_s2": 8}, True)
+            self.assertTrue(saved["saved_startup"])
+            self.assertEqual(saved["cpv_profile_defaults"], {"cv_rad_s": 1.5, "acc_rad_s2": 8., "dcc_rad_s2": 8.})
+
+    def test_cpv_group_refuses_non_hold_and_never_saves_partial_failure(self) -> None:
+        from unittest.mock import patch
+        values = {"cv_rad_s": 2., "acc_dcc_rad_s2": 10.}
+        state = {"session": {}, "authority": {"hardware_mode": "HOLD", "safety_state": "NORMAL", "feedback_fresh": True}}
+        with patch.object(self.hardware, "osc_state", return_value=state), \
+             patch.object(self.hardware, "status", return_value={"control": {"mode": "FREEDRIVE"}}), \
+             patch.object(self.hardware.robot, "call") as write:
+            with self.assertRaisesRegex(RuntimeError, "must be in HOLD"):
+                self.hardware.osc_set_cpv_parameters(values)
+            write.assert_not_called()
+        snapshot = {"status": "available", "values": {key: [1.] * 7 for key in ("cv", "acc", "dcc", "pp", "kp", "ki")}}
+        with patch.object(self.hardware, "osc_readonly_cpv_parameters", return_value={"cpv_parameters": snapshot}), \
+             patch.object(self.hardware, "read_osc_cpv_parameters", return_value=snapshot) as read, \
+             patch.object(self.hardware.robot, "call", return_value={"ok": True}), \
+             patch.object(self.hardware, "_persist_cpv_profile_defaults") as save:
+            with self.assertRaisesRegex(RuntimeError, "七关节读回不匹配"):
+                self.hardware.osc_set_cpv_parameters(values, True)
+            save.assert_not_called()
+            self.assertEqual(read.call_count, 2)
+
+    def test_cpv_save_failure_does_not_publish_unsaved_defaults(self) -> None:
+        from unittest.mock import patch
+        self.hardware._cpv_profile_defaults = {"cv_rad_s": 2.}
+        self.hardware._runtime_config_path = Path("missing-runtime-file.json")
+        with patch.object(Path, "read_text", side_effect=OSError("disk error")):
+            with self.assertRaises(OSError):
+                self.hardware._persist_cpv_profile_defaults(cv_rad_s=1.5)
+        self.assertEqual(self.hardware._cpv_profile_defaults, {"cv_rad_s": 2.})
+
     def test_acceleration_only_maintenance_preserves_other_parameters(self) -> None:
         from unittest.mock import patch
         import copy
@@ -277,7 +375,7 @@ class BrokerPreemptionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "untouched CPV parameter acc"):
                 self.hardware.osc_set_cpv_speed(2.0)
 
-    def test_cpv_startup_profile_guard_rejects_reset_and_missing_values_without_writes(self) -> None:
+    def test_cpv_startup_profile_reports_mismatch_without_rejecting_complete_readback(self) -> None:
         from unittest.mock import patch
         import copy
         correct = {"status": "available", "values": {
@@ -291,15 +389,15 @@ class BrokerPreemptionTests(unittest.TestCase):
                 changed = copy.deepcopy(correct)
                 changed["values"][name][2] = value
                 read.return_value = changed
-                with self.assertRaisesRegex(RuntimeError, "CPV hardware profile mismatch"):
-                    self.hardware._verify_cpv_profile("after_cpv_prime")
+                result = self.hardware._verify_cpv_profile("after_cpv_prime")
+                self.assertFalse(result["verification"]["ok"])
                 self.assertFalse(self.hardware._cpv_profile_cache["verification"]["ok"])
             read.return_value = {"status": "partial", "values": {}}
-            with self.assertRaisesRegex(RuntimeError, "incomplete read-back"):
+            with self.assertRaisesRegex(RuntimeError, "read-back unavailable"):
                 self.hardware._verify_cpv_profile("before_cpv_prime")
             write.assert_not_called()
 
-    def test_cpv_prepare_never_primes_with_wrong_profile_and_revokes_on_post_prime_reset(self) -> None:
+    def test_cpv_prepare_continues_with_profile_mismatch_and_revokes_on_post_prime_reset(self) -> None:
         from unittest.mock import patch
         from supervisor.authority import ArmWriter
         with patch.object(self.hardware, "_require_operational_control"), \
@@ -307,15 +405,30 @@ class BrokerPreemptionTests(unittest.TestCase):
              patch.object(self.hardware.robot, "call") as prime:
             with self.assertRaisesRegex(RuntimeError, "profile mismatch"):
                 self.hardware.prepare_osc_hardware()
+            # A read/transport failure is still a safety stop; only a
+            # complete but mismatched profile is non-blocking.
             prime.assert_not_called()
+
+        mismatch = {"verification": {"ok": False, "mismatches": ["cv:J1=1.0, expected 2.0"]}}
+        with patch.object(self.hardware, "_require_operational_control"), \
+             patch.object(self.hardware, "_verify_cpv_profile", side_effect=[mismatch, mismatch]) as verify, \
+             patch.object(self.hardware, "_restore_cpv_profile_after_mode_entry") as restore, \
+             patch.object(self.hardware.robot, "call", return_value={}) as prime:
+            self.hardware.prepare_osc_hardware()
+            self.assertEqual([call.args[0] for call in verify.call_args_list],
+                             ["before_cpv_prime", "after_cpv_prime"])
+            restore.assert_called_once()
+            prime.assert_called_once()
         for post_error in (RuntimeError("profile reset by mode entry"), RuntimeError("read failed")):
             with patch.object(self.hardware, "_require_operational_control"), \
                  patch.object(self.hardware, "_verify_cpv_profile", side_effect=[{}, post_error]) as verify, \
+                 patch.object(self.hardware, "_restore_cpv_profile_after_mode_entry") as restore, \
                  patch.object(self.hardware.robot, "call", return_value={}) as prime:
                 with self.assertRaisesRegex(RuntimeError, str(post_error)):
                     self.hardware.prepare_osc_hardware()
                 self.assertEqual([call.args[0] for call in verify.call_args_list],
                                  ["before_cpv_prime", "after_cpv_prime"])
+                restore.assert_called_once()
                 prime.assert_called_once()
                 self.assertEqual(self.hardware.supervisor.snapshot().writer, ArmWriter.NONE)
 
@@ -324,9 +437,10 @@ class BrokerPreemptionTests(unittest.TestCase):
         events = []
         with patch.object(self.hardware, "_require_operational_control"), \
              patch.object(self.hardware, "_verify_cpv_profile", side_effect=lambda stage: events.append(stage)), \
+             patch.object(self.hardware, "_restore_cpv_profile_after_mode_entry", side_effect=lambda: events.append("restore")), \
              patch.object(self.hardware.robot, "call", side_effect=lambda *a, **kw: events.append("prime") or {}):
             self.hardware.prepare_osc_hardware()
-        self.assertEqual(events, ["before_cpv_prime", "prime", "after_cpv_prime"])
+        self.assertEqual(events, ["before_cpv_prime", "prime", "restore", "after_cpv_prime"])
 
     def test_cpv_profile_check_failure_does_not_clear_concurrent_safety_authority(self) -> None:
         from unittest.mock import patch

@@ -68,8 +68,31 @@
     </section>
     <p id="tcp-reference-readout" class="result">当前 TCP：-- · 参考 TCP：--</p>
 
-    <details class="maintenance"><summary><span>维护区</span><small>仅用于控制服务恢复，不属于日常操作</small></summary><div><p>重置只重启控制服务，不发送运动、夹爪、CPV、零力或急停命令。</p><button id="reset-control" class="button" type="button">重置控制服务</button><span id="maintenance-result" class="result"></span></div></details>
+    <details id="maintenance-panel" class="maintenance"><summary><span>维护区</span><small>控制服务恢复 · 硬件 CPV · OSC 软件调参</small></summary><div>
+      <p>硬件 CPV 参数只允许在无控制会话的 HOLD 状态下设置。勾选保存后，服务重置并完成固件初始化时会写回启动配置。</p>
+      <h3>硬件 CPV 参数</h3>
+      <div class="osc-tuning-scroll" aria-label="硬件 CPV 参数设置">
+        <table class="osc-tuning-table"><thead><tr><th>参数</th><th>运行中生效值（最近硬件读回）</th><th>编辑值</th><th>允许范围</th><th>启动配置</th></tr></thead><tbody>
+          <tr><td>CV（rad/s）</td><td id="cpv-running-speed">--</td><td><input id="cpv-speed-input" type="number" min="0.001" max="2" step="0.001" inputmode="decimal" aria-label="CV 编辑值"></td><td id="cpv-speed-range">0 &lt; CV ≤ 2</td><td id="cpv-startup-speed">--</td></tr>
+          <tr><td>ACC/DCC（rad/s²）</td><td id="cpv-running-acceleration">--</td><td><input id="cpv-acceleration-input" type="number" min="0.001" max="10" step="0.001" inputmode="decimal" aria-label="ACC/DCC 编辑值"></td><td id="cpv-acceleration-range">0 &lt; ACC/DCC ≤ 10</td><td id="cpv-startup-acceleration">--</td></tr>
+        </tbody></table>
+      </div>
+      <label class="osc-tuning-save"><input id="cpv-save-startup" type="checkbox">同时保存为启动配置（不勾选时，仅应用当前运行；重置服务后写回启动配置）</label>
+      <button id="apply-cpv-profile" class="button" type="button">设置整组硬件 CPV 参数</button>
+      <button id="read-cpv-profile" class="button quiet" type="button">刷新硬件读回值</button>
+      <p id="cpv-maintenance-result" class="result" role="status"></p>
+      <section class="osc-tuning-maintenance" aria-label="OSC 软件控制参数">
+        <h3>OSC 软件控制参数</h3>
+        <p>整组应用后从下一控制周期生效。运行中调参会影响跟踪响应；硬件 CPV 参数在上方单独设置。</p>
+        <div class="osc-tuning-scroll"><table class="osc-tuning-table"><thead><tr><th>参数</th><th>运行中生效值</th><th>编辑值</th><th>建议范围</th><th>启动配置</th></tr></thead><tbody id="osc-tuning-fields"></tbody></table></div>
+        <label class="osc-tuning-save"><input id="osc-tuning-save" type="checkbox">同时保存为启动配置（不勾选时，重启后恢复启动配置）</label>
+        <button id="apply-osc-tuning" class="button" type="button">设置整组 OSC 参数</button>
+        <button id="reload-osc-tuning" class="button quiet" type="button">用运行值重新填入编辑值</button>
+        <p id="osc-tuning-result" class="result" role="status"></p>
+      </section>
+      <button id="reset-control" class="button" type="button">重置控制服务</button><span id="maintenance-result" class="result"></span>
+    </div></details>
   </main>
-  <script src="app.js?v=dataset-modular-v13"></script>
+  <script src="app.js?v=cpv-profile-v16"></script>
 </body>
 </html>

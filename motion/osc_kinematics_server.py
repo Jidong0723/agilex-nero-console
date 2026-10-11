@@ -359,6 +359,7 @@ def main() -> int:
             "input_sequence": latest.get("sequence"),
             "solver_request_id": latest.get("solver_request_id"),
             "control_sample_id": latest.get("control_sample_id"),
+            "tuning_revision": latest.get("tuning_revision"),
             "target_generation": latest.get("target_generation"),
             "joint_state_rad": latest.get("joint_angles_rad"),
             "joint_state_monotonic_ns": latest.get("joint_state_monotonic_ns"),
