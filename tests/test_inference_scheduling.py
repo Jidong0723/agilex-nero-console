@@ -39,6 +39,7 @@ class SchedulingTests(unittest.TestCase):
         p=Path(tmp)/'config/pi05.json';p.parent.mkdir()
         c=json.loads((Path(__file__).parents[1]/'config/pi05.json').read_text())
         c['execution'].update(expected_chunk_steps=horizon,max_chunk_steps=horizon,replan_steps=horizon//2,arrival_wait_s=0,period_s=.05,osc_state_poll_s=.05)
+        c['inference_profiles'][c['inference_profiles']['active']].update(expected_chunk_steps=horizon,replan_steps=horizon//2)
         p.write_text(json.dumps(c));camera=SlowDiagnosticsCamera();broker=CountingBroker()
         with patch('supervisor.pi05_adapter.OpenPIClient',_InitiallyUnavailablePolicy),patch.object(Pi05InputAdapter,'_local_forward_listening',return_value=True):
             a=Pi05InputAdapter(broker,p,camera)

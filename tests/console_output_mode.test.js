@@ -24,6 +24,7 @@ function fixture(mode = "cpv") {
   const requests = [];
   for (const id of ["cpv-speed-input", "cpv-acceleration-input", "cpv-save-startup"]) element(id);
   const context = vm.createContext({
+    window: {NeroInferenceStartup: require('../web/console/inference_startup.js'), NeroInferencePanel: {render() {}}},
     document: { getElementById: element, querySelector: () => null, querySelectorAll: () => [] },
     sessionStorage: { getItem: () => "browser-test" },
     performance: { now: () => 0 }, crypto: {}, AbortController, setTimeout, clearTimeout,

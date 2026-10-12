@@ -27,14 +27,13 @@ class GripperObservationTests(unittest.TestCase):
                 'execution':{'measured_tcp_pose':{'position_m':[.1,.2,.3],'orientation_xyzw':[0,0,0,1]}},
                 'gripper':self.feedback(.094319,1)}
 
-    def test_current_cache_replaces_old_observation_and_preserves_8d_contract(self):
+    def test_current_cache_replaces_old_observation_and_preserves_7d_contract(self):
         a=self.adapter();source=self.snapshot();updated=a._refresh_gripper_observation(source)
         self.assertEqual(source['gripper']['width_m'],.094319)
         self.assertEqual(updated['gripper']['width_m'],.02)
         image=np.zeros((224,224,3),np.uint8)
         state=a._observation(updated,image,image)['observation/state']
-        self.assertEqual(state.shape,(8,));self.assertAlmostEqual(float(state[6]),.02/.095,places=6)
-        self.assertAlmostEqual(float(state[7]),-.02/.095,places=6)
+        self.assertEqual(state.shape,(7,));self.assertAlmostEqual(float(state[6]),.02/.095,places=6)
         self.assertTrue(updated['gripper_observation']['new_sdk_feedback'])
 
     def test_same_outer_timestamp_does_not_count_as_new_sdk_data(self):

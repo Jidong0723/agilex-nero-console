@@ -278,3 +278,42 @@
 .osc-tuning-table input{min-width:100px;max-width:160px}
 .osc-tuning-save{display:flex;gap:8px;align-items:center;margin:10px 0;color:var(--muted);font-size:12px}
 .osc-tuning-save input{width:auto}
+.unified-inference .inference-settings{padding:14px;border:1px solid var(--line);border-radius:7px;background:rgba(10,21,24,.7);margin-bottom:12px}
+.unified-inference .inference-settings-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:12px}
+.unified-inference .inference-settings-grid label{display:flex;flex-direction:column;gap:5px;min-width:0;color:var(--muted);font-size:11px}
+.unified-inference .inference-settings-grid input,.unified-inference .inference-settings-grid select{width:100%;min-width:0}
+.unified-inference .inference-settings-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:10px 0}
+.unified-inference .inference-settings-footer small{color:var(--muted)}
+.unified-inference .inference-live-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0}
+.unified-inference .inference-live-grid span{min-width:0;color:var(--muted);font-size:11px}
+.unified-inference .inference-live-grid b,.unified-inference .inference-live-grid code{display:block;color:var(--text);font-weight:500;overflow-wrap:anywhere}
+.unified-inference .pi05-head{justify-content:space-between;gap:12px}
+.unified-inference .pi05-head>div{display:grid;gap:3px}
+.unified-inference .pi05-help .help-content{display:block;overflow-wrap:anywhere}
+.unified-inference .pi05-help code{display:block;white-space:pre-wrap;margin-top:8px}
+.unified-inference .pi05-connection-nodes em{overflow-wrap:anywhere}
+.unified-inference .pi05-chunk{min-width:0}
+.unified-inference .pi05-action-chunk pre{max-width:100%;overflow:auto}
+.unified-inference #inference-protocol{white-space:normal;max-width:45%}
+.osc-panel .unified-inference .pi05-connection{margin:0 0 12px}
+.osc-panel .unified-inference>*{order:0}
+.unified-inference #inference-connection-active{color:var(--muted);font-size:11px;overflow-wrap:anywhere;margin:0 0 10px}
+.osc-panel .unified-inference .pi05-connection-node{white-space:normal;align-self:stretch;padding:12px;min-width:0}
+.osc-panel .unified-inference .pi05-connection-node b,.osc-panel .unified-inference .pi05-connection-node small,.osc-panel .unified-inference .pi05-connection-node em,.osc-panel .unified-inference .pi05-connection-node code{display:block;white-space:normal;overflow-wrap:anywhere;text-overflow:clip}
+.osc-panel .unified-inference .pi05-connection-node b:after{content:none}
+.osc-panel .unified-inference .pi05-connection-node b{font-size:12px;margin-bottom:5px}
+.osc-panel .unified-inference .pi05-connection-node small,.osc-panel .unified-inference .pi05-connection-node em{font-size:11px;margin-top:6px}
+.osc-panel .unified-inference .pi05-connection-node code{font-size:11px;color:var(--text);margin-top:6px}
+.unified-inference .pi05-connection-node.neutral b:before{content:"●";color:var(--muted);margin-right:6px}
+.osc-panel .unified-inference .pi05-help{margin:0 0 12px}
+.unified-inference .inference-help-cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:12px 0}
+.unified-inference .inference-help-card{min-width:0;border:1px solid var(--line);border-radius:7px;padding:12px;background:#0a1716}
+.unified-inference .inference-help-card>strong,.unified-inference .pi05-help small{display:block;margin:8px 0;color:var(--text)}
+.unified-inference .pi05-help pre{max-width:100%;min-width:0;overflow-x:auto;background:#06110f;border:1px solid var(--line);border-radius:5px;padding:10px}
+.unified-inference .pi05-help pre code{white-space:pre;overflow-wrap:normal;margin:0;font-size:11px;line-height:1.6}
+.unified-inference .pi05-help p,.unified-inference .pi05-help li{font-size:11px;line-height:1.7;overflow-wrap:anywhere}
+.unified-inference .help-note{color:var(--amber)}
+.unified-inference .pi05-help [hidden]{display:none!important}
+@media(max-width:720px){.unified-inference .inference-help-cards{grid-template-columns:1fr}}
+@media(max-width:1180px){.unified-inference .inference-settings-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:720px){.unified-inference .inference-settings-grid,.unified-inference .inference-live-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.unified-inference .inference-address{grid-column:1/-1}.unified-inference .inference-settings-footer{align-items:stretch;flex-direction:column}.unified-inference .pi05-adapter-actions{flex-wrap:wrap}.unified-inference .pi05-adapter-actions .button{flex:1}.unified-inference .pi05-adapter-row{grid-template-columns:1fr}}

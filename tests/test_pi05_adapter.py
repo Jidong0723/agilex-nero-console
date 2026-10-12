@@ -105,13 +105,13 @@ class Pi05AdapterTests(unittest.TestCase):
         observation = {
             "observation/image": np.zeros((224, 224, 3), dtype=np.uint8),
             "observation/wrist_image": np.zeros((224, 224, 3), dtype=np.uint8),
-            "observation/state": np.zeros(8, dtype=np.float32),
+            "observation/state": np.zeros(7, dtype=np.float32),
         }
         payload = msgpack.Packer(default=_pack_array).pack(observation)
         decoded = msgpack.unpackb(payload, object_hook=_unpack_array)
         self.assertEqual(decoded["observation/image"].shape, (224, 224, 3))
         self.assertEqual(decoded["observation/wrist_image"].shape, (224, 224, 3))
-        self.assertEqual(decoded["observation/state"].shape, (8,))
+        self.assertEqual(decoded["observation/state"].shape, (7,))
 
     def test_observation_uses_direct_nero_base_pose_and_gripper_ratio(self):
         broker = _Broker()
@@ -121,7 +121,7 @@ class Pi05AdapterTests(unittest.TestCase):
         finally:
             adapter.close()
         expected_ratio = .02 / .095
-        np.testing.assert_allclose(observation["observation/state"], [0., 0., .3, 0., 0., 0., expected_ratio, -expected_ratio])
+        np.testing.assert_allclose(observation["observation/state"], [0., 0., .3, 0., 0., 0., expected_ratio])
 
     def test_action_decoding_uses_chunk_start_and_left_multiplied_base_rotation(self):
         broker = _Broker()
