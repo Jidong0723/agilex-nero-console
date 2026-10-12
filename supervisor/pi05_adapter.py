@@ -26,6 +26,10 @@ from .inference_connection import local_listener, loopback
 LOGGER = logging.getLogger(__name__)
 
 
+class ObservationNotReady(RuntimeError):
+    """A measured field is absent; wait instead of inventing an output input."""
+
+
 def _finite(values: Any, length: int, name: str) -> list[float]:
     if not isinstance(values, (list, tuple)) or len(values) != length:
         raise ValueError(f"{name} must contain {length} values")
@@ -825,7 +829,9 @@ class Pi05InputAdapter:
         # The AutoDL training state is expressed directly in the NERO base
         # frame.  Do not apply LIBERO axis flips or arbitrary normalisation.
         rotvec = _quaternion_rotvec(_finite(pose.get("orientation_xyzw"), 4, "TCP orientation"))
-        gripper = (osc.get("gripper") or {}).get("width_m", 0.0)
+        gripper = (osc.get("gripper") or {}).get("width_m")
+        if gripper is None:
+            raise ObservationNotReady('waiting for measured gripper opening')
         minimum = float(self.config["gripper"]["min_width_m"])
         maximum = float(self.config["gripper"]["max_width_m"])
         width = max(minimum, min(maximum, float(gripper)))
@@ -1052,6 +1058,7 @@ class Pi05InputAdapter:
                     osc_source = self._osc_snapshot
                     session_id, client_id = self.state["session_id"], self.state["client_id"]
                     execution_enabled = bool(self.state.get("execution_enabled"))
+                    priming_requested = bool(self.state.get('priming'))
                     revision,run_revision = self._connection_revision,self._run_revision
                     execution_config = dict(self.config["execution"])
                     capture = self._capture
@@ -1081,7 +1088,26 @@ class Pi05InputAdapter:
                 with self.lock:
                     if self.state.get("camera_state") == "WAITING":
                         self.state.update({"camera_state": "READY", "camera_wait_reason": None, "updated_at": time.time()})
-                observation = self._observation(osc, external, wrist)
+                placeholder = False
+                try:
+                    observation = self._observation(osc, external, wrist)
+                except ObservationNotReady as exc:
+                    if not execution_enabled and not priming_requested and not active_session:
+                        # Only a non-output protocol preview may use this
+                        # explicit placeholder. start/stop/switch increments
+                        # run_revision, so its response cannot become motion.
+                        preview = dict(osc, gripper={'width_m':float(self.config['gripper']['min_width_m'])})
+                        observation = self._observation(preview, external, wrist)
+                        placeholder = True
+                    else:
+                        with self.lock:
+                            changed = self.state.get('observation_wait_reason') != str(exc)
+                            self.state.update(observation_wait_reason=str(exc), observation_preview_placeholder=False)
+                        if changed: self._event('observation_wait',reason=str(exc))
+                        self.stop_event.wait(.05)
+                        continue
+                with self.lock:
+                    self.state.update(observation_wait_reason=None, observation_preview_placeholder=placeholder)
                 self._record_inference_input(external, wrist, observation)
                 try:
                     inference_ns = time.perf_counter_ns()
@@ -1163,7 +1189,7 @@ class Pi05InputAdapter:
                     # is unavailable or waiting for a hardware handoff.
                     self.stop_event.wait(float(self.config["execution"]["period_s"]))
                     continue
-                if not execution_enabled or not active_session:
+                if placeholder or not execution_enabled or not active_session:
                     self.stop_event.wait(float(self.config["execution"]["period_s"]))
                     continue
                 period_s = float(self.config["execution"]["period_s"])
