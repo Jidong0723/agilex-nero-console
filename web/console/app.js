@@ -488,7 +488,7 @@
     }
   }
 
-  const selectedAdapter = () => $("input-adapter")?.value || "web";
+  const selectedAdapter = () => $("input-adapter")?.value === "pi05-local" ? "pi05" : ($("input-adapter")?.value || "web");
   function applyAdapterSelection() {
     const pi = selectedAdapter() === "pi05";
     const pico = selectedAdapter() === "pico";
@@ -827,6 +827,14 @@
     $("pi05-start").textContent = "开始 AutoDL云端推理";
     $("pi05-stop").textContent = "停止 AutoDL云端推理";
     renderPi05Connections(pi.connections || {});
+    window.NeroInferencePanel.render(pi);
+    if (inferenceStartup.busy) {
+      $("pi05-start").disabled = true;
+      $("pi05-stop").disabled = false;
+      $("pi05-start").textContent = "正在准备推理…";
+      $("pi05-stop").textContent = "取消启动";
+      if (result) result.textContent = inferenceStartup.message;
+    }
   }
 
   function renderPi05Connections(connections) {
@@ -871,7 +879,13 @@
     if ((selectedAdapter() !== "pi05" && selectedAdapter() !== "pico") || state.cameraRefreshBusy) return;
     state.cameraRefreshBusy = true;
     try {
-      state.cameras = await api("/api/cameras/state", "GET", undefined, 900);
+      // Inference status already carries live frame metadata. Avoid repeated
+      // driver-property queries which hold the observation camera cache lock.
+      if (selectedAdapter() === "pi05" && state.pi05?.execution_enabled && state.pi05?.camera) {
+        state.cameras = state.pi05.camera;
+      } else {
+        state.cameras = await api("/api/cameras/state", "GET", undefined, 900);
+      }
       refreshPi05Frames();
     } catch (_) {
       // Keep the last successful preview visible while a camera is warming up.
@@ -1569,17 +1583,22 @@
     });
   }
 
+  const inferenceStartup = window.NeroInferenceStartup.create();
   async function startPi05() {
+    if (inferenceStartup.busy) return;
     try {
-      let current = session();
-      if (current.state !== "ACTIVE" || current.client_id !== clientId) {
-        const result = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId, input_source: "pi05" }, 10000);
-        updateOscState(result.state, true); current = session();
-      }
-      // Cameras and inference are already running; this button only enables
-      // forwarding the latest Action Chunk to OSC.
-      await api("/api/pi05/config", "POST", { model: { prompt: $("pi05-prompt")?.value || "" }, execution: { action_delta_scale: Number($("pi05-action-scale")?.value ?? 1) } });
-      state.pi05 = await api("/api/pi05/start", "POST", { session_id: current.id, client_id: clientId }, 10000);
+      const desiredPrompt = ($("pi05-prompt")?.value || "").trim();
+      const desiredScale = Number($("pi05-action-scale")?.value ?? 1);
+      const existing = state.pi05?.config;
+      const config = existing?.model?.prompt === desiredPrompt && existing?.execution?.action_delta_scale === desiredScale
+        ? null : {model:{prompt:desiredPrompt},execution:{action_delta_scale:desiredScale}};
+      const started = await inferenceStartup.run({api,clientId,mode:$("execution-mode").value,
+        context:() => `${state.requestGeneration}|${$("input-adapter").value}|${$("execution-mode").value}`,
+        session,acceptOsc:value => updateOscState(value,true),acceptPi:value => { state.pi05 = value; },
+        progress:text => { phase(text); renderPi05(); },changed:() => renderPi05(),
+        config});
+      if (!started) return;
+      const current = session();
       phase(current.execution_mode === "shadow"
         ? "AutoDL云端推理已开启，但当前是影子模式，不会驱动真机；请切换为真机模式"
         : "AutoDL云端推理已开启，Nero Chunk 正在发送给 OSC 执行");
@@ -1588,6 +1607,7 @@
   }
 
   async function stopPi05() {
+    if (inferenceStartup.busy) { inferenceStartup.cancel(); renderPi05(); }
     try {
       state.pi05 = await api("/api/pi05/stop", "POST", { reason: "operator stopped pi05 adapter" });
       phase("AutoDL云端推理继续运行，已停止向 OSC 输出 Nero Chunk"); render();
@@ -1718,10 +1738,14 @@
   attachStick("xy");
   attachStick("right");
   buildPi05Card();
+  window.NeroInferencePanel.initialize(api, (value) => { state.pi05 = value; renderPi05(); }, phase);
   buildPicoCard();
   buildDatasetCard();
   void loadSharedCameras();
-  $("input-adapter")?.addEventListener("change", applyAdapterSelection);
+  $("input-adapter")?.addEventListener("change", async () => {
+    await window.NeroInferencePanel.selectChanged();
+    applyAdapterSelection();
+  });
   $("execution-mode")?.addEventListener("change", async () => {
     resetWebAdapter();
     const current = session();
