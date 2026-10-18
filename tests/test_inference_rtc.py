@@ -275,6 +275,10 @@ class RuntimeTests(unittest.TestCase):
             snapshot["session"]["execution_mode"] = "hardware"
             with self.assertRaisesRegex(RuntimeError, "timestamp missing or stale"):
                 assembler.read()
+            health = self.a.state['rtc_observation_health']
+            self.assertGreater(health['sample_age_ms'], 100.)
+            self.assertLess(health['cache_age_ms'], 100.)
+            self.assertEqual(health['source'], 'osc_execution')
 
     def test_tcp_clock_conversion_with_windows_epoch_offset(self):
         with self.a.lock:

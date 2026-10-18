@@ -22,8 +22,8 @@
     "period_s": 0.05,
     "osc_state_poll_s": 0.05,
     "startup_hold_s": 0.3,
-    "arrival_wait_s": 0.05,
-    "mode": "normal",
+    "arrival_wait_s": 0.1,
+    "mode": "rtc",
     "rtc_min_replan_steps": 6
   },
   "inference_profiles": {
@@ -47,6 +47,7 @@
     "min_width_m": 0,
     "max_width_m": 0.095,
     "force_n": 0.8,
-    "dedupe_tolerance_ratio": 0.01
+    "dedupe_tolerance_ratio": 0.01,
+    "ratio_upper_boundary_tolerance": 0.05
   }
 }

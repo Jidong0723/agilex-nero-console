@@ -522,6 +522,13 @@ class Pi05InputAdapter:
                     with self.lock:
                         self.state['observation_wait_reason'] = str(observation_error)
                 snapshot = self._refresh_gripper_observation(snapshot)
+                publish_ns = time.perf_counter_ns()
+                observed = snapshot.get('inference_observation') or {}
+                observation_timing = dict(observed.get('timing') or {})
+                if observation_timing:
+                    observation_timing.update(published_perf_ns=publish_ns,
+                        sample_age_at_publish_ms=(publish_ns-observed['perf_ns'])/1e6)
+                    observed['timing'] = observation_timing
                 self._publish_logging_feedback(snapshot)
                 published = copy.deepcopy(snapshot)
                 lock_started_ns = time.perf_counter_ns()
@@ -534,6 +541,8 @@ class Pi05InputAdapter:
                 self._event('feedback_cache_poll',rpc_ms=(returned_ns-poll_ns)/1e6,
                     publish_lock_wait_ms=(lock_acquired_ns-lock_started_ns)/1e6,
                     poll_started_perf_ns=poll_ns,poll_returned_perf_ns=returned_ns,
+                    observation_timing=observation_timing,
+                    observation_error=self.state.get('observation_wait_reason'),
                     poll_interval_ms=(poll_ns-previous_poll_ns)/1e6 if previous_poll_ns is not None else None)
             except Exception as exc:
                 with self.lock:
@@ -923,44 +932,45 @@ class Pi05InputAdapter:
         return make_observation(position, rotvec, ratio, external, wrist, self.config["model"]["prompt"])
 
     def _normalise_gripper_ratio(self, ratio: float, action_index: int | None = None) -> float:
-        """Accept only harmless endpoint round-off, preserving hard safety rejects.
+        """Saturate bounded model overshoot; reject outputs beyond that envelope.
 
-        Network inference can return float32 values infinitesimally outside a
-        closed training range (for example ``1.0000001``).  Treating that as a
-        fatal action chunk is needlessly disruptive, but broadly clipping a
-        policy output would conceal a real semantic error.  The configurable
-        tolerance is therefore deliberately small: values outside it still
-        reject the complete chunk and request HOLD.
+        The upper endpoint allows 5% prediction overshoot by operator choice;
+        the lower endpoint retains its existing 0.5% allowance. These are
+        model-output allowances, never permission to exceed hardware opening.
         """
-        # Default allowance: 0.5% of opening range, 0.475mm at 95mm.
         # Only the command is clipped; raw model outputs remain in the log.
         tolerance = float(self.config["gripper"].get("ratio_boundary_tolerance", 0.005))
-        if not math.isfinite(tolerance) or tolerance < 0.0:
+        upper_tolerance = float(self.config["gripper"].get("ratio_upper_boundary_tolerance", 0.05))
+        if any(not math.isfinite(value) or value < 0.0 for value in (tolerance, upper_tolerance)):
             raise RuntimeError("Model gripper ratio boundary tolerance must be finite and non-negative")
         if 0.0 <= ratio <= 1.0:
             return ratio
         row = "unknown" if action_index is None else str(action_index)
-        if -tolerance <= ratio <= 1.0 + tolerance:
+        if -tolerance <= ratio <= 1.0 + upper_tolerance:
             command_ratio = min(1.0, max(0.0, ratio))
             diagnostic = {"status": "boundary_normalized", "action_index": action_index,
                           "raw_ratio": ratio, "command_ratio": command_ratio,
-                          "tolerance": tolerance, "updated_at": time.time()}
+                          "tolerance": tolerance, "upper_tolerance": upper_tolerance,
+                          "accepted_min": -tolerance, "accepted_max": 1.0+upper_tolerance,
+                          "updated_at": time.time()}
             with self.lock:
                 self.state["gripper_ratio_diagnostic"] = diagnostic
             # This is a recoverable model-output boundary condition.  The
             # state diagnostic is deliberately user-visible; keep the process
             # log at debug level so a sustained endpoint command does not
             # drown out actual safety events.
-            LOGGER.debug("Model gripper ratio boundary-normalized at row %s: %.9g -> %.9g (tolerance %.9g)",
-                         row, ratio, command_ratio, tolerance)
+            LOGGER.debug("Model gripper ratio boundary-normalized at row %s: %.9g -> %.9g (accepted [%.9g, %.9g])",
+                         row, ratio, command_ratio, -tolerance, 1.0+upper_tolerance)
             return command_ratio
         diagnostic = {"status": "rejected", "action_index": action_index,
-                      "raw_ratio": ratio, "tolerance": tolerance, "updated_at": time.time()}
+                      "raw_ratio": ratio, "tolerance": tolerance, "upper_tolerance": upper_tolerance,
+                      "accepted_min": -tolerance, "accepted_max": 1.0+upper_tolerance,
+                      "updated_at": time.time()}
         with self.lock:
             self.state["gripper_ratio_diagnostic"] = diagnostic
         raise RuntimeError(
             f"Model gripper ratio at row {row} is {ratio:.9g}; expected [0, 1] "
-            f"(only endpoint round-off within ±{tolerance:.9g} is normalized)"
+            f"(model endpoint overshoot within [{-tolerance:.9g}, {1.0+upper_tolerance:.9g}] is normalized)"
         )
 
     def _target_from_action(self, action: Any, base: dict[str, Any],

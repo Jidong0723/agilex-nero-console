@@ -854,11 +854,19 @@ class SafetySupervisor:
         self.limit_data["acceleration_rad_s2"] = [min(a, b) for a, b in zip(limits["controller_acceleration_rad_s2"], requested_acceleration)]
         fixed_model = _finite_vector(self.config.get("fixed_model_margin_rad", [0.03, 0.03, 0.03, 0.025, 0.03, 0.02, 0.02]), 7, "fixed_model_margin_rad")
         stop_reserve = _finite_vector(self.config.get("controller_stop_reserve_rad", [0.02, 0.02, 0.02, 0.02, 0.02, 0.015, 0.015]), 7, "controller_stop_reserve_rad")
+        if any(value < 0.0 for value in fixed_model + stop_reserve):
+            raise ValueError("joint limit margins must be non-negative")
         self.limit_data["fixed_margin_rad"] = [a + b for a, b in zip(fixed_model, stop_reserve)]
         self.limit_data["soft_lower_rad"] = [a + b for a, b in zip(limits["effective_lower_rad"], self.limit_data["fixed_margin_rad"])]
         self.limit_data["soft_upper_rad"] = [a - b for a, b in zip(limits["effective_upper_rad"], self.limit_data["fixed_margin_rad"])]
         if any(lower >= upper for lower, upper in zip(self.limit_data["soft_lower_rad"], self.limit_data["soft_upper_rad"])):
             raise ValueError("fixed per-joint margins consume an effective joint range")
+        # Pink keeps both margins. The sender's last-resort reference check
+        # keeps the stop reserve only, allowing small integration/shaping
+        # excursions past the planning boundary without reaching hard limits.
+        # Measured-state braking and final_gate remain unchanged.
+        self.limit_data["cpv_lower_rad"] = [a + b for a, b in zip(limits["effective_lower_rad"], stop_reserve)]
+        self.limit_data["cpv_upper_rad"] = [a - b for a, b in zip(limits["effective_upper_rad"], stop_reserve)]
 
     def observe_delay(self, feedback_age: float, cycle_s: float, solver_age: float | None, batch_skew_s: float, response_s: float) -> float:
         response = max(self.controller_response_floor_s, max(0.0, response_s))
@@ -2153,8 +2161,8 @@ class _OperationalSpaceServo:
                     output_fields = {"cpv_reference": {
                         "reference_id": self._cpv_reference_id,
                         "anchor_position_rad": list(planning_q), "dt_s": actual_dt,
-                        "lower_rad": list(data["soft_lower_rad"]),
-                        "upper_rad": list(data["soft_upper_rad"]),
+                        "lower_rad": list(data["cpv_lower_rad"]),
+                        "upper_rad": list(data["cpv_upper_rad"]),
                         "gate_mask": [abs(a-b)>1e-9 for a,b in zip(target_velocity,final_velocity)]}}
                 if shadow:
                     if not self.impedance_output:

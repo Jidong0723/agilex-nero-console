@@ -100,6 +100,24 @@ class DirectCpvTests(unittest.TestCase):
         self.assertEqual(published["joint_target_rad"], result["final_joint_target_rad"])
         self.assertEqual(published["max_joint_acceleration_rad_s2"], 2.0)
 
+    def test_sender_uses_outer_cpv_bounds_without_changing_pink_bounds(self):
+        requests = []
+        solve = self.servo.solver.solve_current
+        self.servo.solver.solve_current = lambda request, timeout: (requests.append(request) or solve(request, timeout))
+        self.step()
+        data = self.servo.supervisor.limit_data
+        reference = self.hardware.publish_servo_position.call_args.args[0]["cpv_reference"]
+        self.assertEqual(requests[0]["soft_lower_rad"], data["soft_lower_rad"])
+        self.assertEqual(requests[0]["soft_upper_rad"], data["soft_upper_rad"])
+        self.assertEqual(reference["lower_rad"], data["cpv_lower_rad"])
+        self.assertEqual(reference["upper_rad"], data["cpv_upper_rad"])
+        for lo, soft_lo, soft_hi, hi, hard_lo, hard_hi in zip(
+                reference["lower_rad"], data["soft_lower_rad"], data["soft_upper_rad"],
+                reference["upper_rad"], data["effective_lower_rad"], data["effective_upper_rad"]):
+            self.assertLess(hard_lo, lo)
+            self.assertLess(lo, soft_lo)
+            self.assertLess(soft_hi, hi)
+            self.assertLess(hi, hard_hi)
     def test_tuning_during_solve_takes_effect_as_one_group_next_cycle(self):
         self.raw_velocity = [0.] * 7
         old = self.servo.tuning.public()["running"]

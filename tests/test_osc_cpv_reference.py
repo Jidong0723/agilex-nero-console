@@ -84,6 +84,34 @@ class CpvReferenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.prepare(reference,1_020_000_000,v=float('nan'))
         self.assertEqual(reference.snapshot(),old)
 
+    def test_planning_boundary_has_reserve_but_outer_cpv_boundary_still_rejects(self):
+        from motion.osc import SafetySupervisor
+        safety = SafetySupervisor({"fixed_model_margin_rad": [.025]*7,
+                                   "controller_stop_reserve_rad": [.02]*7})
+        safety.configure(dict(effective_lower_rad=[-2.14]*7, effective_upper_rad=[2.14]*7,
+                              controller_speed_rad_s=[1.]*7,
+                              controller_acceleration_rad_s2=[2.]*7), [1.]*7, [2.]*7)
+        data = safety.limit_data
+        self.assertAlmostEqual(data['soft_upper_rad'][0], 2.095)
+        for sign in (-1, 1):
+            meta = command(anchor=sign*2.09499985)
+            meta.update(lower_rad=data['cpv_lower_rad'], upper_rad=data['cpv_upper_rad'])
+            candidate = self.prepare(CpvReference(), 1_000_000_000, v=sign*.000025, meta=meta)
+            self.assertGreater(abs(candidate['position_rad'][0]), 2.095)
+            self.assertLess(abs(candidate['position_rad'][0]), 2.12)
+            meta['anchor_position_rad'] = [sign*2.11999985]*7
+            with self.assertRaisesRegex(RuntimeError, 'outside joint limits'):
+                self.prepare(CpvReference(), 1_000_000_000, v=sign*.000025, meta=meta)
+
+    def test_negative_margins_cannot_expand_protection_past_hard_limits(self):
+        from motion.osc import SafetySupervisor
+        for field in ('fixed_model_margin_rad', 'controller_stop_reserve_rad'):
+            safety = SafetySupervisor({field: [-.01]*7})
+            with self.assertRaisesRegex(ValueError, 'non-negative'):
+                safety.configure(dict(effective_lower_rad=[-2.]*7, effective_upper_rad=[2.]*7,
+                                      controller_speed_rad_s=[1.]*7,
+                                      controller_acceleration_rad_s2=[2.]*7), [1.]*7, [2.]*7)
+
 
 class CpvReferenceSenderTests(unittest.TestCase):
     def setUp(self):

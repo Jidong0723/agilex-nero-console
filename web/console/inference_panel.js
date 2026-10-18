@@ -37,18 +37,29 @@
           <div class="pi05-prompt"><label for="pi05-prompt">任务指令</label><textarea id="pi05-prompt" maxlength="500"></textarea><div class="pi05-prompt-footer"><small id="pi05-active-prompt">等待服务状态</small><button id="pi05-prompt-save" class="button" type="button">保存任务文本</button></div></div>
         </section>
         <div class="pi05-inference-stack"><section class="pi05-inference">
-          <div class="pi05-head"><div><strong>运行状态</strong><small id="inference-model-report">等待模型报告</small></div><strong id="pi05-model-state">未连接</strong></div>
-          <div class="inference-live-grid"><span>当前端点<code id="inference-live-endpoint">--</code></span><span>生效预设<b id="inference-live-profile">--</b></span><span>生效 H / K<b id="inference-live-lengths">--</b></span><span>最近返回步数<b id="inference-returned-steps">--</b></span></div>
+          <div class="pi05-head"><strong>运行状态</strong><strong id="pi05-model-state">未连接</strong></div>
           <div class="pi05-metrics"><span>状态<b id="pi05-run-state">IDLE</b></span><span>推理耗时<b id="pi05-inference-ms">--</b></span><span>Chunk 序号<b id="pi05-chunk-length">0</b></span><span>已执行行<b id="pi05-executed">0</b></span></div>
-          <p id="inference-rtc-state" class="result" role="status"></p>
           <p id="inference-preview-state" class="result" role="status">动作预览：等待连接与观测</p>
           <p id="inference-control-state" class="result" role="status">控制状态：未开始</p>
+          <p id="inference-control-message" class="result fault" role="alert" hidden></p>
           <p id="inference-chunk-source" class="result">暂无动作块</p>
-        </section><div class="pi05-chunk"><span>NERO 动作块</span><code id="pi05-action-first">等待推理结果</code><code id="pi05-chunk-base">起点 TCP --</code><small id="pi05-rejection">--</small><small id="pi05-websocket-diagnostic">等待连接诊断</small><div class="pi05-action-chunk"><span>动作预览 · 前 5 行（原始 Δ）</span><pre id="pi05-action-chunk-rows">等待推理结果</pre></div></div></div>
+        </section><div class="pi05-chunk"><span>动作预览</span><div class="pi05-action-chunk"><span>前 5 步 · 位置／旋转增量与夹爪开度</span><pre id="pi05-action-chunk-rows">等待推理结果</pre></div></div></div>
       </div>
       <div class="pi05-adapter-actions"><button id="pi05-start" class="button primary" type="button" disabled>开始推理控制</button><button id="pi05-stop" class="button quiet" type="button" disabled>停止推理控制</button><button id="inference-export" class="button quiet" type="button" disabled>导出日志</button></div>
       <p id="inference-start-reason" class="result" role="status"></p>
-      <p id="pi05-result" class="result" role="status"></p><p id="inference-log-state" class="result"></p>`;
+      <p id="pi05-result" class="result" role="status"></p>
+      <details class="inference-details"><summary>技术详情</summary>
+        <p id="inference-model-report" class="result"></p>
+        <div class="inference-live-grid"><span>当前端点<code id="inference-live-endpoint">--</code></span><span>生效预设<b id="inference-live-profile">--</b></span><span>生效 H / K<b id="inference-live-lengths">--</b></span><span>最近返回步数<b id="inference-returned-steps">--</b></span></div>
+        <p id="inference-protocol-detail" class="result"></p>
+        <p id="inference-training-detail" class="result"></p>
+        <p id="inference-rtc-state" class="result"></p>
+        <p id="inference-chunk-detail" class="result"></p>
+        <p id="inference-error-detail" class="result"></p>
+        <code id="pi05-action-first"></code><code id="pi05-chunk-base"></code>
+        <p id="pi05-rejection" class="result"></p><p id="pi05-websocket-diagnostic" class="result"></p>
+        <p id="inference-log-state" class="result"></p>
+      </details>`;
     document.querySelector(".osc-panel")?.append(panel);
   }
   function savedDraft(state, name) {
@@ -160,7 +171,7 @@
     if(latest.model_state!=="CONNECTED") return "等待模型 WebSocket 连接";
     if(!latest.camera_ready) return "请先打开相机，提供推理观测";
     if(latest.protocol_compatibility?.status!=="compatible") return latest.protocol_compatibility?.status==="incompatible"?latest.protocol_compatibility.message:"等待实际推理响应通过 7D／H 验证";
-    return "动作预览自动更新；点击开始推理控制后才执行模型动作";
+    return "";
   }
   function connections() {
     if(!latest) return;
@@ -180,7 +191,18 @@
     const entry=items.service_entry;
     get("pi05-connection-message").textContent=latest.model_state==="CONNECTED"?"推理服务连接成功":(entry?.state==="ok"?"入口已就绪；等待推理服务连接":"先启动服务或建立转发；连接会自动重试");
   }
-  function render(state) {
+  function readableError(error, osc) {
+    if(!error) return "";
+    const cpv=osc?.diagnostics?.mailboxes?.cpv || osc?.transport?.cpv_mailbox;
+    const cause=cpv?.last_result?.error || "";
+    if(/joint limits|joint.*limit|关节.*限位/i.test(error+cause)) return "关节限位保护已触发，控制已停止。请先检查当前姿态。";
+    if(/write authority|tracking authority|PermissionError/.test(error)) return "控制权限已撤销，机械臂保持停止。请检查故障详情后重新建立控制会话。";
+    if(/workspace/.test(error)) return "模型目标超出允许工作范围，控制已停止。";
+    if(/feedback|stale|image\/TCP|camera.*older/i.test(error)) return "观测反馈不够新鲜，控制已停止。请检查相机和机械臂反馈。";
+    if(/deadline|slot|runway|exhausted/i.test(error)) return "推理或控制未赶上执行节奏，控制已停止。";
+    return "控制发生异常，已停止。请展开技术详情查看原因。";
+  }
+  function render(state, context={}) {
     if (!state?.config?.inference_profiles || !get("inference-save")) return;
     const wasClean=latest && selected && !dirty();
     latest=state;
@@ -197,7 +219,8 @@
     get("inference-returned-steps").textContent=state.last_response_steps ?? "--";
     const compatibility=state.model_state==="CONNECTED"?(state.protocol_compatibility || {status:"pending",message:"待响应验证"}):{status:"pending",message:"待连接后验证 7D／H"};
     if (notice==="设置已保存；正在验证模型连接与响应" && compatibility.status==="compatible" && state.last_response_steps) notice="设置已保存，模型响应验证通过";
-    get("inference-protocol").textContent=compatibility.message+(compatibility.status==="compatible"?` · H=${p.expected_chunk_steps} / 实际=${state.last_response_steps ?? "--"} / 动作7维`:"");
+    get("inference-protocol").textContent=compatibility.status==="compatible"?"协议就绪":compatibility.status==="incompatible"?"协议不兼容":"待验证";
+    get("inference-protocol-detail").textContent=compatibility.message;
     get("inference-protocol").className=`badge ${compatibility.status==="compatible"?"ok":compatibility.status==="incompatible"?"fault":"neutral"}`;
     const metadata=state.policy_metadata || {};
     get("inference-model-report").textContent=metadata.deployment_label || metadata.checkpoint_dir ? `模型报告：${metadata.deployment_label || metadata.checkpoint_dir}` : (p.checkpoint_label?`预设备注：${p.checkpoint_label}（模型未报告名称）`:"模型未报告名称");
@@ -207,16 +230,24 @@
     const rtcNames={BOOTSTRAP:"初始化",RUNNING:"运行中",STOPPING:"正在停止",HOLD_PENDING:"等待保持确认",HOLD:"已保持",HOLD_UNCONFIRMED:"保持未确认",RELEASED:"已交出控制权"};
     get("inference-rtc-state").textContent=state.config.execution.mode==="rtc"?`RTC：${rtcNames[rtc?.state]||"待启动"} · 队列 ${rtc?.queue_remaining_ms??0} ms · 端到端 ${rtc?.end_to_end_ms?.toFixed(1)??"--"} ms · 重规划 ${rtc?.replan_interval_steps??"--"} 步${rtc?.reason?" · "+rtc.reason:""}${rtc?.manual_restart_required?" · 需手动重新开始":""}`:"";
     const preview=state.preview||{}, previewNames={WAITING:"等待观测",INFERENCING:"推理中",READY:"自动更新中",PAUSED:"控制期间暂停",ERROR:"预览失败"};
-    get("inference-preview-state").textContent=`动作预览：${previewNames[preview.state]||"等待连接"}${preview.hz?` · ${preview.hz.toFixed(1)} Hz`:""}${preview.updated_at?` · 最近完成 ${new Date(preview.updated_at*1000).toLocaleTimeString()}`:""}${preview.error?` · ${preview.error}`:""}`;
-    get("inference-control-state").textContent=`控制状态：${state.execution_enabled?"控制中":state.priming?"准备控制":"未控制"}${state.last_error?" · "+state.last_error:""}${state.training_notice?" · "+state.training_notice:""}`;
-    get("inference-chunk-source").textContent=state.chunk_updated_at?`${state.chunk_source==="control"?"控制动作块":"动作预测预览"} · #${state.chunk_sequence} · H=${state.action_chunk_length} · ${state.inference_ms?.toFixed(1)??"--"} ms · ${new Date(state.chunk_updated_at*1000).toLocaleTimeString()}${state.chunk_stale?" · 已过期":""}${state.chunk_source!=="control"&&state.config.execution.mode==="rtc"?" · 普通 H20 采样，未进行 RTC 衔接":""}`:"暂无动作块；等待有效观测与响应";
+    get("inference-preview-state").textContent=`动作预览：${previewNames[preview.state]||"等待连接"}${preview.hz&&preview.state!=="PAUSED"?` · ${preview.hz.toFixed(1)} Hz`:""}${preview.error&&!state.last_error?" · 等待有效观测":""}`;
+    get("inference-control-state").textContent=`控制状态：${state.execution_enabled?"控制中":state.priming?"准备控制":state.last_error?"已停止":"未控制"}`;
+    const message=get("inference-control-message");
+    message.textContent=readableError(state.last_error,context.osc);message.hidden=!state.last_error;
+    get("inference-training-detail").textContent=state.training_notice||"";
+    get("inference-training-detail").hidden=!state.training_notice;
+    get("inference-error-detail").textContent=[state.last_error,preview.error,(context.osc?.diagnostics?.mailboxes?.cpv?.last_result||{}).error].filter(Boolean).join("\n");
+    get("inference-chunk-source").textContent=state.chunk_updated_at?`${state.chunk_source==="control"?"控制动作":"动作预测预览"}${state.chunk_stale?" · 历史结果，已停止更新":state.chunk_source!=="control"?" · 仅预览，不执行":""}`:"等待模型预测";
+    get("inference-chunk-detail").textContent=state.chunk_updated_at?`第 ${state.chunk_sequence} 块 · H=${state.action_chunk_length} · ${state.inference_ms?.toFixed(1)??"--"} ms · ${new Date(state.chunk_updated_at*1000).toLocaleTimeString()}${state.chunk_source!=="control"&&state.config.execution.mode==="rtc"?" · 普通 H20 采样，未进行 RTC 衔接":""}`:"";
     if(["HOLD_PENDING","HOLD_UNCONFIRMED","STOPPING"].includes(rtc?.state)) get("pi05-stop").disabled=false;
     get("inference-export").disabled=!state.log_export_ready;
+    get("inference-export").hidden=!state.log_export_ready;
     const log=state.inference_log;
-    get("inference-log-state").textContent=state.log_error || (log ? `${log.run_id} · ${log.finished?"已结束":"记录中"}${log.write_error?" · "+log.write_error:""}` : "日志：尚未开始");
+    get("inference-log-state").textContent=state.log_error || (log ? `${log.run_id} · ${log.finished?"已结束":"记录中"}${log.write_error?" · "+log.write_error:""}` : "");
+    get("inference-log-state").hidden=!get("inference-log-state").textContent;
     controls();help();get("inference-start-reason").textContent=startReason();
   }
-  const api={build,initialize,render,save,canStart};
+  const api={build,initialize,render,save,canStart,readableError};
   if(typeof module!=="undefined" && module.exports) module.exports=api;
   else root.NeroInferencePanel=api;
 })(typeof window!=="undefined"?window:globalThis);

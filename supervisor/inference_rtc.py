@@ -162,6 +162,15 @@ class ObservationAssembler:
             osc['execution'] = execution
             osc['gripper'] = dict(osc.get('gripper') or {}, width_m=measured['gripper_width_m'])
         if session.get("execution_mode") == "hardware":
+            health = {"read_perf_ns": now, "sample_perf_ns": stamp,
+                      "sample_age_ms": (now-stamp)/1e6 if isinstance(stamp, int) else None,
+                      "cache_age_ms": (now-published)/1e6,
+                      "feedback_age_ms": float(execution.get("feedback_age_s", math.inf))*1000,
+                      "source": measured.get('source') if measured else 'osc_execution',
+                      "observation_timing": measured.get('timing') if measured else None}
+            a._event('rtc_observation_health', **health)
+            with a.lock:
+                a.state['rtc_observation_health'] = health
             if not isinstance(stamp, int) or not 0 <= now-stamp <= 100_000_000:
                 raise RuntimeError("RTC measured TCP timestamp missing or stale")
             if float(execution.get("feedback_age_s", math.inf)) > .1:

@@ -727,7 +727,7 @@
     const submittedPrompt = String(pi.prompt || model.prompt || "").trim();
     const submittedPromptView = $("pi05-active-prompt");
     if (submittedPromptView) submittedPromptView.textContent = submittedPrompt ? `当前已提交给模型：${submittedPrompt}` : "当前已提交给模型：--";
-    $("pi05-model-state").textContent = pi.model_state || "UNKNOWN";
+    $("pi05-model-state").textContent = {CONNECTED:"已连接",DISCONNECTED:"未连接",CONNECTING:"连接中"}[pi.model_state] || "等待连接";
     $("pi05-run-state").textContent = pi.state || "IDLE";
     $("pi05-inference-ms").textContent = Number.isFinite(Number(pi.inference_ms)) ? `${Number(pi.inference_ms).toFixed(0)} ms` : "--";
     $("pi05-chunk-length").textContent = String(pi.chunk_sequence || 0);
@@ -738,7 +738,7 @@
     $("pi05-chunk-base").textContent = base ? `起点 P [${base.position_m.map((value) => Number(value).toFixed(3)).join(", ")}]` : "起点 TCP --";
     const gripDiagnostic = pi.gripper_ratio_diagnostic;
     const boundaryMessage = gripDiagnostic?.status === "boundary_normalized"
-      ? `夹爪比例边界归一化：第 ${Number(gripDiagnostic.action_index) + 1} 行 ${Number(gripDiagnostic.raw_ratio).toFixed(6)} → ${Number(gripDiagnostic.command_ratio).toFixed(3)}（容差 ±${Number(gripDiagnostic.tolerance).toFixed(4)}）`
+      ? `夹爪比例边界归一化：第 ${Number(gripDiagnostic.action_index) + 1} 行 ${Number(gripDiagnostic.raw_ratio).toFixed(6)} → ${Number(gripDiagnostic.command_ratio).toFixed(3)}（允许预测范围 ${Number(gripDiagnostic.accepted_min ?? -gripDiagnostic.tolerance).toFixed(4)}～${Number(gripDiagnostic.accepted_max ?? 1 + gripDiagnostic.tolerance).toFixed(4)}）`
       : "";
     $("pi05-rejection").textContent = pi.last_rejection || boundaryMessage;
     const chunkRows = $("pi05-action-chunk-rows");
@@ -758,7 +758,7 @@
       const frameText = input ? ` · RGB ${input.external_rgb} / ${input.wrist_rgb} · state ${input.state}` : "";
       diagnosticView.textContent = `WebSocket：连接 ${diagnostics.connect_successes || 0}/${diagnostics.connect_attempts || 0} · 断开 ${diagnostics.disconnects || 0} · Ping失败 ${diagnostics.ping_failures || 0} · 推理失败 ${diagnostics.inference_failures || 0} · ${last}${frameText}`;
     }
-    const result = $("pi05-result"); if (result) result.textContent = pi.last_error || state.pi05PromptNotice || "";
+    const result = $("pi05-result"); if (result) result.textContent = state.pi05PromptNotice || "";
     $("pi05-external-preview").textContent = pi.camera_ready ? "模型输入 224 × 224 RGB" : "等待画面";
     $("pi05-wrist-preview").textContent = pi.camera_ready ? "模型输入 224 × 224 RGB" : "等待画面";
     refreshPi05Frames();
@@ -767,7 +767,7 @@
     $("pi05-stop").disabled = pi.execution_enabled !== true;
     $("pi05-start").textContent = "开始推理控制";
     $("pi05-stop").textContent = "停止推理控制";
-    window.NeroInferencePanel.render(pi);
+    window.NeroInferencePanel.render(pi,{osc:state.osc});
     if (inferenceStartup.busy) {
       $("pi05-start").disabled = true;
       $("pi05-stop").disabled = false;

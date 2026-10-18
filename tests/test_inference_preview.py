@@ -102,7 +102,10 @@ class PreviewTests(unittest.TestCase):
         source=ObservationSource(SimpleNamespace(osc=broker))
         source.last_joints=(0.,)*7
         source.last_pose={'position_m':[0,0,.3],'orientation_xyzw':[0,0,0,1]}
-        source.refresh({'session':{'state':'IDLE'}})
+        observed = source.refresh({'session':{'state':'IDLE'}})['inference_observation']
+        self.assertEqual(observed['timing']['sample_perf_ns'], observed['perf_ns'])
+        self.assertTrue(observed['timing']['fk_reused'])
+        self.assertGreaterEqual(observed['timing']['refresh_ms'], observed['timing']['fk_ms'])
         source.gripper_seen_ns-=200_000_000
         with self.assertRaisesRegex(RuntimeError,'150 ms'):
             source.refresh({'session':{'state':'IDLE'}})

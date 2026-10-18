@@ -9,6 +9,8 @@ class BoundaryStartTests(unittest.TestCase):
         p=Path(tmp)/'config/pi05.json';p.parent.mkdir()
         p.write_text((Path(__file__).parents[1]/'config/pi05.json').read_text())
         with patch('supervisor.pi05_adapter.OpenPIClient',_InitiallyUnavailablePolicy):a=Pi05InputAdapter(_Broker(),p)
+        # Keep startup-race coverage independent of the operator's live RTC selection.
+        a.config['execution']['mode']='normal'
         a._connection_stop.set();a._connection_wakeup.set();a._connection_thread.join(2)
         a._osc_state_stop.set();a._osc_state_thread.join(2)
         return a
@@ -26,7 +28,7 @@ class BoundaryStartTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             a=self.make(tmp)
             try:
-                for value in (1.01,-.01,float('nan'),float('inf')):
+                for value in (1.051,-.01,float('nan'),float('inf')):
                     with self.assertRaises((RuntimeError,ValueError)):
                         a._target_from_action([0,0,0,0,0,0,value],{'position_m':[0,0,.3],'orientation_xyzw':[0,0,0,1]})
             finally:a.close()

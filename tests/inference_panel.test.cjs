@@ -89,7 +89,8 @@ test('active output and priming lock settings; connection alone cannot enable ou
   const state=structuredClone(f.state());state.execution_enabled=false;state.priming=false;
   state.protocol_compatibility={status:'incompatible',message:'state8 is incompatible'};f.panel.render(state);
   assert.equal(f.panel.canStart(),false);
-  assert.equal(f.element('inference-protocol').textContent,'state8 is incompatible');
+  assert.equal(f.element('inference-protocol').textContent,'协议不兼容');
+  assert.equal(f.element('inference-protocol-detail').textContent,'state8 is incompatible');
 });
 
 test('entry and websocket cards show independent evidence and drafts never relabel active connection',()=>{
@@ -119,7 +120,7 @@ test('automatic preview is separate from hardware control readiness and shows st
   assert.equal(f.panel.canStart(),false);
   assert.match(f.element('inference-preview-state').textContent,/自动更新中.*3.8 Hz/);
   assert.match(f.element('inference-control-state').textContent,/未控制/);
-  assert.match(f.element('inference-chunk-source').textContent,/动作预测预览.*已过期/);
+  assert.match(f.element('inference-chunk-source').textContent,/动作预测预览.*历史结果/);
 });
 
 test('RTC hardware start is enabled with valid observations even when training provenance is unverified',()=>{
@@ -132,5 +133,21 @@ test('RTC hardware start is enabled with valid observations even when training p
   // Use a clean initial render so the saved RTC draft is authoritative.
   f.panel.render(s);
   assert.equal(f.panel.canStart(),true);
-  assert.match(f.element('inference-control-state').textContent,/未核验/);
+  assert.doesNotMatch(f.element('inference-control-state').textContent,/未核验/);
+  assert.match(f.element('inference-training-detail').textContent,/未核验/);
+});
+
+test('control faults remain visible in plain Chinese while raw diagnostics and empty logs stay out of the main status',()=>{
+  const f=fixture(),s=structuredClone(f.state());
+  const raw='Model chunk execution rejected: PermissionError: OSC command rejected: cannot resume from HOLD_READY (SERVO write authority is unavailable)';
+  s.last_error=raw;s.training_notice='训练契约未核验';
+  f.panel.render(s,{osc:{diagnostics:{mailboxes:{cpv:{last_result:{error:'CPV reference moves outside joint limits'}}}}}});
+  assert.match(f.element('inference-control-message').textContent,/关节限位保护/);
+  assert.equal(f.element('inference-control-message').hidden,false);
+  assert.equal(f.element('inference-control-state').textContent,'控制状态：已停止');
+  assert.match(f.element('inference-error-detail').textContent,/SERVO write authority/);
+  assert.equal(f.element('inference-log-state').textContent,'');
+  assert.equal(f.element('inference-log-state').hidden,true);
+  assert.equal(f.element('inference-export').hidden,true);
+  assert.match(f.panel.readableError(raw),/控制权限已撤销/);
 });

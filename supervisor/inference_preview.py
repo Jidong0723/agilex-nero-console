@@ -22,6 +22,7 @@ class ObservationSource:
 
     def refresh(self, snapshot):
         """Read cached feedback; never acquire a lease or send a command."""
+        started_ns = time.perf_counter_ns()
         reader = getattr(self.a.osc, "sensor_sample", None)
         if not callable(reader):
             return snapshot  # Direct fake clients retain their explicit samples.
@@ -44,10 +45,13 @@ class ObservationSource:
             if not isinstance(stamp, int) or not 0 <= now-stamp <= 100_000_000 or age > .1:
                 raise RuntimeError("实测关节反馈过期")
             source = "measured_joint_fk"
+        sample_read_ns = time.perf_counter_ns()
         values = np.asarray(joints, dtype=float)
         if values.shape != (7,) or not np.isfinite(values).all():
             raise RuntimeError("实测关节反馈无效")
         key = tuple(values)
+        fk_started_ns = time.perf_counter_ns()
+        fk_reused = key == self.last_joints
         if key != self.last_joints:
             from motion.osc import KinematicsClient, pose_from_tcp
             if self.fk is None:
@@ -59,6 +63,7 @@ class ObservationSource:
             self.fk.start()
             self.last_pose = pose_from_tcp(self.fk.fk(list(key)))
             self.last_joints = key
+        fk_finished_ns = time.perf_counter_ns()
         gripper = copy.deepcopy(snapshot.get("gripper") or {})
         if not shadow:
             feedback = self.a.osc.inference_gripper_feedback()
@@ -74,7 +79,14 @@ class ObservationSource:
         if width is None or not math.isfinite(float(width)):
             raise RuntimeError("等待实测夹爪开度")
         snapshot["inference_observation"] = {"pose": copy.deepcopy(self.last_pose), "perf_ns": stamp,
-            "feedback_age_s": age, "source": source, "gripper_width_m": float(width)}
+            "feedback_age_s": age, "source": source, "gripper_width_m": float(width),
+            "timing": {"refresh_started_perf_ns": started_ns,
+                       "sample_read_perf_ns": sample_read_ns, "sample_perf_ns": stamp,
+                       "sample_age_at_read_ms": (sample_read_ns-stamp)/1e6,
+                       "sensor_read_ms": (sample_read_ns-started_ns)/1e6,
+                       "fk_ms": (fk_finished_ns-fk_started_ns)/1e6, "fk_reused": fk_reused,
+                       "refresh_ms": (time.perf_counter_ns()-started_ns)/1e6,
+                       "latest_feedback_age_ms": age*1000}}
         snapshot["gripper"] = gripper
         return snapshot
 

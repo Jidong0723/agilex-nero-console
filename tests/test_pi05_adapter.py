@@ -154,14 +154,27 @@ class Pi05AdapterTests(unittest.TestCase):
     def test_invalid_gripper_ratio_rejects_action_without_clipping(self):
         adapter = Pi05InputAdapter(_Broker(), Path(__file__).resolve().parents[1] / "config" / "pi05.json")
         try:
-            with self.assertRaisesRegex(RuntimeError, "row unknown.*1.01"):
-                adapter._target_from_action([0., 0., 0., 0., 0., 0., 1.01], {"position_m": [0., 0., .3], "orientation_xyzw": [0., 0., 0., 1.]})
+            with self.assertRaisesRegex(RuntimeError, "row unknown.*1.051"):
+                adapter._target_from_action([0., 0., 0., 0., 0., 0., 1.051], {"position_m": [0., 0., .3], "orientation_xyzw": [0., 0., 0., 1.]})
             diagnostic = adapter.snapshot()["gripper_ratio_diagnostic"]
         finally:
             adapter.close()
         self.assertEqual(diagnostic["status"], "rejected")
         self.assertEqual(diagnostic["action_index"], None)
-        self.assertAlmostEqual(diagnostic["raw_ratio"], 1.01)
+        self.assertAlmostEqual(diagnostic["raw_ratio"], 1.051)
+
+    def test_upper_overshoot_up_to_105_percent_saturates_but_lower_limit_is_unchanged(self):
+        adapter = Pi05InputAdapter(_Broker(), Path(__file__).resolve().parents[1] / "config" / "pi05.json")
+        try:
+            for value in (1.00538116, 1.00601659, 1.01, 1.05, float(np.float32(1.05))):
+                self.assertEqual(adapter._normalise_gripper_ratio(value, 3), 1.0)
+            self.assertAlmostEqual(adapter.snapshot()['gripper_ratio_diagnostic']['accepted_max'], 1.05)
+            self.assertEqual(adapter._normalise_gripper_ratio(-.005), 0.)
+            for value in (1.050001, -.005001, float('nan'), float('inf')):
+                with self.assertRaises(RuntimeError):
+                    adapter._normalise_gripper_ratio(value, 3)
+        finally:
+            adapter.close()
 
     def test_gripper_ratio_endpoint_roundoff_is_normalized_and_diagnosed(self):
         adapter = Pi05InputAdapter(_Broker(), Path(__file__).resolve().parents[1] / "config" / "pi05.json")

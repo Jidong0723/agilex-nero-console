@@ -314,6 +314,14 @@
 .unified-inference .pi05-help p,.unified-inference .pi05-help li{font-size:11px;line-height:1.7;overflow-wrap:anywhere}
 .unified-inference .help-note{color:var(--amber)}
 .unified-inference .pi05-help [hidden]{display:none!important}
+.unified-inference [hidden]{display:none!important}
+.osc-panel .unified-inference .pi05-adapter-row{align-items:start}
+.unified-inference .inference-details{margin-top:12px;padding:10px 12px;border:1px solid #294843;border-radius:8px;min-width:0;color:#91aaa5}
+.unified-inference .inference-details>summary{cursor:pointer;font-size:12px;user-select:none}
+.unified-inference .inference-details .result,.unified-inference .inference-details>code{display:block;white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;line-height:1.6}
+.unified-inference #inference-control-message{padding:9px 10px;border-left:3px solid var(--amber);background:#231d12;color:#f0c57a;line-height:1.7}
+.unified-inference .result:empty{display:none}
+.osc-panel .unified-inference .pi05-adapter-actions:before{content:none}
 @media(max-width:720px){.unified-inference .inference-help-cards{grid-template-columns:1fr}}
 @media(max-width:1180px){.unified-inference .inference-settings-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:720px){.unified-inference .inference-settings-grid,.unified-inference .inference-live-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.unified-inference .inference-address{grid-column:1/-1}.unified-inference .inference-settings-footer{align-items:stretch;flex-direction:column}.unified-inference .pi05-adapter-actions{flex-wrap:wrap}.unified-inference .pi05-adapter-actions .button{flex:1}.unified-inference .pi05-adapter-row{grid-template-columns:1fr}}
