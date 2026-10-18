@@ -21,6 +21,8 @@ from .openpi_client import OpenPIClient, _pack_array, _unpack_array
 from .inference_config import project, prepare_update, save_config, endpoint_uri
 from .inference_contract import metadata_compatibility, make_observation, action_rows
 from .inference_connection import local_listener, loopback
+from .inference_rtc import run_adapter as run_rtc_adapter, compatibility as rtc_compatibility
+from .inference_preview import ObservationSource, preview_once
 
 
 LOGGER = logging.getLogger(__name__)
@@ -144,6 +146,9 @@ class Pi05InputAdapter:
         self._capture: RunCapture | None = None
         self._completed_capture: RunCapture | None = None
         self._pending_gripper: dict[str, Any] | None = None
+        self._rtc_run = None
+        self._preview_busy = False
+        self._observation_source = ObservationSource(self)
         self._gripper_observation_identity = None
         self._gripper_observation_cache: dict[str, Any] | None = None
         self.state: dict[str, Any] = self._new_state()
@@ -151,7 +156,9 @@ class Pi05InputAdapter:
         self._osc_state_thread.start()
 
     def _new_state(self) -> dict[str, Any]:
-        return {"adapter": "pi05", "state": "IDLE", "camera_state": "IDLE", "model_state": "UNKNOWN",
+        return {"preview": {"state": "WAITING", "error": None, "updated_at": None, "sequence": 0, "stale": True},
+                "chunk_source": None, "chunk_updated_at": None,
+                "adapter": "pi05", "state": "IDLE", "camera_state": "IDLE", "model_state": "UNKNOWN",
                 "session_id": None, "client_id": None, "execution_mode": None, "prompt": self.config["model"]["prompt"],
                 "last_error": None, "websocket_error": None, "inference_ms": None, "action_chunk": None, "absolute_tcp_chunk": None,
                 "inference_base_tcp": None, "action_chunk_length": 0, "chunk_sequence": 0,
@@ -171,6 +178,16 @@ class Pi05InputAdapter:
                                           "disconnects": 0, "ping_failures": 0,
                                           "inference_failures": 0, "last_event": "等待 Model Policy WebSocket"},
                 "updated_at": time.time()}
+
+    def _metadata_status(self, metadata):
+        status = metadata_compatibility(metadata, self.config["execution"]["expected_chunk_steps"])
+        if self.config["execution"].get("mode") == "rtc":
+            try:
+                rtc_compatibility(metadata, self.config["execution"])
+                return {"status": "compatible", "message": "RTC 能力已确认；启动时验证实际 H20 响应"}
+            except Exception as exc:
+                return {"status": "incompatible", "message": str(exc)}
+        return status
 
     def _record_websocket_event(self, event: str, detail: str | None = None, *, log: bool = True) -> None:
         """Retain compact, operator-visible evidence for connection flapping."""
@@ -215,13 +232,31 @@ class Pi05InputAdapter:
             result['log_export_ready'] = bool(self._completed_capture and self._completed_capture.status()['export_ready'])
             result['policy_metadata'] = copy.deepcopy(getattr(self._policy,'metadata',{}))
             result['connection_switching'] = self._changing_connection
+            preview = result['preview']
+            preview['stale'] = bool(preview.get('stale') or not preview.get('updated_at') or time.time()-preview['updated_at'] > 1)
+            result['chunk_stale'] = not result.get('chunk_updated_at') or time.time()-result['chunk_updated_at'] > 1
+            basic = (None if result['camera_ready'] and result['model_state'] == 'CONNECTED'
+                     and result['protocol_compatibility']['status'] == 'compatible'
+                     and result.get('last_response_steps') == self.config['execution']['expected_chunk_steps']
+                     and not result['chunk_stale'] and not result.get('observation_wait_reason')
+                     and result['preview'].get('state') != 'ERROR'
+                     else result.get('observation_wait_reason') or result['preview'].get('error') or '等待连接、有效观测和实际动作响应')
+            control_busy = bool(result['execution_enabled'] or result['priming'] or self._changing_connection
+                                or result.get('rtc', {}).get('state') in {'STOPPING','HOLD_PENDING','HOLD_UNCONFIRMED'})
+            training = bool(result['policy_metadata'].get('training_contract_verified'))
+            rtc = self.config['execution'].get('mode') == 'rtc'
+            result['control_readiness'] = {
+                'shadow': {'allowed': not basic and not control_busy, 'reason': basic or ('控制正在运行或停止确认中' if control_busy else None)},
+                'hardware': {'allowed': not basic and not control_busy,
+                             'reason': basic or ('控制正在运行或停止确认中' if control_busy else None)}}
+            result['training_notice'] = 'RTC训练时间对齐尚未核验；此信息不阻止手动启动控制' if rtc and not training else None
             return result
 
     def _camera_ui_snapshot(self, active: bool) -> dict[str, Any]:
         resource = self.camera_resource
         if resource is None:
             return {"ready": self.cameras is not None, "frame_version": 0}
-        if not active or not hasattr(resource,'frame_times_ns'):
+        if (not active and self._camera_status_snapshot is None) or not hasattr(resource,'frame_times_ns'):
             # Idle diagnostics retain the original full driver properties.
             result = resource.snapshot()
             self._camera_status_snapshot = copy.deepcopy(result)
@@ -301,6 +336,8 @@ class Pi05InputAdapter:
         with self.lock:
             if self.state.get("execution_enabled") or self.state.get("priming") or self._capture is not None:
                 raise RuntimeError("请先停止推理输出，再修改连接或 H/K")
+            if self._rtc_run and not self._rtc_run.stop_confirmed:
+                raise RuntimeError("RTC HOLD is unconfirmed; confirm stop before changing configuration")
             save_config(self.config_path, candidate)
             self._changing_connection = True
             self._connection_revision += 1
@@ -434,7 +471,7 @@ class Pi05InputAdapter:
                                 if self._connection_stop.is_set() or self._changing_connection or revision != self._connection_revision:
                                     policy.close()
                                 else:
-                                    self.state["protocol_compatibility"] = metadata_compatibility(getattr(policy, "metadata", {}), self.config["execution"]["expected_chunk_steps"])
+                                    self.state["protocol_compatibility"] = self._metadata_status(getattr(policy, "metadata", {}))
                                     self._policy = policy
                                     self._policy_generation += 1
                                     self.state.update({"model_state": "CONNECTED", "websocket_error": None, "updated_at": time.time()})
@@ -477,6 +514,13 @@ class Pi05InputAdapter:
             try:
                 snapshot = self.osc.state()
                 returned_ns = time.perf_counter_ns()
+                try:
+                    snapshot = self._observation_source.refresh(snapshot)
+                    with self.lock:
+                        self.state['observation_wait_reason'] = None
+                except Exception as observation_error:
+                    with self.lock:
+                        self.state['observation_wait_reason'] = str(observation_error)
                 snapshot = self._refresh_gripper_observation(snapshot)
                 self._publish_logging_feedback(snapshot)
                 published = copy.deepcopy(snapshot)
@@ -566,7 +610,7 @@ class Pi05InputAdapter:
             if self.worker and self.worker.is_alive():
                 return
             self.stop_event = threading.Event()
-            self.state.update({"state": "RUNNING", "last_error": None, "updated_at": time.time()})
+            self.state.update({"state": "RUNNING", "updated_at": time.time()})
             self.worker = threading.Thread(target=self._run, name="nero-pi05-input-adapter", daemon=True)
             self.worker.start()
 
@@ -638,8 +682,12 @@ class Pi05InputAdapter:
             with self.lock:
                 candidate = prepare_update(self.config, value)
                 execution = value.get("execution") or {}
-                switch = ("inference_profile" in value or "policy_endpoint" in value
-                          or "expected_chunk_steps" in execution or "replan_steps" in execution)
+                rtc_active = self.config["execution"].get("mode") == "rtc" and (self.state.get("execution_enabled") or self.state.get("priming"))
+                if rtc_active:
+                    raise RuntimeError("Stop RTC output before changing model settings")
+                switch = ("inference_profile" in value or "policy_endpoint" in value or "model" in value
+                          or "expected_chunk_steps" in execution or "replan_steps" in execution
+                          or "mode" in execution or "rtc_min_replan_steps" in execution)
                 cameras = value.get("cameras")
                 if cameras is not None:
                     if not isinstance(cameras, dict):
@@ -691,13 +739,16 @@ class Pi05InputAdapter:
             return self.snapshot()
 
     def start(self, session_id: str, client_id: str) -> dict[str, Any]:
+        previous_rtc = self._rtc_run
+        if previous_rtc and (not previous_rtc.finished.is_set() or not previous_rtc.stop_confirmed):
+            raise RuntimeError("Previous RTC run is still exiting or HOLD is unconfirmed")
         previous_worker = self.worker
         if self.stop_event.is_set() and previous_worker and previous_worker.is_alive():
             previous_worker.join(timeout=1)
             if previous_worker.is_alive(): raise RuntimeError('Previous inference is still exiting')
         with self.lock:
             if self._changing_connection: raise RuntimeError('Policy connection is switching')
-            metadata_status = metadata_compatibility(getattr(self._policy, "metadata", {}), self.config["execution"]["expected_chunk_steps"])
+            metadata_status = self._metadata_status(getattr(self._policy, "metadata", {}))
             if metadata_status["status"] == "incompatible":
                 self.state["protocol_compatibility"] = metadata_status
                 raise RuntimeError(metadata_status["message"])
@@ -724,6 +775,7 @@ class Pi05InputAdapter:
             session = osc.get("session") or {}
             if session.get("state") != "ACTIVE" or session.get("id") != session_id or session.get("client_id") != client_id:
                 raise PermissionError("Model inference requires the caller's active OSC session")
+            rtc = self.config["execution"].get("mode") == "rtc"
             self._last_gripper_target = None
             self._run_revision += 1
             self._wait_cancel = threading.Event()
@@ -732,15 +784,18 @@ class Pi05InputAdapter:
                 self._capture = RunCapture(self.config_path.parent.parent/'runtime/logs/inference_runs',
                     {'session':session,'config':copy.deepcopy(self.config)},self._logging_feedback)
             except Exception as exc: self.state['log_error'] = f'{type(exc).__name__}: {exc}'
-            needs_priming = session.get("execution_mode") == "hardware"
+            needs_priming = rtc or session.get("execution_mode") == "hardware"
             self.state.update({"state": "PRIMING" if needs_priming else "RUNNING",
                                "execution_enabled": not needs_priming, "priming": needs_priming,
                                "session_id": session_id, "client_id": client_id,
                                "execution_mode": session.get("execution_mode"), "last_error": None, "updated_at": time.time()})
             self.state["osc_error"] = None
+            self.state['preview'].update(state='PAUSED', stale=True)
+            if self._preview_busy and self._policy is not None:
+                self._invalidate_policy(self._policy, 'Cancel preview; acquire fresh control observation')
             self._ensure_worker()
             self._connection_wakeup.set()
-            if needs_priming:
+            if needs_priming and not rtc:
                 threading.Thread(target=self._prime_control_worker, args=(session_id, client_id, self._run_revision), name="nero-pi05-osc-prime", daemon=True).start()
         return self.snapshot()
 
@@ -771,11 +826,36 @@ class Pi05InputAdapter:
 
     def stop(self, reason: str = "Model inference stopped") -> dict[str, Any]:
         with self.lock:
+            was_active = bool(self.state.get('execution_enabled') or self.state.get('priming'))
+            session_id, client_id = self.state.get('session_id'), self.state.get('client_id')
             self._run_revision += 1
             self._wait_cancel.set()
             self._cancel_pending_gripper(reason)
             self.state.update({"state": "RUNNING" if self.state.get("state") == "PRIMING" else self.state.get("state"),
                                "execution_enabled": False, "priming": False, "updated_at": time.time()})
+            rtc_run = self._rtc_run
+        if rtc_run and not rtc_run.stop_confirmed:
+            with self.lock:
+                self.state.setdefault("rtc", {}).update(state="STOPPING", hold_confirmed=False)
+            rtc_run.cancel.set()
+            self._invalidate_policy(rtc_run.policy, "RTC stopped; discard in-flight response")
+            try:
+                rtc_run.stop(reason)
+                with self.lock:
+                    self.state.setdefault("rtc", {}).update(state="RELEASED" if rtc_run.authority_released else "HOLD",
+                        hold_confirmed=rtc_run.hold_confirmed, authority_released=rtc_run.authority_released, manual_restart_required=True)
+            except Exception as exc:
+                with self.lock:
+                    self.state.setdefault("rtc", {}).update(state="HOLD_UNCONFIRMED", hold_confirmed=False)
+                    self.state["last_error"] = f"RTC stop unconfirmed: {exc}"
+                raise
+        if was_active and (rtc_run is None or self.config['execution'].get('mode') != 'rtc') and session_id and client_id:
+            with self._row_lock:
+                current = self.osc.state().get('session') or {}
+                if (current.get('id'), current.get('client_id')) == (session_id, client_id):
+                    result = self.osc.hold(session_id, client_id, self._next_sequence(), reason)
+                    if not result.get('ok'):
+                        raise RuntimeError('Control HOLD not confirmed')
         with self._row_lock: self._finish_capture(reason)
         return self.snapshot()
 
@@ -813,23 +893,27 @@ class Pi05InputAdapter:
     @staticmethod
     def _feedback_pose(osc: dict[str, Any]) -> dict[str, Any] | None:
         """Pose represented by the state frame captured for one inference."""
-        pose = (osc.get("execution") or {}).get("measured_tcp_pose")
+        observed = osc.get('inference_observation')
+        pose = observed['pose'] if observed else (osc.get("execution") or {}).get("measured_tcp_pose")
         if not isinstance(pose, dict):
             pose = (osc.get("command") or {}).get("target_tcp")
         return copy.deepcopy(pose) if isinstance(pose, dict) else None
 
     def _observation(self, osc: dict[str, Any], external: Any, wrist: Any) -> dict[str, Any]:
+        observed = osc.get('inference_observation')
+        if observed and not 0 <= time.perf_counter_ns()-observed['perf_ns'] <= 100_000_000:
+            raise ObservationNotReady('waiting for fresh measured TCP')
         pose = self._feedback_pose(osc)
         # Before an OSC session is opened there may be no published target
         # pose yet. Inference is still useful in preview mode; execution will
         # only be enabled after a session has supplied a real measured pose.
         if not isinstance(pose, dict):
-            pose = {"position_m": [0.0, 0.0, 0.0], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]}
+            raise ObservationNotReady('waiting for measured TCP pose')
         position = _finite(pose.get("position_m"), 3, "TCP position")
         # The AutoDL training state is expressed directly in the NERO base
         # frame.  Do not apply LIBERO axis flips or arbitrary normalisation.
         rotvec = _quaternion_rotvec(_finite(pose.get("orientation_xyzw"), 4, "TCP orientation"))
-        gripper = (osc.get("gripper") or {}).get("width_m")
+        gripper = observed['gripper_width_m'] if observed else (osc.get("gripper") or {}).get("width_m")
         if gripper is None:
             raise ObservationNotReady('waiting for measured gripper opening')
         minimum = float(self.config["gripper"]["min_width_m"])
@@ -879,17 +963,11 @@ class Pi05InputAdapter:
             f"(only endpoint round-off within ±{tolerance:.9g} is normalized)"
         )
 
-    def _target_from_action(self, action: Any, base: dict[str, Any], delta_scale: float | None = None,
+    def _target_from_action(self, action: Any, base: dict[str, Any],
                             action_index: int | None = None) -> tuple[dict[str, Any], float]:
         values = _finite(action, 7, "AutoDL Nero action")
         gripper_ratio = self._normalise_gripper_ratio(values[6], action_index)
-        scale = float(self.config["execution"].get("action_delta_scale", 1.0) if delta_scale is None else delta_scale)
-        if not math.isfinite(scale) or not 0.0 <= scale <= 1.0:
-            raise RuntimeError("Model action delta scale must be within [0, 1]")
-        # Only the policy's relative TCP translation and rotation are scaled.
-        # Its final component is an absolute gripper-opening ratio, not a
-        # delta, so leaving it untouched preserves trained gripper semantics.
-        delta, rotvec = [value * scale for value in values[:3]], [value * scale for value in values[3:6]]
+        delta, rotvec = values[:3], values[3:6]
         position = [float(base["position_m"][i]) + delta[i] for i in range(3)]
         orientation = _quat_product(_rotvec_quaternion(rotvec), _finite(base["orientation_xyzw"], 4, "TCP orientation"))
         norm = math.sqrt(sum(value * value for value in orientation)); orientation = [value / norm for value in orientation]
@@ -1039,9 +1117,18 @@ class Pi05InputAdapter:
         self._finish_capture(reason)
 
     def _run(self) -> None:
+        if self.config["execution"].get("mode") == "rtc":
+            run_rtc_adapter(self)
+            return
         policy = None
         try:
             while not self.stop_event.is_set():
+                with self.lock:
+                    active = bool(self.state.get('execution_enabled') or self.state.get('priming'))
+                if not active:
+                    preview_once(self)
+                    policy = None
+                    continue
                 if policy is None:
                     try:
                         policy = self._policy_client()
@@ -1092,20 +1179,12 @@ class Pi05InputAdapter:
                 try:
                     observation = self._observation(osc, external, wrist)
                 except ObservationNotReady as exc:
-                    if not execution_enabled and not priming_requested and not active_session:
-                        # Only a non-output protocol preview may use this
-                        # explicit placeholder. start/stop/switch increments
-                        # run_revision, so its response cannot become motion.
-                        preview = dict(osc, gripper={'width_m':float(self.config['gripper']['min_width_m'])})
-                        observation = self._observation(preview, external, wrist)
-                        placeholder = True
-                    else:
-                        with self.lock:
-                            changed = self.state.get('observation_wait_reason') != str(exc)
-                            self.state.update(observation_wait_reason=str(exc), observation_preview_placeholder=False)
-                        if changed: self._event('observation_wait',reason=str(exc))
-                        self.stop_event.wait(.05)
-                        continue
+                    with self.lock:
+                        changed = self.state.get('observation_wait_reason') != str(exc)
+                        self.state.update(observation_wait_reason=str(exc), observation_preview_placeholder=False)
+                    if changed: self._event('observation_wait',reason=str(exc))
+                    self.stop_event.wait(.05)
+                    continue
                 with self.lock:
                     self.state.update(observation_wait_reason=None, observation_preview_placeholder=placeholder)
                 self._record_inference_input(external, wrist, observation)
@@ -1160,9 +1239,7 @@ class Pi05InputAdapter:
                             observation_preparation_ms=(inference_ns-observation_ns)/1e6,inference_ms=inference_ms)
                     if base is None:
                         raise RuntimeError("OSC measured TCP feedback is unavailable for this Model chunk")
-                    with self.lock:
-                        delta_scale = float(execution_config.get("action_delta_scale", 1.0))
-                    decoded = [self._target_from_action(action, base, delta_scale, index)
+                    decoded = [self._target_from_action(action, base, action_index=index)
                                for index, action in enumerate(rows)]
                     absolute_chunk = [target for target, _ratio in decoded]
                     limit = execution_config["replan_steps"]
@@ -1176,6 +1253,7 @@ class Pi05InputAdapter:
                         continue
                     self.state["protocol_compatibility"] = {"status": "compatible", "message": "7D 输入／动作响应验证通过"}
                     self.state.update({"action_chunk": rows, "absolute_tcp_chunk": absolute_chunk,
+                                       "chunk_source": "control", "chunk_updated_at": time.time(),
                                        "inference_base_tcp": copy.deepcopy(base), "action_chunk_length": len(rows),
                                        "decoded_first_target": copy.deepcopy(absolute_chunk[0]),
                                        "last_rejection": None,
@@ -1258,16 +1336,21 @@ class Pi05InputAdapter:
             self._finish_capture('inference worker exited')
             with self.lock:
                 session_id, client_id = self.state.get("session_id"), self.state.get("client_id")
+                needs_hold = bool(self.state.get('execution_enabled') or self.state.get('priming'))
+                self.state.update(execution_enabled=False, priming=False)
                 if self.stop_event.is_set() and self.state.get("state") != "ERROR":
                     self.state["state"] = "IDLE"
                 self.state["updated_at"] = time.time()
-            if session_id and client_id and not self.stop_event.is_set():
+            if needs_hold and session_id and client_id and not self.stop_event.is_set():
                 try:
-                    self.osc.hold(str(session_id), str(client_id), self._next_sequence(), "Model inference failed")
+                    owner = self.osc.state().get('session') or {}
+                    if (owner.get('id'),owner.get('client_id')) == (session_id,client_id):
+                        self.osc.hold(str(session_id), str(client_id), self._next_sequence(), "Model inference failed")
                 except Exception:
                     pass
 
     def close(self) -> None:
+        self.stop_event.set()
         self.stop("service closing")
         self._connection_stop.set()
         self._osc_state_stop.set()
@@ -1287,3 +1370,4 @@ class Pi05InputAdapter:
             try: policy.close()
             except Exception: pass
         if self.camera_resource is None and self.cameras: self.cameras.close()
+        self._observation_source.close()

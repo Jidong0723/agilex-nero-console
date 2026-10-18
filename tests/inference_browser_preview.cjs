@@ -10,6 +10,7 @@ const {chromium} = require('playwright');
   const root = path.resolve(__dirname, '../web/console');
   const canonical = JSON.parse(fs.readFileSync(path.resolve(__dirname,'../config/pi05.json'),'utf8'));
   canonical.inference_profiles.active='local5090';
+  canonical.execution.mode='normal';
   let pi, camera;
   const requests = [];
   function publish() {
@@ -20,6 +21,9 @@ const {chromium} = require('playwright');
     pi = {config, camera, camera_ready:true,model_state:'CONNECTED',state:'RUNNING',
       execution_enabled:false,protocol_compatibility:{status:'compatible',message:'7D 输入／动作响应验证通过'},
       action_chunk:Array.from({length:p.expected_chunk_steps},()=>[.001,0,0,0,0,0,.5]),
+      preview:{state:'READY',updated_at:Date.now()/1000,hz:4,sequence:7},
+      chunk_source:'preview',chunk_sequence:7,action_chunk_length:p.expected_chunk_steps,
+      chunk_updated_at:Date.now()/1000,chunk_stale:false,inference_ms:190,
       last_response_steps:p.expected_chunk_steps,policy_metadata:{deployment_label:'模拟模型 · state7/action7'},
       connections:{policy:{state:'ok',label:'模型 WebSocket',endpoint:`ws://${p.host}:${p.port}`,message:'已连接'},
         service_entry:{state:'ok',subtitle:config.inference_profiles.active==='autodl'?'AutoDL 本机转发入口':'5090 本地直连',endpoint:`${p.host}:${p.port}`,message:'已有服务监听',checked_at:Date.now()/1000},
@@ -39,6 +43,7 @@ const {chromium} = require('playwright');
         Object.assign(p,body.policy_endpoint||{});
         for(const key of ['expected_chunk_steps','replan_steps']) if(body.execution?.[key]) p[key]=body.execution[key];
         if(body.execution?.arrival_wait_s!==undefined) canonical.execution.arrival_wait_s=body.execution.arrival_wait_s;
+        for(const key of ['mode','rtc_min_replan_steps']) if(body.execution?.[key]!==undefined) canonical.execution[key]=body.execution[key];
         publish(); data=pi;
       } else if(req.url.includes('/pi05/state')) data=pi;
       else if(req.url==='/api/osc/state'||req.url==='/api/osc/fast-state') data=osc;
@@ -101,6 +106,15 @@ const {chromium} = require('playwright');
     assert.ok(await page.isDisabled('#pi05-start'));
     pi.protocol_compatibility={status:'compatible',message:'7D／H 验证通过'};
     await page.waitForFunction(()=>document.querySelector('#inference-protocol').classList.contains('ok'));
+    await page.selectOption('#inference-mode','rtc');
+    assert.equal(await page.inputValue('#inference-horizon'),'20');
+    assert.ok(await page.isDisabled('#inference-prefix'));
+    assert.equal(await page.locator('#pi05-action-scale').count(),0);
+    assert.match(await page.locator('label').allTextContents().then(x=>x.join(' ')),/段末到位等待上限（ms）/);
+    await page.click('#inference-save');
+    await page.waitForFunction(()=>document.querySelector('#inference-mode').value==='rtc'&&!document.querySelector('#inference-save').disabled);
+    pi.rtc={state:'RUNNING',queue_remaining_ms:650,end_to_end_ms:150,replan_interval_steps:7};
+    await page.waitForFunction(()=>document.querySelector('#inference-rtc-state').textContent.includes('650 ms'));
     await page.locator('#pi05-panel').screenshot({path:path.join(output,'autodl-desktop.png')});
     await page.setViewportSize({width:390,height:844});
     await page.locator('#pi05-panel').screenshot({path:path.join(output,'autodl-mobile.png')});
@@ -108,12 +122,18 @@ const {chromium} = require('playwright');
     const cards=await page.locator('.inference-help-card').evaluateAll(nodes=>nodes.map(node=>({x:node.getBoundingClientRect().x,y:node.getBoundingClientRect().y})));
     assert.equal(cards[0].x,cards[1].x);assert.ok(cards[1].y>cards[0].y);
     await page.setViewportSize({width:1440,height:1100});
+    await page.selectOption('#inference-mode','normal');
+    await page.click('#inference-save');
     await page.selectOption('#inference-profile','local5090');
     assert.equal(await page.inputValue('#inference-horizon'),'13');assert.equal(await page.inputValue('#inference-prefix'),'4');
     await page.click('#inference-save');
     await page.addStyleTag({content:'.topbar{position:static!important}'});
     assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1),'desktop page must not overflow horizontally');
     await page.locator('#pi05-panel').screenshot({path:path.join(output,'desktop.png')});
+    assert.equal(await page.locator('#pi05-start').textContent(),'开始推理控制');
+    assert.equal(await page.locator('#pi05-stop').textContent(),'停止推理控制');
+    assert.match(await page.locator('#inference-preview-state').textContent(),/自动更新中/);
+    assert.match(await page.locator('#inference-chunk-source').textContent(),/动作预测预览/);
     await page.reload();await page.selectOption('#input-adapter','pi05');
     await page.waitForFunction(()=>document.querySelector('#inference-horizon').value==='13');
     await page.setViewportSize({width:390,height:844});

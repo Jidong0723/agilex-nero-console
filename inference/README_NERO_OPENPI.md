@@ -1,5 +1,9 @@
 # NERO OpenPI inference
 
+For the optional H20 inference-time RTC service, new AutoDL instance, timing
+contract and no-motion validation results, see [RTC deployment guide](README_RTC.md).
+Ordinary inference remains the default.
+
 The console owns one OpenPI MessagePack/WebSocket client for both local 5090
 and AutoDL presets. Start the ordinary policy server using its deployment's
 existing checkpoint and matching normalization assets. The console does not

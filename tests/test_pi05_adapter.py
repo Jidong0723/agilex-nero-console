@@ -81,7 +81,9 @@ class Pi05AdapterTests(unittest.TestCase):
         fixture_path = Path(self._fixture_dir.name) / "config" / "pi05.json"
         fixture_path.parent.mkdir()
         configuration = json.loads(original_path.read_text(encoding="utf-8"))
-        configuration['execution'].update(expected_chunk_steps=10,replan_steps=5,max_chunk_steps=10)
+        configuration['execution'].update(mode='normal',expected_chunk_steps=10,replan_steps=5,max_chunk_steps=10)
+        for preset in ('local5090','autodl'):
+            configuration['inference_profiles'][preset].update(expected_chunk_steps=10,replan_steps=5)
         fixture_path.write_text(json.dumps(configuration),encoding="utf-8")
         original_init = Pi05InputAdapter.__init__
         def isolated_init(adapter, osc, config_path, camera_resource=None):
@@ -137,17 +139,16 @@ class Pi05AdapterTests(unittest.TestCase):
         np.testing.assert_allclose(target["orientation_xyzw"], [.5, -.5, .5, .5], atol=1e-6)
         self.assertEqual(ratio, .25)
 
-    def test_action_delta_scale_reduces_tcp_delta_but_not_gripper_ratio(self):
+    def test_action_decoding_preserves_physical_delta_and_gripper_ratio(self):
         adapter = Pi05InputAdapter(_Broker(), Path(__file__).resolve().parents[1] / "config" / "pi05.json")
         try:
-            adapter.config["execution"]["action_delta_scale"] = .25
             target, ratio = adapter._target_from_action([.04, -.08, .12, 0., 0., 0., .75],
                                                         {"position_m": [.1, .2, .3], "orientation_xyzw": [0., 0., 0., 1.]})
         finally:
             adapter.close()
-        self.assertAlmostEqual(target["position_m"][0], .11)
-        self.assertAlmostEqual(target["position_m"][1], .18)
-        self.assertAlmostEqual(target["position_m"][2], .33)
+        self.assertAlmostEqual(target["position_m"][0], .14)
+        self.assertAlmostEqual(target["position_m"][1], .12)
+        self.assertAlmostEqual(target["position_m"][2], .42)
         self.assertEqual(ratio, .75)
 
     def test_invalid_gripper_ratio_rejects_action_without_clipping(self):
@@ -201,7 +202,7 @@ class Pi05AdapterTests(unittest.TestCase):
             adapter.close()
         self.assertNotEqual(snapshot["state"], "ERROR")
         self.assertGreaterEqual(len([item for item in broker.commands if item["type"] == "track_tcp"]), 5)
-        self.assertFalse(any(item["type"] == "hold" for item in broker.commands))
+        self.assertFalse(any(item["type"] == "hold" and item['payload']['reason'] != 'service closing' for item in broker.commands))
         self.assertEqual(snapshot["gripper_ratio_diagnostic"]["status"], "boundary_normalized")
 
     def test_rejected_osc_target_stops_entire_chunk_and_requests_hold(self):

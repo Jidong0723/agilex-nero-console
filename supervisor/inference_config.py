@@ -56,6 +56,14 @@ def canonical(config):
     if active not in PROFILES:
         raise ValueError("Unknown inference profile")
     execution = result.setdefault("execution", {})
+    execution.pop('action_delta_scale', None)  # Drop retired settings on migration.
+    execution.setdefault("mode", "normal")
+    execution.setdefault("rtc_min_replan_steps", 6)
+    if execution["mode"] not in ("normal", "rtc"):
+        raise ValueError("Unknown inference execution mode")
+    positive_integer(execution["rtc_min_replan_steps"], "RTC minimum replan steps")
+    if execution["rtc_min_replan_steps"] > 9:
+        raise ValueError("RTC minimum replan steps must be <=9 for H20")
     model = result.setdefault("model", {})
     legacy = result.get("schema_version") != SCHEMA
     horizon = execution.get("expected_chunk_steps", 10)
@@ -118,12 +126,23 @@ def prepare_update(config, request):
     preset.update({key: execution[key] for key in length_keys if key in execution})
     validate_preset(preset)
     profiles["active"] = name
-    for key, upper in (("arrival_wait_s", 5), ("action_delta_scale", 1)):
+    for key, upper in (("arrival_wait_s", 5),):
         if key in execution:
             value = execution[key]
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= upper:
                 raise ValueError(f"{key} must be within [0, {upper}]")
             result["execution"][key] = float(value)
+    if "mode" in execution:
+        if execution["mode"] not in ("normal", "rtc"):
+            raise ValueError("Unknown inference execution mode")
+        result["execution"]["mode"] = execution["mode"]
+    if "rtc_min_replan_steps" in execution:
+        steps = positive_integer(execution["rtc_min_replan_steps"], "RTC minimum replan steps")
+        if steps > 9:
+            raise ValueError("RTC minimum replan steps must be <=9 for H20")
+        result["execution"]["rtc_min_replan_steps"] = steps
+    if result["execution"]["mode"] == "rtc" and preset["expected_chunk_steps"] != 20:
+        raise ValueError("RTC requires H20; apply H=20 together with RTC mode")
     model = request.get("model", {})
     if not isinstance(model, dict):
         raise ValueError("Model must be an object")

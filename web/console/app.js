@@ -724,9 +724,6 @@
     // Periodic telemetry refreshes must never overwrite a task the operator
     // has typed but not yet received an explicit save confirmation for.
     if (promptInput && !state.pi05PromptDirty && !state.pi05PromptSaving && document.activeElement !== promptInput) promptInput.value = serverPrompt;
-    const actionDeltaScale = Number(config.execution?.action_delta_scale ?? 1);
-    if ($("pi05-action-scale") && document.activeElement !== $("pi05-action-scale")) $("pi05-action-scale").value = String(actionDeltaScale);
-    if ($("pi05-action-scale-value")) $("pi05-action-scale-value").textContent = `${actionDeltaScale.toFixed(2)}×`;
     const submittedPrompt = String(pi.prompt || model.prompt || "").trim();
     const submittedPromptView = $("pi05-active-prompt");
     if (submittedPromptView) submittedPromptView.textContent = submittedPrompt ? `当前已提交给模型：${submittedPrompt}` : "当前已提交给模型：--";
@@ -768,13 +765,13 @@
     if ($("pi05-cameras")) $("pi05-cameras").disabled = pi.state === "RUNNING";
     $("pi05-start").disabled = pi.execution_enabled === true || !pi.camera_ready;
     $("pi05-stop").disabled = pi.execution_enabled !== true;
-    $("pi05-start").textContent = "开始推理输出";
-    $("pi05-stop").textContent = "停止输出";
+    $("pi05-start").textContent = "开始推理控制";
+    $("pi05-stop").textContent = "停止推理控制";
     window.NeroInferencePanel.render(pi);
     if (inferenceStartup.busy) {
       $("pi05-start").disabled = true;
       $("pi05-stop").disabled = false;
-      $("pi05-start").textContent = "正在准备推理…";
+      $("pi05-start").textContent = "正在准备控制…";
       $("pi05-stop").textContent = "取消启动";
       if (result) result.textContent = inferenceStartup.message;
     }
@@ -1428,7 +1425,7 @@
     return { model: { prompt: $("pi05-prompt")?.value || "" }, cameras: {
       external: { index: Number($("pi05-external-index")?.value), width: 640, height: 480 },
       wrist: { index: Number($("pi05-wrist-index")?.value), width: 640, height: 480 },
-    }, execution: { action_delta_scale: Number($("pi05-action-scale")?.value ?? 1) }};
+    }};
   }
 
   async function commitPi05Prompt() {
@@ -1460,20 +1457,6 @@
       renderPi05();
     } finally {
       if (revision === state.pi05PromptRevision) state.pi05PromptSaving = false;
-    }
-  }
-
-  async function savePi05ActionScale() {
-    const scale = Number($("pi05-action-scale")?.value);
-    if (!Number.isFinite(scale) || scale < 0 || scale > 1) return;
-    try {
-      state.pi05 = await api("/api/pi05/config", "POST", { execution: { action_delta_scale: scale } }, 5000);
-      const result = $("pi05-result");
-      if (result) result.textContent = `动作 Δ 缩放已保存为 ${scale.toFixed(2)}×；夹爪比例保持原样。`;
-      renderPi05();
-    } catch (error) {
-      const result = $("pi05-result");
-      if (result) result.textContent = `动作 Δ 缩放保存失败：${error.message}`;
     }
   }
 
@@ -1525,10 +1508,8 @@
     if (inferenceStartup.busy || !window.NeroInferencePanel.canStart()) return;
     try {
       const desiredPrompt = ($("pi05-prompt")?.value || "").trim();
-      const desiredScale = Number($("pi05-action-scale")?.value ?? 1);
       const existing = state.pi05?.config;
-      const config = existing?.model?.prompt === desiredPrompt && existing?.execution?.action_delta_scale === desiredScale
-        ? null : {model:{prompt:desiredPrompt},execution:{action_delta_scale:desiredScale}};
+      const config = existing?.model?.prompt === desiredPrompt ? null : {model:{prompt:desiredPrompt}};
       const started = await inferenceStartup.run({api,clientId,mode:$("execution-mode").value,
         context:() => `${state.requestGeneration}|${$("input-adapter").value}|${$("execution-mode").value}`,
         session,acceptOsc:value => updateOscState(value,true),acceptPi:value => { state.pi05 = value; },
@@ -1537,8 +1518,8 @@
       if (!started) return;
       const current = session();
       phase(current.execution_mode === "shadow"
-        ? "模型推理已开启，但当前是影子模式，不会驱动真机；请切换为真机模式"
-        : "模型推理已开启，Nero Chunk 正在发送给 OSC 执行");
+        ? "影子推理控制已开始，模型动作交给虚拟机械臂执行"
+        : "真机推理控制已开始，模型动作交给 OSC 执行");
       render();
     } catch (error) { phase(`模型推理启动失败：${error.message}`, true); await refresh(); }
   }
@@ -1547,7 +1528,7 @@
     if (inferenceStartup.busy) { inferenceStartup.cancel(); renderPi05(); }
     try {
       state.pi05 = await api("/api/pi05/stop", "POST", { reason: "operator stopped pi05 adapter" });
-      phase("模型推理继续运行，已停止向 OSC 输出 Nero Chunk"); render();
+      phase("控制已停止，动作预览继续"); render();
     } catch (error) { phase(`模型推理停止失败：${error.message}`, true); }
   }
 
@@ -1729,11 +1710,6 @@
     renderPi05();
   });
   $("pi05-prompt-save")?.addEventListener("click", () => { void commitPi05Prompt(); });
-  $("pi05-action-scale")?.addEventListener("input", () => {
-    const value = Number($("pi05-action-scale")?.value ?? 1);
-    if ($("pi05-action-scale-value")) $("pi05-action-scale-value").textContent = `${value.toFixed(2)}×`;
-  });
-  $("pi05-action-scale")?.addEventListener("change", () => { void savePi05ActionScale(); });
   $("pi05-start")?.addEventListener("click", startPi05);
   $("pi05-stop")?.addEventListener("click", stopPi05);
   $("pico-start")?.addEventListener("click", startPico);

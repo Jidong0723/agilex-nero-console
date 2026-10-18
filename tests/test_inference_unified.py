@@ -23,7 +23,9 @@ ROOT = Path(__file__).parents[1]
 
 class UnifiedConfigTests(unittest.TestCase):
     def config(self):
-        return project(json.loads((ROOT / "config/pi05.json").read_text(encoding="utf-8")))
+        config = project(json.loads((ROOT / "config/pi05.json").read_text(encoding="utf-8")))
+        config['execution']['mode'] = 'normal'
+        return config
 
     def test_legacy_active_values_win_and_projection_has_one_persisted_source(self):
         old = self.config()
@@ -66,6 +68,12 @@ class UnifiedConfigTests(unittest.TestCase):
         self.assertEqual(endpoint_uri("wss://example.com/policy", 9911), "wss://example.com:9911/policy")
         self.assertEqual(endpoint_uri("::1", 9911), "ws://[::1]:9911")
 
+    def test_old_scaling_setting_is_dropped_during_migration(self):
+        config=self.config()
+        config['execution']['action_delta_scale']=.25
+        self.assertNotIn('action_delta_scale',project(config)['execution'])
+        self.assertNotIn('action_delta_scale',canonical(config)['execution'])
+
 
 class UnifiedContractTests(unittest.TestCase):
     def test_state7_and_contract_failures(self):
@@ -99,7 +107,7 @@ class UnifiedContractTests(unittest.TestCase):
                     base = project(json.loads((ROOT / "config/pi05.json").read_text(encoding="utf-8")))
                     config = prepare_update(base, {"inference_profile": name,
                         "policy_endpoint": {"host": "127.0.0.1", "port": server.socket.getsockname()[1]},
-                        "execution": {"expected_chunk_steps": 13, "replan_steps": 4}})
+                        "execution": {"mode": "normal", "expected_chunk_steps": 13, "replan_steps": 4}})
                     client = OpenPIClient(config["model"]["host"], config["model"]["port"], 2)
                     try:
                         image = np.zeros((224, 224, 3), np.uint8)
@@ -140,6 +148,9 @@ class UnifiedContractTests(unittest.TestCase):
                     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
                     path = Path(tmp) / "pi05.json"
                     config = json.loads((ROOT / "config/pi05.json").read_text(encoding="utf-8"))
+                    config['execution']['mode'] = 'normal'
+                    for name in ('local5090','autodl'):
+                        config['inference_profiles'][name].update(expected_chunk_steps=10, replan_steps=5)
                     for name in ("local5090", "autodl"):
                         config["inference_profiles"][name].update(host="127.0.0.1", port=server.socket.getsockname()[1])
                     config["model"]["request_timeout_s"] = 1
@@ -165,7 +176,11 @@ class UnifiedAdapterTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = Path(self.tmp.name) / "config/pi05.json"
         self.path.parent.mkdir()
-        self.path.write_text((ROOT / "config/pi05.json").read_text(encoding="utf-8"), encoding="utf-8")
+        config = json.loads((ROOT / "config/pi05.json").read_text(encoding="utf-8"))
+        config['execution']['mode'] = 'normal'
+        for name in ('local5090','autodl'):
+            config['inference_profiles'][name].update(expected_chunk_steps=10,replan_steps=5)
+        self.path.write_text(json.dumps(config), encoding='utf-8')
         with patch("supervisor.pi05_adapter.OpenPIClient", _InitiallyUnavailablePolicy):
             self.adapter = Pi05InputAdapter(_Broker(), self.path)
         self.adapter._connection_stop.set(); self.adapter._connection_wakeup.set()
@@ -209,7 +224,7 @@ class UnifiedAdapterTests(unittest.TestCase):
             self.adapter.start("session-1", "client-1")
         self.assertFalse(self.adapter.osc.commands)
 
-    def test_preview_can_validate_protocol_before_any_tcp_pose_exists(self):
+    def test_preview_waits_without_inventing_tcp_pose(self):
         a = self.adapter
         class Preview:
             def infer(self, observation):
@@ -221,8 +236,9 @@ class UnifiedAdapterTests(unittest.TestCase):
         deadline = time.monotonic() + 1
         while a.state["protocol_compatibility"]["status"] != "compatible" and time.monotonic() < deadline:
             time.sleep(.005)
-        self.assertEqual(a.state["protocol_compatibility"]["status"], "compatible")
-        self.assertEqual(a.state["last_response_steps"], 10)
+        self.assertNotEqual(a.state["protocol_compatibility"]["status"], "compatible")
+        self.assertIsNone(a.state["last_response_steps"])
+        self.assertIn('TCP', a.state['preview']['error'])
         self.assertFalse(a.osc.commands)
 
     def test_switch_discards_old_preview_and_executes_exact_non_half_prefix(self):
@@ -247,6 +263,9 @@ class UnifiedAdapterTests(unittest.TestCase):
         a._policy = Current()
         a.config["execution"].update(period_s=.001, arrival_wait_s=0)
         a.start("session-1", "client-1")
+        # This fixture deliberately stops its connection owner. Emulate its
+        # reconnect after start cancels an in-flight preview socket.
+        a._policy = Current()
         deadline = time.monotonic() + 2
         while a.state["executed_steps"] < 4 and time.monotonic() < deadline:
             time.sleep(.005)

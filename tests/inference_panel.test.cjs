@@ -22,7 +22,7 @@ function fixture() {
   let handler = async (url,method,body) => {
     state=structuredClone(state);state.config.inference_profiles.active=body.inference_profile;
     Object.assign(state.config.inference_profiles[body.inference_profile],body.policy_endpoint,body.execution);
-    state.config.execution.arrival_wait_s=body.execution.arrival_wait_s;
+    Object.assign(state.config.execution,body.execution);
     state.protocol_compatibility={status:'pending',message:'待响应验证'};
     return state;
   };
@@ -44,7 +44,7 @@ test('unified preset selection preserves drafts, uses saved H/K and blocks unsav
   assert.equal(f.element('inference-horizon').value,'17');
   await f.panel.save();
   assert.deepEqual(JSON.parse(JSON.stringify(f.calls[0][2])),{inference_profile:'local5090',policy_endpoint:{host:'127.0.0.1',port:8000},
-    execution:{expected_chunk_steps:17,replan_steps:6,arrival_wait_s:.1}});
+    execution:{expected_chunk_steps:17,replan_steps:6,arrival_wait_s:.1,mode:'normal',rtc_min_replan_steps:6}});
   assert.equal(f.panel.canStart(),false);
 });
 
@@ -57,6 +57,25 @@ test('invalid groups and save failure retain editable values',async()=>{
   assert.match(f.element('inference-save-result').textContent,/disk full/);
   assert.equal(f.state().config.inference_profiles.local5090.host,'127.0.0.1');
   assert.equal(f.panel.canStart(),false);
+});
+
+test('RTC selects H20, preserves drafts, locks normal-only controls and saves mode',async()=>{
+  const f=fixture();
+  f.element('inference-mode').value='rtc';f.element('inference-mode').onchange();
+  assert.equal(f.element('inference-horizon').value,'20');
+  assert.equal(f.element('inference-prefix').disabled,true);
+  assert.equal(f.element('inference-wait').disabled,true);
+  assert.equal(f.element('inference-rtc-min').disabled,false);
+  f.panel.render(f.state());
+  assert.equal(f.element('inference-mode').value,'rtc');
+  assert.equal(f.panel.canStart(),false);
+  await f.panel.save();
+  assert.equal(f.calls[0][2].execution.mode,'rtc');
+  assert.equal(f.calls[0][2].execution.expected_chunk_steps,20);
+  const s=structuredClone(f.state());s.rtc={state:'HOLD_UNCONFIRMED'};
+  s.protocol_compatibility={status:'compatible',message:'RTC'};f.panel.render(s);
+  assert.equal(f.panel.canStart(),false);
+  assert.equal(f.element('pi05-stop').disabled,false);
 });
 
 test('active output and priming lock settings; connection alone cannot enable output',()=>{
@@ -88,4 +107,30 @@ test('entry and websocket cards show independent evidence and drafts never relab
   f.input('inference-port','12345');
   assert.match(f.element('inference-help-command').textContent,/:9911:/);
   assert.match(f.element('inference-help-draft').textContent,/已保存值/);
+});
+
+test('automatic preview is separate from hardware control readiness and shows stale chunks',()=>{
+  const f=fixture(),state=structuredClone(f.state());
+  state.preview={state:'READY',sequence:7,updated_at:Date.now()/1000,hz:3.8};
+  state.chunk_source='preview';state.chunk_sequence=7;state.action_chunk_length=13;
+  state.chunk_updated_at=Date.now()/1000;state.chunk_stale=true;state.inference_ms=190;
+  state.control_readiness={shadow:{allowed:false,reason:'缺少有效观测'},hardware:{allowed:false,reason:'训练契约未核验'}};
+  f.panel.render(state);
+  assert.equal(f.panel.canStart(),false);
+  assert.match(f.element('inference-preview-state').textContent,/自动更新中.*3.8 Hz/);
+  assert.match(f.element('inference-control-state').textContent,/未控制/);
+  assert.match(f.element('inference-chunk-source').textContent,/动作预测预览.*已过期/);
+});
+
+test('RTC hardware start is enabled with valid observations even when training provenance is unverified',()=>{
+  const f=fixture(),s=structuredClone(f.state());
+  s.config.execution.mode='rtc';s.config.inference_profiles.local5090.expected_chunk_steps=20;
+  s.policy_metadata={training_contract_verified:false};
+  s.control_readiness={hardware:{allowed:true,reason:null}};
+  s.training_notice='训练时间对齐未核验；不阻止手动控制';
+  f.element('execution-mode').value='hardware';
+  // Use a clean initial render so the saved RTC draft is authoritative.
+  f.panel.render(s);
+  assert.equal(f.panel.canStart(),true);
+  assert.match(f.element('inference-control-state').textContent,/未核验/);
 });

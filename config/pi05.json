@@ -7,7 +7,7 @@
       "height": 480
     },
     "wrist": {
-      "index": 2,
+      "index": 1,
       "width": 640,
       "height": 480
     },
@@ -16,23 +16,24 @@
   },
   "model": {
     "request_timeout_s": 30,
-    "prompt": "Pick up the yellow cube and move it to the P1 area."
+    "prompt": "Pick up the yellow cube and move it to the TO area."
   },
   "execution": {
     "period_s": 0.05,
     "osc_state_poll_s": 0.05,
     "startup_hold_s": 0.3,
-    "action_delta_scale": 1,
-    "arrival_wait_s": 0.1
+    "arrival_wait_s": 0.05,
+    "mode": "normal",
+    "rtc_min_replan_steps": 6
   },
   "inference_profiles": {
     "active": "autodl",
     "autodl": {
       "host": "127.0.0.1",
-      "port": 8001,
+      "port": 18762,
       "checkpoint_label": "Nero LoRA checkpoint 6000",
-      "expected_chunk_steps": 10,
-      "replan_steps": 5
+      "expected_chunk_steps": 20,
+      "replan_steps": 10
     },
     "local5090": {
       "host": "127.0.0.1",

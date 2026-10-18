@@ -1,0 +1,234 @@
+"""Standalone 7D/H20 normal + RTC service; leaves the installed OpenPI tree intact."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import json
+import logging
+from pathlib import Path
+import subprocess
+import threading
+import time
+import types
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from scipy.spatial.transform import Rotation
+from openpi import transforms
+from openpi.models import model as model_module
+from openpi.models.pi0_config import Pi0Config
+from openpi.policies.libero_policy import LiberoInputs
+from openpi.policies.policy import Policy
+from openpi_client import msgpack_numpy
+from websockets.asyncio.server import serve as websocket_serve
+from websockets.exceptions import ConnectionClosed
+from openpi.shared import nnx_utils
+from openpi.training.checkpoints import load_norm_stats
+from openpi.training.config import ModelTransformFactory
+
+from codec import VERSION, HORIZON, PERIOD, encode_prefix, echo_context, validate_context
+from sampling import prefix_weights, sample_rtc
+
+
+class Inputs:
+    def __init__(self, model_type):
+        self.convert = LiberoInputs(model_type)
+
+    def __call__(self, data):
+        state = np.asarray(data["observation/state"], np.float32).copy()
+        if state.shape != (7,) or not np.isfinite(state).all() or not 0 <= state[6] <= 1:
+            raise ValueError("Expected finite 7D state with gripper in [0,1]")
+        for key in ("observation/image", "observation/wrist_image"):
+            image = np.asarray(data[key])
+            if image.shape != (224, 224, 3) or image.dtype != np.uint8:
+                raise ValueError(f"{key} must be RGB uint8 [224,224,3]")
+        state[3:6] = Rotation.from_rotvec(state[3:6]).as_rotvec()
+        return self.convert(dict(data, **{"observation/state": state}))
+
+
+class RtcPolicy:
+    def __init__(self, checkpoint, steps=10, cap=5.0):
+        checkpoint = Path(checkpoint).resolve(strict=True)
+        config = Pi0Config(pi05=True, action_dim=32, action_horizon=HORIZON, discrete_state_input=False)
+        model = config.load(model_module.restore_params(checkpoint / "params", dtype=jnp.bfloat16))
+        asset_id = "nerovla/nero_chunk7_v1"
+        stats = load_norm_stats(checkpoint / "assets", asset_id)
+        for key in ("state", "actions"):
+            if len(stats[key].mean) != 7:
+                raise ValueError("Checkpoint assets are not state7/action7")
+        self.normalize = transforms.Normalize(stats, use_quantiles=True)
+        output = transforms.Unnormalize(stats, use_quantiles=True)
+        group = ModelTransformFactory()(config)
+        self.policy = Policy(model, transforms=[Inputs(config.model_type), self.normalize, *group.inputs],
+                             output_transforms=[*group.outputs, output, lambda d: {"actions": d["actions"][..., :7]}],
+                             sample_kwargs={"num_steps": steps})
+        self.rtc_sample = nnx_utils.module_jit(types.MethodType(sample_rtc, model), static_argnames=("num_steps", "cap"))
+        self.steps, self.cap = steps, cap
+        self.lock = threading.Lock()
+        norm_file = checkpoint / "assets" / asset_id / "norm_stats.json"
+        source_hash = hashlib.sha256()
+        for name in ("codec.py", "sampling.py", "serve.py", "validation.py", "start.sh"):
+            source_hash.update(Path(__file__).with_name(name).read_bytes())
+        self.metadata = {"state_dim": 7, "valid_action_dim": 7, "action_dim": 32,
+                         "action_horizon": 20, "rtc_version": VERSION, "period_s": PERIOD,
+                         "action_contract": "base_relative_observation_start_rotvec_gripper_absolute",
+                         "checkpoint_dir": str(checkpoint), "deployment_label": "NERO pi0.5 H20 step11649 normal + RTC",
+                         "norm_stats_sha256": hashlib.sha256(norm_file.read_bytes()).hexdigest(),
+                         "rtc_source_sha256": source_hash.hexdigest(), "num_steps": steps, "guidance_cap": cap,
+                         "training_contract_verified": False, "ready": False}
+        # Record actual files, including the clone's uncommitted customizations.
+        openpi_root = Path(model_module.__file__).resolve().parents[3]
+        self.metadata["openpi_source_sha256"] = {
+            str(p.relative_to(openpi_root)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in [openpi_root / "src/openpi/models/pi0.py", openpi_root / "src/openpi/models/pi0_config.py",
+                      openpi_root / "src/openpi/transforms.py", openpi_root / "src/openpi/training/config.py",
+                      openpi_root / "src/openpi/training/data_loader.py"]}
+
+    def infer(self, obs, *, noise=None, guidance=True):
+        with self.lock:
+            return self._infer(obs, noise=noise, guidance=guidance)
+
+    def _infer(self, obs, *, noise=None, guidance=True):
+        started = time.perf_counter()
+        obs = dict(obs)
+        context = obs.pop("rtc_context", None)
+        if context is None:
+            result = self.policy.infer(obs, noise=noise)
+            result["policy_timing"]["infer_ms"] = (time.perf_counter()-started)*1000
+            return result
+        delay, length = validate_context(context)
+        # Validate physical prefix even on the explicit zero-guidance path.
+        physical = encode_prefix(context["absolute_prefix"], obs["observation/state"])
+        if context["phase"] == "bootstrap" or not guidance:
+            result = self.policy.infer(obs, noise=noise)
+            sampler = "bootstrap_normal" if context["phase"] == "bootstrap" else "zero_guidance_normal"
+        else:
+            # Relative conversion happened above exactly once. Normalize directly.
+            normalized = self.normalize({"actions": physical})["actions"]
+            prefix = np.zeros((1, 20, 32), np.float32)
+            prefix[0, :length, :7] = normalized
+            weights = np.zeros((1, 20, 32), np.float32)
+            weights[0, :, :7] = np.asarray(prefix_weights(delay, length))[:, None]
+            inputs = self.policy._input_transform(obs)
+            inputs = jax.tree.map(lambda x: jnp.asarray(x)[None, ...], inputs)
+            self.policy._rng, key = jax.random.split(self.policy._rng)
+            kwargs = {"num_steps": self.steps, "cap": self.cap}
+            if noise is not None:
+                kwargs["noise"] = jnp.asarray(noise).reshape(1, 20, 32)
+            actions = self.rtc_sample(key, model_module.Observation.from_dict(inputs),
+                                      jnp.asarray(prefix), jnp.asarray(weights), **kwargs)
+            jax.block_until_ready(actions)
+            result = self.policy._output_transform({"state": np.asarray(inputs["state"][0]),
+                                                   "actions": np.asarray(actions[0])})
+            sampler = "rtc_vjp"
+        actions = np.asarray(result["actions"])
+        if actions.shape != (20, 7) or not np.isfinite(actions).all():
+            raise ValueError("Invalid H20 action response")
+        result["rtc"] = dict(echo_context(context), sampler=sampler, valid_prefix_steps=length)
+        if length:
+            relative = encode_prefix(context["absolute_prefix"], obs["observation/state"])
+            result["rtc"]["prefix_position_rmse_m"] = float(np.sqrt(np.mean((actions[:length, :3]-relative[:, :3])**2)))
+            result["rtc"]["prefix_gripper_rmse"] = float(np.sqrt(np.mean((actions[:length, 6]-relative[:, 6])**2)))
+        result["policy_timing"] = {"infer_ms": (time.perf_counter()-started)*1000}
+        return result
+
+    def warmup(self):
+        obs = {"observation/image": np.zeros((224, 224, 3), np.uint8),
+               "observation/wrist_image": np.zeros((224, 224, 3), np.uint8),
+               "observation/state": np.asarray([0, 0, .3, 0, 0, 0, .5], np.float32), "prompt": "Pick up the yellow cube."}
+        self.infer(obs)
+        context = {"version": VERSION, "run_epoch": 0, "request_id": 1, "observation_tick": 0,
+                   "plan_revision": 0, "freeze_until": 7, "period_s": PERIOD, "phase": "replan",
+                   "absolute_prefix": [[0, 0, .3, 0, 0, 0, 1, .5]]*13}
+        self.infer(dict(obs, rtc_context=context))
+        self.metadata["ready"] = True
+
+
+class Server:
+    """One active RTC socket and at most one GPU call; reject, never queue peers."""
+    def __init__(self, policy, host, port):
+        self.policy, self.host, self.port = policy, host, port
+        self.owner = None
+        self.busy = False
+
+    async def handler(self, socket):
+        packer = msgpack_numpy.Packer()
+        await socket.send(packer.pack(self.policy.metadata))
+        try:
+            async for raw in socket:
+                observation = msgpack_numpy.unpackb(raw)
+                rtc = isinstance(observation, dict) and "rtc_context" in observation
+                if (self.owner is not None and self.owner is not socket) or self.busy:
+                    await socket.send("Inference service is busy; another RTC session owns the model")
+                    await socket.close(code=1013, reason="Model busy")
+                    return
+                if rtc:
+                    self.owner = socket
+                self.busy = True
+                try:
+                    result = await asyncio.to_thread(self.policy.infer, observation)
+                finally:
+                    self.busy = False
+                await socket.send(packer.pack(result))
+        except ConnectionClosed:
+            pass
+        except Exception as exc:
+            logging.exception("Inference request rejected")
+            try:
+                await socket.send(f"{type(exc).__name__}: {exc}")
+                await socket.close(code=1011, reason="Inference rejected")
+            except ConnectionClosed:
+                pass
+        finally:
+            if self.owner is socket:
+                self.owner = None
+
+    async def run(self):
+        async with websocket_serve(self.handler, self.host, self.port, compression=None, max_size=4*1024*1024,
+                                   max_queue=1) as server:
+            await server.serve_forever()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--port", type=int, default=8002)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--steps", type=int, default=10)
+    parser.add_argument("--validate", action="store_true", help="Run no-motion checks before serving")
+    parser.add_argument("--training-contract", type=Path, help="Verified training provenance JSON; absent means Shadow-only RTC")
+    args = parser.parse_args()
+    if not 1 <= args.steps <= 100 or not 1 <= args.port <= 65535:
+        parser.error("Invalid steps or port")
+    logging.basicConfig(level=logging.INFO)
+    policy = RtcPolicy(args.checkpoint, args.steps)
+    if args.training_contract:
+        contract = json.loads(args.training_contract.read_text())
+        required = {"state_dim": 7, "action_dim": 7, "action_horizon": 20, "period_s": .05,
+                    "row_zero_alignment": "next_control_slot", "discrete_state_input": False,
+                    "normalization": "quantile", "action_contract": policy.metadata["action_contract"]}
+        if any(contract.get(k) != v for k, v in required.items()) or Path(contract.get("checkpoint_dir", "")).resolve() != Path(args.checkpoint).resolve():
+            raise ValueError("Training provenance does not match this deployment")
+        evidence = contract.get("evidence_files")
+        if not isinstance(evidence, list) or not evidence:
+            raise ValueError("Training provenance needs actual evidence files")
+        policy.metadata["training_evidence_sha256"] = {str(Path(p).resolve()): hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in evidence}
+        policy.metadata["training_contract_sha256"] = hashlib.sha256(args.training_contract.read_bytes()).hexdigest()
+        policy.metadata["training_contract_verified"] = True
+    policy.warmup()
+    if args.validate:
+        from validation import validate
+        report = validate(policy)
+        Path(__file__).with_name("validation_report.json").write_text(json.dumps(report, indent=2)+"\n")
+    manifest = dict(policy.metadata, devices=[str(x) for x in jax.devices()])
+    manifest["openpi_commit"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    manifest["openpi_dirty"] = subprocess.check_output(["git", "status", "--short"], text=True)
+    Path(__file__).with_name("deployment_manifest.json").write_text(json.dumps(manifest, indent=2)+"\n")
+    logging.info("READY %s", json.dumps(manifest))
+    asyncio.run(Server(policy, args.host, args.port).run())
+
+
+if __name__ == "__main__":
+    main()

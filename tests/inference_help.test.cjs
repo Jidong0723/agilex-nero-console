@@ -28,6 +28,14 @@ test('PowerShell templates parse without executing ssh', {skip:process.platform!
 });
 
 const bash=process.platform==='win32'?'C:/Program Files/Git/bin/bash.exe':'/bin/bash';
+test('RTC help uses explicit RTC entry and valid Bash without inferring model from H',()=>{
+  const script=commands({host:'127.0.0.1',port:8001},{mode:'rtc'}).server;
+  assert.match(script,/<rtc-service-directory>\/serve.py/);
+  assert.match(script,/--checkpoint "<checkpoint-directory>"/);
+  assert.match(script,/--port "<policy-port>" --validate/);
+  assert.ok(!script.includes('policy.config'));
+  if(fs.existsSync(bash)) assert.equal(spawnSync(bash,['-n'],{input:script,encoding:'utf8'}).status,0);
+});
 test('remote launch is valid Bash and retains literal remote environment variables',{skip:!fs.existsSync(bash)},()=>{
   const script=commands({host:'127.0.0.1',port:8001}).server;
   const result=spawnSync(bash,['-n'],{input:script,encoding:'utf8'});
