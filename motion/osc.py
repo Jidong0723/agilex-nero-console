@@ -1003,6 +1003,17 @@ class _OperationalSpaceServo:
         self.authority = JointLimitAuthority(self.solver.urdf, config)
         self.supervisor = SafetySupervisor(config.get("safety_supervisor", {}))
         self.lock = threading.RLock()
+        # High-rate model input is intentionally separated from the public
+        # OSC/status lock.  Producers replace one pending target; the servo
+        # loop is the only consumer and applies it at its next cycle.
+        self._target_mailbox_lock = threading.Lock()
+        self._target_mailbox: dict[str, Any] | None = None
+        self._target_mailbox_revision = 0
+        self._target_mailbox_last: dict[str, Any] = {"status": "empty"}
+        self._fast_input_state: dict[str, Any] = {
+            "session_id": None, "client_id": None, "session_state": "IDLE",
+            "trajectory_state": "IDLE", "sequence": 0,
+        }
         # Serializes session replacement without holding the state lock while
         # the old servo thread performs its normal braking shutdown.
         self._session_transition_lock = threading.Lock()
@@ -1156,6 +1167,129 @@ class _OperationalSpaceServo:
             return False
         return True
 
+    def _publish_fast_input_state_locked(self) -> None:
+        """Publish the immutable admission snapshot for the fast mailbox.
+
+        Callers hold ``self.lock`` while session/authority state changes.  The
+        mailbox producer reads only this small snapshot and never takes the
+        full OSC lock.
+        """
+        session = self.session or {}
+        with self._target_mailbox_lock:
+            self._fast_input_state = {
+                "session_id": session.get("session_id"),
+                "client_id": session.get("client_id"),
+                "session_state": session.get("state", "IDLE"),
+                "trajectory_state": self.trajectory_state if session else "IDLE",
+                "sequence": int(session.get("sequence", 0)),
+            }
+
+    def publish_target_nonblocking(self, session_id: str, client_id: str,
+                                   sequence: int, target_pose: dict[str, Any]) -> dict[str, Any]:
+        """Replace the pending model target without entering the OSC state lock.
+
+        Admission here is deliberately limited to immutable session identity,
+        sequence, finite pose, and workspace checks.  Authority transitions
+        and hardware output remain owned by the servo thread when it consumes
+        the mailbox.
+        """
+        if not isinstance(target_pose, dict):
+            raise ValueError("target_pose must be an object")
+        reference = {
+            "position_m": _finite_vector(target_pose.get("position_m"), 3, "target_pose.position_m"),
+            "orientation_xyzw": _unit_quaternion(target_pose.get("orientation_xyzw"), "target_pose.orientation_xyzw"),
+        }
+        if not self._pose_in_workspace(reference):
+            return {"accepted": False, "reason": "OSC target is outside the configured workspace"}
+        sequence = int(sequence)
+        with self._target_mailbox_lock:
+            state = dict(self._fast_input_state)
+            if state.get("session_state") != "ACTIVE":
+                return {"accepted": False, "reason": "OSC session is not active"}
+            if str(client_id) != str(state.get("client_id")):
+                return {"accepted": False, "reason": "OSC command rejected: session belongs to another client"}
+            if str(session_id) != str(state.get("session_id")):
+                return {"accepted": False, "reason": "OSC command rejected: session id mismatch"}
+            previous = int(state.get("sequence", 0))
+            pending_sequence = int((self._target_mailbox or {}).get("sequence", 0))
+            if sequence <= max(previous, pending_sequence):
+                return {"accepted": False, "reason": "stale sequence", "accepted_sequence": max(previous, pending_sequence)}
+            if state.get("trajectory_state") == "FAULT":
+                return {"accepted": False, "reason": "OSC command rejected: FAULT"}
+            if state.get("trajectory_state") not in {"RUNNING", "HOLD_READY"}:
+                return {"accepted": False, "reason": f"OSC target submission is unavailable while {state.get('trajectory_state')}"}
+            self._target_mailbox_revision += 1
+            revision = self._target_mailbox_revision
+            self._target_mailbox = {
+                "session_id": str(session_id), "client_id": str(client_id),
+                "sequence": sequence, "target_pose": reference,
+                "mailbox_revision": revision, "published_monotonic_ns": time.monotonic_ns(),
+            }
+            # Reserve the sequence at admission so a producer cannot enqueue
+            # duplicate values before the next servo tick consumes the slot.
+            self._fast_input_state["sequence"] = sequence
+            self._target_mailbox_last = {
+                "status": "pending", "mailbox_revision": revision,
+                "sequence": sequence, "published_monotonic_ns": self._target_mailbox["published_monotonic_ns"],
+            }
+        return {"accepted": True, "accepted_sequence": sequence,
+                "session_id": str(session_id), "mailbox_revision": revision,
+                "mailbox": "osc_target_latest_value"}
+
+    def _take_target_mailbox(self) -> dict[str, Any] | None:
+        with self._target_mailbox_lock:
+            entry = self._target_mailbox
+            self._target_mailbox = None
+            return dict(entry) if entry is not None else None
+
+    def _consume_target_mailbox_locked(self, entry: dict[str, Any]) -> None:
+        """Apply one admitted target while the servo owns the OSC lock."""
+        session = self.session or {}
+        if (session.get("state") != "ACTIVE"
+                or str(session.get("session_id")) != str(entry.get("session_id"))
+                or str(session.get("client_id")) != str(entry.get("client_id"))
+                or int(entry.get("sequence", -1)) <= int(session.get("sequence", 0))):
+            return
+        if self.trajectory_state == "FAULT":
+            return
+        if self.trajectory_state == "HOLD_READY":
+            resumed, reason = self._resume_from_hold_locked()
+            if not resumed:
+                with self._target_mailbox_lock:
+                    self._target_mailbox_last = {"status": "rejected", "mailbox_revision": entry.get("mailbox_revision"), "reason": reason}
+                self.last_error = f"OSC target rejected while resuming HOLD: {reason}"
+                return
+        reference = dict(entry["target_pose"])
+        previous_reference = self._target_pose or {}
+        previous_position = previous_reference.get("position_m") or []
+        previous_orientation = previous_reference.get("orientation_xyzw") or []
+        same_reference = (
+            len(previous_position) == 3
+            and len(previous_orientation) == 4
+            and max(abs(float(current) - float(previous)) for current, previous in zip(reference["position_m"], previous_position)) <= 1e-9
+            and abs(sum(float(current) * float(previous) for current, previous in zip(reference["orientation_xyzw"], previous_orientation))) >= 1.0 - 1e-12
+        )
+        self.session["sequence"] = int(entry["sequence"])
+        now_ns = time.monotonic_ns()
+        self._target_pose = reference
+        if not same_reference:
+            self.target_generation += 1
+            self._target_changed_monotonic_ns = now_ns
+            self._arrival_since_monotonic_ns = 0
+            self._arrival_reached = False
+        self.command = {
+            "sequence": int(entry["sequence"]), "host_monotonic_ns": now_ns,
+            "target_generation": self.target_generation,
+            "target_pose": dict(reference), "osc_mode": "track_tcp",
+        }
+        with self._target_mailbox_lock:
+            self._fast_input_state["trajectory_state"] = self.trajectory_state
+            self._fast_input_state["sequence"] = int(entry["sequence"])
+            self._target_mailbox_last = {
+                "status": "consumed", "mailbox_revision": entry.get("mailbox_revision"),
+                "sequence": int(entry["sequence"]), "consumed_monotonic_ns": now_ns,
+            }
+
     def _invalidate_motion(self, reason: str) -> None:
         # This is a P1 braking request, not an ownership transfer. The active
         # epoch remains valid long enough for the servo to transmit the braking
@@ -1179,7 +1313,15 @@ class _OperationalSpaceServo:
         if self.impedance_output and session.get("execution_mode") != "shadow":
             self.hardware.revoke_servo_targets(self.motion_epoch, self.target_generation, reason)
         self._target_pose = None
-        self.trajectory_state = "BRAKING"
+        with self._target_mailbox_lock:
+            self._target_mailbox = None
+            self._target_mailbox_last = {"status": "revoked", "reason": reason}
+            self._fast_input_state["trajectory_state"] = "BRAKING"
+        # A repeated HOLD/session cleanup must not reopen a stopped CPV
+        # reference after a long idle gap. HOLD_READY already has no active
+        # motion; FAULT must also never be demoted by a later stop request.
+        if self.trajectory_state not in {"HOLD_READY", "FAULT"}:
+            self.trajectory_state = "BRAKING"
         self.trajectory_brake_reason = reason
 
     def freeze_for_authority_change(self, epoch: int, reason: str) -> None:
@@ -1369,6 +1511,7 @@ class _OperationalSpaceServo:
                 self._accepting_targets = True
                 self._heartbeat_monotonic_ns = time.monotonic_ns()
                 self.trajectory_state, self.trajectory_brake_reason, self.feedback_sync_pending = "HOLD_READY", None, True
+                self._publish_fast_input_state_locked()
                 self.needs_resync = True
                 self.stop_event.clear()
                 self._send_times.clear(); self._batch_history.clear(); self.cpv_send_count = 0; self.output_count = 0; self.loop_count = 0
@@ -1407,6 +1550,7 @@ class _OperationalSpaceServo:
             if self.session:
                 self.session.update({"state": "STOPPING", "stopped_reason": reason})
             self._accepting_targets = False
+            self._publish_fast_input_state_locked()
             self._bump_state()
             self.stop_event.set(); self.command = None
         servo_thread = self.thread
@@ -1439,6 +1583,7 @@ class _OperationalSpaceServo:
             self.last_error = None
             self._accepting_targets = False
             self._bump_state()
+            self._publish_fast_input_state_locked()
         result = self.status()
         result["handoff"] = {
             "reason": reason,
@@ -1610,6 +1755,7 @@ class _OperationalSpaceServo:
                 "target_pose": dict(reference),
                 "osc_mode": mode,
             }
+            self._publish_fast_input_state_locked()
             self.pico_trace_logger.append({"record_type": "osc_target", "monotonic_ns": now_ns, "sequence": sequence, "target_generation": self.target_generation, "mode": mode})
             self._bump_state()
             return {
@@ -1714,7 +1860,7 @@ class _OperationalSpaceServo:
 
     def fast_status(self) -> dict[str, Any]:
         with self.lock:
-            return {
+            result = {
                 "state_sequence": self.state_sequence,
                 "session": self._session_view(),
                 "target_generation": self.target_generation,
@@ -1724,8 +1870,11 @@ class _OperationalSpaceServo:
                 "execution_sample": dict(self.execution_sample) if self.execution_sample else None,
                 "diagnostics": {"trajectory_state": self.trajectory_state, "motion_epoch": self.motion_epoch,
                                 "timing": dict(self._timing), "loop_count": self.loop_count,
-                                "output_count": self.output_count},
+                                "output_count": self.output_count, "target_mailbox": {}},
             }
+        with self._target_mailbox_lock:
+            result["diagnostics"]["target_mailbox"] = dict(self._target_mailbox_last)
+        return result
 
     def _public_target_pose(self) -> dict[str, list[float]] | None:
         with self.lock:
@@ -1827,6 +1976,14 @@ class _OperationalSpaceServo:
                 with self.lock:
                     session = dict(self.session) if self.session else None; command = dict(self.command) if self.command else None; self.loop_count += 1
                 if not session or session.get("state") != "ACTIVE": continue
+                fast_target = self._take_target_mailbox()
+                if fast_target is not None:
+                    with self.lock:
+                        self._consume_target_mailbox_locked(fast_target)
+                        session = dict(self.session) if self.session else None
+                        command = dict(self.command) if self.command else None
+                    if not session or session.get("state") != "ACTIVE":
+                        continue
                 shadow = session.get("execution_mode") == "shadow"
                 if not .001 <= actual_dt <= .2:
                     self._fault_zero(f"invalid OSC control interval: {actual_dt}", shadow)
@@ -1930,6 +2087,7 @@ class _OperationalSpaceServo:
                     if hard_stale and motion_or_brake_active:
                         self.trajectory_state, self.trajectory_brake_reason = "FAULT", "feedback hard stale"
                         self._accepting_targets = False
+                        self._publish_fast_input_state_locked()
                     state = self.trajectory_state; epoch = self.motion_epoch
                     if self.impedance_output and state == "HOLD_READY" and not hard_stale and max(abs(v) for v in qd) > float(self.config["solver"].get("hold_velocity_epsilon_rad_s", .005)):
                         self._invalidate_motion("MIT hold measured joints moving")
@@ -2132,7 +2290,9 @@ class _OperationalSpaceServo:
                 )
                 gate_limited = gate_reason == "velocity clipped by final safety gate"
                 if not gate_ok:
-                    with self.lock: self.trajectory_state, self.trajectory_brake_reason = "FAULT", gate_reason or "final safety gate rejected velocity"
+                    with self.lock:
+                        self.trajectory_state, self.trajectory_brake_reason = "FAULT", gate_reason or "final safety gate rejected velocity"
+                        self._publish_fast_input_state_locked()
                     final_velocity = [0.0] * 7
                 settled = max(abs(x) for x in self.trajectory["velocity_rad_s"]) <= float(self.config.get("solver", {}).get("hold_velocity_epsilon_rad_s", 0.005)) and max(abs(x) for x in self.trajectory["acceleration_rad_s2"]) <= float(self.config.get("solver", {}).get("hold_acceleration_epsilon_rad_s2", 0.02))
                 if self.impedance_output:
@@ -2334,7 +2494,9 @@ class _OperationalSpaceServo:
                 self._fault_zero(f"osc loop: {type(exc).__name__}: {exc}", shadow=bool((self.session or {}).get("execution_mode") == "shadow"))
 
     def _fault_zero(self, reason: str, shadow: bool) -> None:
-        with self.lock: self.trajectory_state, self.trajectory_brake_reason = "FAULT", reason
+        with self.lock:
+            self.trajectory_state, self.trajectory_brake_reason = "FAULT", reason
+            self._publish_fast_input_state_locked()
         if not shadow:
             self.hardware.trigger_safety_fault(reason)
         if self.impedance_output:
@@ -2372,6 +2534,9 @@ class OscRuntime:
 
     def status(self) -> dict[str, Any]:
         return {**self._servo.status(), **self.output_status()}
+
+    def fast_status(self) -> dict[str, Any]:
+        return self._servo.fast_status()
 
     def output_status(self) -> dict[str, Any]:
         servo = self._servo
@@ -2434,6 +2599,8 @@ class OscRuntime:
     def heartbeat(self, client_id: str, session_id: str) -> dict[str, Any]: return self._servo.heartbeat(client_id, session_id)
     def heartbeat_expired(self) -> bool: return self._servo.heartbeat_expired()
     def submit_absolute_target(self, body: dict[str, Any], *, mode: str) -> dict[str, Any]: return self._servo.submit_absolute_target(body, mode=mode)
+    def publish_target_nonblocking(self, session_id: str, client_id: str, sequence: int, target_pose: dict[str, Any]) -> dict[str, Any]:
+        return self._servo.publish_target_nonblocking(session_id, client_id, sequence, target_pose)
     def request_shadow_hold(self, reason: str) -> dict[str, Any]: return self._servo.request_shadow_hold(reason)
     def request_hardware_hold(self, reason: str) -> dict[str, Any]: return self._servo.request_hardware_hold(reason)
     def freeze_for_authority_change(self, epoch: int, reason: str) -> None: self._servo.freeze_for_authority_change(epoch, reason)

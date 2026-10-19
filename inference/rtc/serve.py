@@ -28,7 +28,7 @@ from openpi.shared import nnx_utils
 from openpi.training.checkpoints import load_norm_stats
 from openpi.training.config import ModelTransformFactory
 
-from codec import VERSION, HORIZON, PERIOD, encode_prefix, echo_context, validate_context
+from codec import VERSION, HORIZON, PERIOD, TIME_CONTRACT, encode_prefix, echo_context, validate_context, pack_normalized_prefix
 from sampling import prefix_weights, sample_rtc
 
 
@@ -73,6 +73,11 @@ class RtcPolicy:
             source_hash.update(Path(__file__).with_name(name).read_bytes())
         self.metadata = {"state_dim": 7, "valid_action_dim": 7, "action_dim": 32,
                          "action_horizon": 20, "rtc_version": VERSION, "period_s": PERIOD,
+                         "action_time_contract": TIME_CONTRACT, "action_row0_offset_s": 0,
+                         "rtc_bootstrap_mode": "hold_prefix_v1",
+                         "rtc_bootstrap_attention": "full_hold_v2",
+                         "rtc_schedule": "fixed_delay_execute_horizon_v1",
+                         "time_semantics_source": "operator_confirmation_11649_2026-10-18",
                          "action_contract": "base_relative_observation_start_rotvec_gripper_absolute",
                          "checkpoint_dir": str(checkpoint), "deployment_label": "NERO pi0.5 H20 step11649 normal + RTC",
                          "norm_stats_sha256": hashlib.sha256(norm_file.read_bytes()).hexdigest(),
@@ -107,10 +112,10 @@ class RtcPolicy:
         else:
             # Relative conversion happened above exactly once. Normalize directly.
             normalized = self.normalize({"actions": physical})["actions"]
-            prefix = np.zeros((1, 20, 32), np.float32)
-            prefix[0, :length, :7] = normalized
+            prefix = pack_normalized_prefix(normalized)
             weights = np.zeros((1, 20, 32), np.float32)
-            weights[0, :, :7] = np.asarray(prefix_weights(delay, length))[:, None]
+            schedule = 'ones' if context['phase']=='bootstrap_hold' else 'exp'
+            weights[0, :, :7] = np.asarray(prefix_weights(delay, length, schedule=schedule))[:, None]
             inputs = self.policy._input_transform(obs)
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[None, ...], inputs)
             self.policy._rng, key = jax.random.split(self.policy._rng)
@@ -122,13 +127,13 @@ class RtcPolicy:
             jax.block_until_ready(actions)
             result = self.policy._output_transform({"state": np.asarray(inputs["state"][0]),
                                                    "actions": np.asarray(actions[0])})
-            sampler = "rtc_vjp"
+            sampler = "bootstrap_hold_vjp" if context['phase'] == 'bootstrap_hold' else "rtc_vjp"
         actions = np.asarray(result["actions"])
         if actions.shape != (20, 7) or not np.isfinite(actions).all():
             raise ValueError("Invalid H20 action response")
         result["rtc"] = dict(echo_context(context), sampler=sampler, valid_prefix_steps=length)
         if length:
-            relative = encode_prefix(context["absolute_prefix"], obs["observation/state"])
+            relative = encode_prefix(context["absolute_prefix"], obs["observation/state"])[:length]
             result["rtc"]["prefix_position_rmse_m"] = float(np.sqrt(np.mean((actions[:length, :3]-relative[:, :3])**2)))
             result["rtc"]["prefix_gripper_rmse"] = float(np.sqrt(np.mean((actions[:length, 6]-relative[:, 6])**2)))
         result["policy_timing"] = {"infer_ms": (time.perf_counter()-started)*1000}
@@ -140,9 +145,16 @@ class RtcPolicy:
                "observation/state": np.asarray([0, 0, .3, 0, 0, 0, .5], np.float32), "prompt": "Pick up the yellow cube."}
         self.infer(obs)
         context = {"version": VERSION, "run_epoch": 0, "request_id": 1, "observation_tick": 0,
+                   "observation_perf_ns": 0, "timeline_origin_perf_ns": 0,
+                   "freeze_until_perf_ns": 350_000_000, "action_row0_offset_s": 0,
                    "plan_revision": 0, "freeze_until": 7, "period_s": PERIOD, "phase": "replan",
+                   "inference_delay": 7, "execute_horizon": 10, "prefix_attention_horizon": 10,
                    "absolute_prefix": [[0, 0, .3, 0, 0, 0, 1, .5]]*13}
         self.infer(dict(obs, rtc_context=context))
+        hold_context = dict(context, phase='bootstrap_hold', observation_tick=0,
+                            prefix_attention_horizon=20,
+                            absolute_prefix=[[0,0,.3,0,0,0,1,.5]]*20)
+        self.infer(dict(obs, rtc_context=hold_context))
         self.metadata["ready"] = True
 
 
@@ -198,7 +210,7 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--validate", action="store_true", help="Run no-motion checks before serving")
-    parser.add_argument("--training-contract", type=Path, help="Verified training provenance JSON; absent means Shadow-only RTC")
+    parser.add_argument("--training-contract", type=Path, help="Optional file-backed training provenance JSON; absence leaves verification false")
     args = parser.parse_args()
     if not 1 <= args.steps <= 100 or not 1 <= args.port <= 65535:
         parser.error("Invalid steps or port")
@@ -207,7 +219,7 @@ def main():
     if args.training_contract:
         contract = json.loads(args.training_contract.read_text())
         required = {"state_dim": 7, "action_dim": 7, "action_horizon": 20, "period_s": .05,
-                    "row_zero_alignment": "next_control_slot", "discrete_state_input": False,
+                    "row_zero_alignment": "observation_time", "action_row0_offset_s": 0, "discrete_state_input": False,
                     "normalization": "quantile", "action_contract": policy.metadata["action_contract"]}
         if any(contract.get(k) != v for k, v in required.items()) or Path(contract.get("checkpoint_dir", "")).resolve() != Path(args.checkpoint).resolve():
             raise ValueError("Training provenance does not match this deployment")

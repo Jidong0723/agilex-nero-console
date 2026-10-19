@@ -95,6 +95,13 @@ class InferenceGripperTests(unittest.TestCase):
             return {'ok':True,'result':{'sent':True,'before':self.feedback(100)}}
         adapter.osc.gripper=request
         adapter._send_gripper_if_needed('session-1','client-1',value)
+        deadline = time.monotonic() + 1.0
+        while not adapter.osc.commands and time.monotonic() < deadline:
+            time.sleep(.005)
+        self.assertTrue(adapter.osc.commands, 'gripper worker did not submit command')
+        deadline = time.monotonic() + 1.0
+        while adapter._pending_gripper is None and time.monotonic() < deadline:
+            time.sleep(.005)
 
     def test_async_marker_width_health_and_replace_cancel(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -111,6 +118,9 @@ class InferenceGripperTests(unittest.TestCase):
                 self.assertEqual(status['status'],'feedback_received'); self.assertTrue(status['health_confirmed'])
                 self.assertAlmostEqual(status['target_error_m'],abs(.025-.0475)); self.assertIsNone(status['target_reached'])
                 old_sequence=status['sequence']; self.send(adapter,.7)
+                deadline = time.monotonic() + 1.0
+                while (adapter._pending_gripper is None or adapter._pending_gripper['sequence'] <= old_sequence) and time.monotonic() < deadline:
+                    time.sleep(.005)
                 self.assertGreater(adapter._pending_gripper['sequence'],old_sequence)
                 adapter.stop('cancel'); self.assertIsNone(adapter._pending_gripper)
             finally: adapter.close()
@@ -140,5 +150,24 @@ class InferenceGripperTests(unittest.TestCase):
                 adapter._observe_inference_gripper(frame)
                 self.assertIsNone(adapter._pending_gripper)
             finally: adapter.close()
+
+    def test_slow_gripper_submission_does_not_block_enqueue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = self.adapter(tmp)
+            started = threading.Event(); release = threading.Event()
+            try:
+                def slow_request(*_args):
+                    started.set(); release.wait(1.0)
+                    return {'ok': True, 'result': {'sent': True, 'before': self.feedback(100)}}
+                adapter.osc.gripper = slow_request
+                begin = time.perf_counter()
+                adapter._send_gripper_if_needed('session-1', 'client-1', .5)
+                self.assertTrue(started.wait(.5))
+                adapter._send_gripper_if_needed('session-1', 'client-1', .7)
+                self.assertLess(time.perf_counter() - begin, .1)
+                self.assertIsNotNone(adapter._gripper_job)
+            finally:
+                release.set()
+                adapter.close()
 
 if __name__=='__main__': unittest.main()

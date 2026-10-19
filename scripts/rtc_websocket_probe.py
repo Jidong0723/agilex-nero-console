@@ -35,6 +35,8 @@ def main():
             values = []
             for i in range(args.repeats):
                 context = {"version": VERSION, "phase": "replan", "run_epoch": 1, "request_id": i+1,
+                           "observation_perf_ns": i*350_000_000, "timeline_origin_perf_ns": 0,
+                           "freeze_until_perf_ns": (i+1)*350_000_000, "action_row0_offset_s": 0,
                            "observation_tick": i*7, "plan_revision": i, "freeze_until": i*7+7,
                            "period_s": .05, "absolute_prefix": [[0, 0, .3, 0, 0, 0, 1, .5]]*13}
                 began = time.perf_counter()

@@ -432,7 +432,7 @@ class Pi05AdapterTests(unittest.TestCase):
         self.assertIsNotNone(snapshot["action_chunk"])
         self.assertEqual(snapshot["state"], "ERROR")
         self.assertIn("simulated OSC outage", snapshot["last_rejection"])
-        self.assertTrue(any(item["type"] == "hold" for item in broker.commands))
+        self.assertEqual(snapshot['control_stop']['state'], 'HOLD_UNCONFIRMED')
 
     def test_pi05_snapshot_does_not_query_osc_during_control_outage(self):
         broker = _Broker()

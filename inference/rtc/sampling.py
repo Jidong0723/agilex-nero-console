@@ -10,10 +10,18 @@ from openpi.models import model as model_module
 from openpi.models.pi0 import make_attn_mask
 
 
-def prefix_weights(start, end, total=20):
+def prefix_weights(start, end, total=20, schedule="exp"):
     start = jnp.minimum(start, end)
-    w = jnp.clip((start - 1 - jnp.arange(total)) / (end - start + 1) + 1, 0, 1)
-    w = w * jnp.expm1(w) / (jnp.e - 1)
+    if schedule == 'ones':
+        w = jnp.ones(total)
+    elif schedule == 'zeros':
+        w = (jnp.arange(total) < start).astype(jnp.float32)
+    elif schedule in ('linear', 'exp'):
+        w = jnp.clip((start - 1 - jnp.arange(total)) / (end - start + 1) + 1, 0, 1)
+        if schedule == 'exp':
+            w = w * jnp.expm1(w) / (jnp.e - 1)
+    else:
+        raise ValueError('Unsupported RTC prefix attention schedule')
     return jnp.where(jnp.arange(total) < end, w, 0)
 
 

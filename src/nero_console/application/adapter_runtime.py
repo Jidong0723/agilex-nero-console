@@ -24,6 +24,7 @@ class OscClientPort(Protocol):
     """The complete robot-facing surface available to input adapters."""
 
     def state(self) -> dict[str, Any]: ...
+    def fast_state(self) -> dict[str, Any]: ...
     def inference_gripper_feedback(self) -> dict[str, Any]: ...
     def sensor_sample(self, target_monotonic_ns: int, wait_s: float = 0.0) -> dict[str, Any] | None: ...
     def sensor_samples_after(self, revision: int, wait_s: float = 0.0, max_items: int = 128) -> list[dict[str, Any]]: ...
@@ -46,6 +47,10 @@ class OscClient:
 
     def state(self) -> dict[str, Any]:
         return self._broker.osc_state()
+
+    def fast_state(self) -> dict[str, Any]:
+        fast = getattr(self._broker, "osc_fast_state", None)
+        return fast() if fast is not None else self._broker.osc_state()
 
     def inference_gripper_feedback(self) -> dict[str, Any]:
         # The backend already binds this getter for read-only dataset sampling.
@@ -86,6 +91,17 @@ class OscClient:
         })
 
     def track_tcp(self, session_id: str, client_id: str, sequence: int, target_pose: dict[str, Any]) -> dict[str, Any]:
+        """Submit a high-rate target to the OSC mailbox without synchronous RPC work.
+
+        The OSC servo owns the mailbox consumer.  This path deliberately does
+        not build an input-journal entry, read a full OSC snapshot, or wait for
+        the servo/hardware result.  ``ok`` means only that the target passed
+        the session/safety checks and replaced the pending mailbox value.
+        """
+        submit = getattr(self._broker, "osc_track_tcp_nonblocking", None)
+        if submit is not None:
+            return submit(session_id, client_id, sequence, target_pose)
+        # Compatibility fallback for isolated adapter fakes and older callers.
         return self._command(session_id, client_id, sequence, "track_tcp", {"target_pose": target_pose}, acknowledgement_only=True)
 
     def hold(self, session_id: str, client_id: str, sequence: int, reason: str) -> dict[str, Any]:

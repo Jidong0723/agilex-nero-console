@@ -31,9 +31,10 @@
         let current = o.session();
         if (!compatible(current)) {
           const previousId = current?.id;
-          notify('正在准备硬件会话；尚未启用模型运动');
+          const preparation = o.mode === 'hardware' ? '真机会话' : '影子会话';
+          notify(`正在准备${preparation}；尚未启用模型运动`);
           timer = setInterval(() => o.progress(this.message = valid()
-            ? `正在准备硬件会话，已等待${Math.floor((this.now()-began)/1000)}秒；尚未启用模型运动`
+            ? `正在准备${preparation}，已等待${Math.floor((this.now()-began)/1000)}秒；尚未启用模型运动`
             : '正在取消启动，等待硬件请求返回；不会继续启用推理'), 1000);
           let response;
           try {
@@ -59,7 +60,7 @@
           o.acceptOsc(response.state);
         }
         clearInterval(timer); timer = null;
-        check(); notify('会话已就绪，正在准备推理输出');
+        check(); notify('会话已就绪，正在准备推理控制');
         if (o.config) await o.api('/api/pi05/config','POST',o.config,10000);
         check();
         outputSession = current;

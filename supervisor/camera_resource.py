@@ -60,6 +60,8 @@ class CameraPair:
         self.width, self.height = int(config["model_width"]), int(config["model_height"])
         self.captures: dict[int, Any] = {}
         self.sources: dict[str, Any | None] = {}
+        self.capture_settings: dict[int, dict[str, Any]] = {}
+        self.read_failures: dict[int, int] = {}
         for key in ("external", "wrist"):
             item = config[key]
             index = int(item["index"])
@@ -103,29 +105,40 @@ class CameraPair:
         backend = self.cv2.CAP_DSHOW if hasattr(self.cv2, "CAP_DSHOW") else 0
         capture = self.cv2.VideoCapture(index, backend)
         if capture.isOpened() and "realsense" not in name.lower():
-            # Two 640x480 uncompressed USB streams exceeded the shared bus
-            # budget on the NERO host and fell to roughly 12 Hz. Dabai DC1
-            # supports MJPEG; requesting it explicitly restores sufficient
-            # headroom for synchronized 15 Hz dataset sampling.
-            capture.set(self.cv2.CAP_PROP_FRAME_WIDTH, int(settings.get("width", 640)))
-            capture.set(self.cv2.CAP_PROP_FRAME_HEIGHT, int(settings.get("height", 480)))
-            # DirectShow reapplies its default subtype when resolution is
-            # changed, so FOURCC must be set after width and height.
-            capture.set(self.cv2.CAP_PROP_FOURCC, self.cv2.VideoWriter_fourcc(*"MJPG"))
-            # These two cameras expose only YUY2 through DirectShow on this
-            # host. Requesting 30 Hz oversubscribes their shared USB path;
-            # 20 Hz leaves headroom for a stable 15 Hz synchronized dataset.
-            capture.set(self.cv2.CAP_PROP_FPS, float(settings.get("fps", 20.0)))
-            # Dabai DC1's automatic exposure extends a frame to about 80 ms
-            # in the collection room, limiting even one camera to 12.5 Hz.
-            # Pinning exposure and gain keeps exposure below the 50 ms frame
-            # period and also makes image statistics repeatable across runs.
-            if settings.get("exposure") is not None:
-                capture.set(self.cv2.CAP_PROP_EXPOSURE, float(settings["exposure"]))
-            if settings.get("gain") is not None:
-                capture.set(self.cv2.CAP_PROP_GAIN, float(settings["gain"]))
-            if hasattr(self.cv2, "CAP_PROP_BUFFERSIZE"):
-                capture.set(self.cv2.CAP_PROP_BUFFERSIZE, 1)
+            # Request 30 Hz; observed cadence depends on exposure/driver.
+            # -7 was checked against automatic exposure brightness on both
+            # cameras, retaining highlight headroom and short exposure.
+            # Resolution changes reset the subtype: apply these in order.
+            requested = [("width", self.cv2.CAP_PROP_FRAME_WIDTH, 640),
+                         ("height", self.cv2.CAP_PROP_FRAME_HEIGHT, 480),
+                         ("fourcc", self.cv2.CAP_PROP_FOURCC, self.cv2.VideoWriter_fourcc(*"YUY2")),
+                         ("fps", self.cv2.CAP_PROP_FPS, 30),
+                         ("auto_exposure", self.cv2.CAP_PROP_AUTO_EXPOSURE, 0),
+                         ("exposure", self.cv2.CAP_PROP_EXPOSURE, -7)]
+            failures = [key for key, prop, value in requested if not capture.set(prop, value)]
+            actual = {key: float(capture.get(prop)) for key, prop, _ in requested}
+            # DSHOW accepts a boolean setter (0=manual, 1=auto); unlike
+            # V4L2 it does not support reading AUTO_EXPOSURE in OpenCV 4.11.
+            mode_readable = actual["auto_exposure"] != -1
+            mismatches = [key for key, _, value in requested
+                          if not (key == "auto_exposure" and not mode_readable)
+                          and abs(actual[key] - value) > 0.001]
+            self.capture_settings[index] = {
+                "requested_width": 640, "requested_height": 480,
+                "requested_fourcc": "YUY2", "requested_fps": 30,
+                "requested_exposure_mode": "manual", "requested_exposure": -7,
+                "setting_failures": failures, "negotiation_mismatches": mismatches,
+                "configuration_ok": not failures and not mismatches,
+                "actual_backend": capture.getBackendName(),
+                "auto_exposure": actual["auto_exposure"],
+                "exposure_mode": "manual" if mode_readable and actual["auto_exposure"] == 0 else "manual_requested",
+                "exposure_mode_verified": mode_readable and actual["auto_exposure"] == 0,
+                "exposure_mode_note": None if mode_readable else "OpenCV DSHOW does not expose exposure mode readback; setter acknowledgement only",
+                "negotiated_width": int(actual["width"]), "negotiated_height": int(actual["height"]),
+                "negotiated_fps": actual["fps"],
+                "negotiated_fourcc": "".join(chr((int(actual["fourcc"]) >> (8 * i)) & 0xFF) for i in range(4)),
+                "exposure": actual["exposure"], "gain": float(capture.get(self.cv2.CAP_PROP_GAIN)),
+            }
         return capture
 
     def available(self, source: str) -> bool:
@@ -135,8 +148,16 @@ class CameraPair:
         capture = self.sources.get(source)
         if capture is None or isinstance(capture, RealSenseRgbCapture):
             return {"backend": "librealsense" if capture is not None else None}
+        index = self._source_index(source)
+        if index in self.capture_settings:
+            # Driver property queries are cached at open, outside the frame
+            # cache lock. Status polling must not delay live capture reads.
+            return {"backend": "opencv", **self.capture_settings[index],
+                    "read_failures": self.read_failures.get(index, 0)}
         fourcc = int(round(capture.get(self.cv2.CAP_PROP_FOURCC)))
         return {
+            **self.capture_settings.get(self._source_index(source), {}),
+            "read_failures": self.read_failures.get(self._source_index(source), 0),
             "backend": "opencv",
             "negotiated_width": int(round(capture.get(self.cv2.CAP_PROP_FRAME_WIDTH))),
             "negotiated_height": int(round(capture.get(self.cv2.CAP_PROP_FRAME_HEIGHT))),
@@ -152,6 +173,7 @@ class CameraPair:
         # QPC-backed perf_counter_ns preserves independent camera timing.
         received_ns = time.perf_counter_ns()
         if not ok or frame is None:
+            self.read_failures[index] = self.read_failures.get(index, 0) + 1
             return index, None
         if float(sum(self.cv2.mean(frame)[:3])) / 3.0 <= 2.0:
             return index, None
@@ -228,6 +250,8 @@ class SharedCameraResource:
                     "dataset_size": list(self.dataset_frame_sizes[key]) if key in self.dataset_frame_sizes else None,
                     "capture_hz": self._capture_hz(self.dataset_frame_history.get(key, [])),
                     "capture": self.cameras.diagnostics(key) if self.cameras is not None else {},
+                    "frame_mean_luma": round(float(self.frames[key].mean()), 2) if key in self.frames else None,
+                    "frame_max_luma": int(self.frames[key].max()) if key in self.frames else None,
                 }
                 for key in ("external", "wrist")
             }

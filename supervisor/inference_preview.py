@@ -20,13 +20,14 @@ class ObservationSource:
         self.gripper_marker = None
         self.gripper_seen_ns = 0
 
-    def refresh(self, snapshot):
+    def refresh(self, snapshot, *, tcp_only=False):
         """Read cached feedback; never acquire a lease or send a command."""
         started_ns = time.perf_counter_ns()
         reader = getattr(self.a.osc, "sensor_sample", None)
         if not callable(reader):
             return snapshot  # Direct fake clients retain their explicit samples.
         now = time.perf_counter_ns()
+        query_ns = now
         shadow = (snapshot.get("session") or {}).get("execution_mode") == "shadow"
         if shadow:
             execution = snapshot.get("execution") or {}
@@ -37,13 +38,17 @@ class ObservationSource:
             stamp, age, source = now, 0., "shadow_joint_fk"
         else:
             sample = reader(now, 0.)
+            # The IPC may return feedback received AFTER the request began.
+            # Compare against read completion, never the earlier query time.
+            now = time.perf_counter_ns()
             if not sample:
                 raise RuntimeError("等待实测关节反馈")
             joints = sample.get("joint_position_rad")
             stamp = sample.get("feedback_monotonic_ns")
             age = float(sample.get("latest_feedback_age_s", math.inf))
             if not isinstance(stamp, int) or not 0 <= now-stamp <= 100_000_000 or age > .1:
-                raise RuntimeError("实测关节反馈过期")
+                sample_age_ms = (now-stamp)/1e6 if isinstance(stamp,int) else None
+                raise RuntimeError(f"实测关节反馈过期或时间戳无效：age_ms={sample_age_ms}, latest_age_s={age}")
             source = "measured_joint_fk"
         sample_read_ns = time.perf_counter_ns()
         values = np.asarray(joints, dtype=float)
@@ -64,6 +69,18 @@ class ObservationSource:
             self.last_pose = pose_from_tcp(self.fk.fk(list(key)))
             self.last_joints = key
         fk_finished_ns = time.perf_counter_ns()
+        if tcp_only:
+            snapshot['inference_observation'] = {
+                'pose': copy.deepcopy(self.last_pose), 'perf_ns': stamp,
+                'feedback_age_s': age, 'source': source,
+                'timing': {'sample_perf_ns': stamp, 'query_perf_ns': query_ns,
+                    'sample_after_query_ms': (stamp-query_ns)/1e6,
+                    'sample_age_at_read_ms': (sample_read_ns-stamp)/1e6,
+                    'sensor_read_ms': (sample_read_ns-started_ns)/1e6,
+                    'fk_ms': (fk_finished_ns-fk_started_ns)/1e6,
+                    'fk_reused': fk_reused,
+                    'refresh_ms': (time.perf_counter_ns()-started_ns)/1e6}}
+            return snapshot
         gripper = copy.deepcopy(snapshot.get("gripper") or {})
         if not shadow:
             feedback = self.a.osc.inference_gripper_feedback()
@@ -82,6 +99,7 @@ class ObservationSource:
             "feedback_age_s": age, "source": source, "gripper_width_m": float(width),
             "timing": {"refresh_started_perf_ns": started_ns,
                        "sample_read_perf_ns": sample_read_ns, "sample_perf_ns": stamp,
+                       "query_perf_ns": query_ns, "sample_after_query_ms": (stamp-query_ns)/1e6,
                        "sample_age_at_read_ms": (sample_read_ns-stamp)/1e6,
                        "sensor_read_ms": (sample_read_ns-started_ns)/1e6,
                        "fk_ms": (fk_finished_ns-fk_started_ns)/1e6, "fk_reused": fk_reused,
@@ -100,10 +118,11 @@ def preview_once(a):
     with a.lock:
         if a.state.get("execution_enabled") or a.state.get("priming") or a._changing_connection:
             return
-        if a._rtc_run and not a._rtc_run.stop_confirmed:
+        if a._rtc_run and not a._rtc_run.finished.is_set():
+            a.state['preview'].update(state='WAITING', error='等待旧推理请求结束，随后恢复只读预览', stale=True)
             return
         revision = (a._connection_revision, a._run_revision)
-        osc = copy.deepcopy(a._osc_snapshot)
+        osc = a._inference_snapshot() if hasattr(a, '_inference_snapshot') else copy.deepcopy(a._osc_snapshot)
         config = copy.deepcopy(a.config)
         a._preview_busy = True
         a.state["preview"].update(state="WAITING", error=None)
@@ -129,7 +148,12 @@ def preview_once(a):
             if not 0 <= time.perf_counter_ns()-measured["perf_ns"] <= 100_000_000:
                 raise RuntimeError("等待新鲜实测TCP")
             osc["execution"] = dict(osc.get("execution") or {}, measured_tcp_pose=measured["pose"])
-            osc["gripper"] = dict(osc.get("gripper") or {}, width_m=measured["gripper_width_m"])
+            if 'gripper_width_m' in measured:
+                osc["gripper"] = dict(osc.get("gripper") or {}, width_m=measured["gripper_width_m"])
+            else:
+                diagnostic = osc.get('gripper_observation') or {}
+                if diagnostic.get('error') or time.perf_counter_ns()-diagnostic.get('received_perf_ns', 0) > 150_000_000:
+                    raise RuntimeError('等待新鲜实测夹爪反馈（150 ms以内）')
         elif callable(getattr(a.osc, "sensor_sample", None)):
             raise RuntimeError(a.state.get("observation_wait_reason") or "等待实测TCP与夹爪")
         pose = (osc.get("execution") or {}).get("measured_tcp_pose")
@@ -147,8 +171,12 @@ def preview_once(a):
         began = time.perf_counter()
         response = policy.infer(observation)
         rows = action_rows(response, config["execution"]["expected_chunk_steps"])
-        decoded = [a._target_from_action(row, pose, action_index=i)
+        decoded = [a._target_from_action(row, pose, action_index=i, preview_only=True)
                    for i, row in enumerate(rows)]
+        grip = config['gripper']
+        low = -float(grip.get('ratio_boundary_tolerance', .005))
+        high = 1+float(grip.get('ratio_upper_boundary_tolerance', .05))
+        control_valid = all(low <= row[6] <= high for row in rows)
         ended = time.perf_counter()
         with a.lock:
             if revision != (a._connection_revision, a._run_revision) or a.state.get("priming") or a.state.get("execution_enabled"):
@@ -156,14 +184,20 @@ def preview_once(a):
             preview = a.state["preview"]
             previous = preview.get("last_completed_perf_s")
             preview.update(state="READY", error=None, updated_at=time.time(), last_completed_perf_s=ended,
+                control_valid=control_valid,
+                warning=None if control_valid else '预测夹爪比例超出控制允许范围；仅展示，不执行',
                 hz=1/(ended-previous) if previous and ended>previous else None,
                 source="ordinary_h20_preview" if config["execution"].get("mode") == "rtc" else "ordinary_preview",
                 sequence=preview.get("sequence", 0)+1, stale=False)
+            control_contract = a._metadata_status(getattr(policy, 'metadata', {}))
+            if control_contract['status'] != 'incompatible':
+                control_contract = {'status': 'compatible', 'message': '7D／H实际动作响应验证通过'}
             a.state.update(action_chunk=rows, absolute_tcp_chunk=[x[0] for x in decoded],
                 inference_base_tcp=copy.deepcopy(pose), decoded_first_target=decoded[0][0],
                 action_chunk_length=len(rows), last_response_steps=len(rows), chunk_sequence=a.state["chunk_sequence"]+1,
                 inference_ms=(ended-began)*1000, chunk_source="preview", chunk_updated_at=time.time(),
-                protocol_compatibility={"status": "compatible", "message": "7D／H实际动作响应验证通过"})
+                action_response_validation={'status': 'compatible', 'steps': len(rows)},
+                protocol_compatibility=control_contract)
     except Exception as exc:
         with a.lock:
             current = revision == (a._connection_revision, a._run_revision)

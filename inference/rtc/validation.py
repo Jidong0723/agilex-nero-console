@@ -34,6 +34,8 @@ def validate(policy, repeats=12):
            "observation/state": np.asarray([0, 0, .3, 0, 0, 0, .5], np.float32),
            "prompt": "Pick up the yellow cube."}
     context = {"version": VERSION, "run_epoch": 1, "request_id": 1, "observation_tick": 7,
+               "observation_perf_ns": 350_000_000, "timeline_origin_perf_ns": 0,
+               "freeze_until_perf_ns": 700_000_000, "action_row0_offset_s": 0,
                "plan_revision": 1, "freeze_until": 14, "period_s": .05, "phase": "replan",
                "absolute_prefix": [[0, 0, .3, 0, 0, 0, 1, .5]]*13}
     noise = rng.normal(size=(20, 32)).astype(np.float32)
@@ -45,6 +47,11 @@ def validate(policy, repeats=12):
     assert plain.shape == (20, 7) and np.isfinite(plain).all()
     policy.policy._rng = key
     guided = policy.infer(dict(obs, rtc_context=context), noise=noise)["actions"]
+    # Exercise the production fixed D/E request, including a full physical
+    # prefix with a shorter guidance overlap (the two lengths must not mix).
+    fixed = dict(context, inference_delay=7, execute_horizon=10, prefix_attention_horizon=10)
+    fixed['absolute_prefix'] = context['absolute_prefix']+[context['absolute_prefix'][-1]]*7
+    assert policy.infer(dict(obs, rtc_context=fixed), noise=noise)['actions'].shape == (20, 7)
     desired = encode_prefix(context["absolute_prefix"], obs["observation/state"])
     expected = policy.normalize({"actions": desired})["actions"]
     plain_normalized = policy.normalize({"actions": plain[:len(desired)]})["actions"]

@@ -44,7 +44,7 @@ test('unified preset selection preserves drafts, uses saved H/K and blocks unsav
   assert.equal(f.element('inference-horizon').value,'17');
   await f.panel.save();
   assert.deepEqual(JSON.parse(JSON.stringify(f.calls[0][2])),{inference_profile:'local5090',policy_endpoint:{host:'127.0.0.1',port:8000},
-    execution:{expected_chunk_steps:17,replan_steps:6,arrival_wait_s:.1,mode:'normal',rtc_min_replan_steps:6}});
+    execution:{expected_chunk_steps:17,replan_steps:6,arrival_wait_s:.1,mode:'normal',inference_delay:8,execute_horizon:10}});
   assert.equal(f.panel.canStart(),false);
 });
 
@@ -65,7 +65,8 @@ test('RTC selects H20, preserves drafts, locks normal-only controls and saves mo
   assert.equal(f.element('inference-horizon').value,'20');
   assert.equal(f.element('inference-prefix').disabled,true);
   assert.equal(f.element('inference-wait').disabled,true);
-  assert.equal(f.element('inference-rtc-min').disabled,false);
+  assert.equal(f.element('inference-delay').disabled,false);
+  assert.equal(f.element('inference-execute-horizon').disabled,false);
   f.panel.render(f.state());
   assert.equal(f.element('inference-mode').value,'rtc');
   assert.equal(f.panel.canStart(),false);
@@ -150,4 +151,34 @@ test('control faults remain visible in plain Chinese while raw diagnostics and e
   assert.equal(f.element('inference-log-state').hidden,true);
   assert.equal(f.element('inference-export').hidden,true);
   assert.match(f.panel.readableError(raw),/控制权限已撤销/);
+});
+
+test('startup rejection stays visible through successful preview refreshes',()=>{
+  const f=fixture(),s=structuredClone(f.state());
+  const context={startupError:'模型推理启动失败：云端 RTC 协议不兼容，需要 nero.rtc.v2'};
+  f.panel.render(s,context);
+  f.panel.render({...s,last_error:null,chunk_sequence:99},context);
+  assert.equal(f.element('inference-control-message').hidden,false);
+  assert.match(f.element('inference-control-message').textContent,/启动失败.*v2/);
+  assert.match(f.element('inference-error-detail').textContent,/启动失败/);
+});
+
+test('fault recovery always offers stop retry or exit while preview stays independent',()=>{
+  const f=fixture(),s=structuredClone(f.state());
+  s.last_error='injected control fault';s.execution_enabled=false;s.priming=false;
+  s.preview={state:'READY',hz:4,sequence:8};
+  s.rtc={state:'HOLD_UNCONFIRMED'};
+  s.recovery={stop_required:true,can_stop:true};
+  s.control_readiness={shadow:{allowed:false,reason:'请重试停止'}};
+  f.panel.render(s);
+  assert.equal(f.element('pi05-stop').disabled,false);
+  assert.equal(f.element('pi05-stop').textContent,'重试停止');
+  assert.equal(f.element('pi05-start').disabled,true);
+  assert.match(f.element('inference-preview-state').textContent,/自动更新中/);
+  s.rtc={state:'HOLD',hold_confirmed:true};s.recovery={stop_required:false,can_stop:true};
+  s.control_readiness={shadow:{allowed:true,reason:null}};
+  f.panel.render(s);
+  assert.equal(f.element('pi05-stop').textContent,'退出异常');
+  assert.equal(f.element('pi05-start').disabled,false);
+  assert.equal(f.element('pi05-start').textContent,'重新开始推理控制');
 });

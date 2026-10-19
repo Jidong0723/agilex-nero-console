@@ -30,6 +30,7 @@ const {chromium} = require('playwright');
         ssh_forward:{state:'ok',label:'模型连接入口',endpoint:`${p.host}:${p.port}`,message:'模拟连接'}},updated_at:Date.now()/1000};
   }
   publish();
+  camera.ready=false;
   const osc = {state_sequence:1,output_mode:'cpv',session:null,authority:{hardware_mode:'HOLD',servo_mode:'SUSPENDED'},
     transport:{connected:false},execution:{},diagnostics:{},workspace:{},command:{},solver:{}};
   const server = http.createServer(async (req,res) => {
@@ -43,13 +44,23 @@ const {chromium} = require('playwright');
         Object.assign(p,body.policy_endpoint||{});
         for(const key of ['expected_chunk_steps','replan_steps']) if(body.execution?.[key]) p[key]=body.execution[key];
         if(body.execution?.arrival_wait_s!==undefined) canonical.execution.arrival_wait_s=body.execution.arrival_wait_s;
-        for(const key of ['mode','rtc_min_replan_steps']) if(body.execution?.[key]!==undefined) canonical.execution[key]=body.execution[key];
+        for(const key of ['mode','inference_delay','execute_horizon']) if(body.execution?.[key]!==undefined) canonical.execution[key]=body.execution[key];
         publish(); data=pi;
+      } else if(req.url==='/api/pi05/stop') {
+        pi.last_control_error=pi.last_error;pi.last_error=null;pi.state='RUNNING';
+        pi.rtc={state:'HOLD',hold_confirmed:true};
+        pi.recovery={can_stop:false,stop_required:false};
+        pi.control_readiness={shadow:{allowed:true},hardware:{allowed:true}};
+        data=pi;
       } else if(req.url.includes('/pi05/state')) data=pi;
       else if(req.url==='/api/osc/state'||req.url==='/api/osc/fast-state') data=osc;
       else if(req.url==='/api/health') data={http_ready:true,control_backend_ready:true};
       else if(req.url==='/api/status') data={connected:false,control:{mode:'HOLD'}};
-      else if(req.url==='/api/cameras/list') data={cameras:[{index:0,name:'模拟外部相机'},{index:2,name:'模拟腕部相机'}]};
+      else if(req.url==='/api/cameras/list') {
+        await new Promise(resolve=>setTimeout(resolve,250));
+        data={cameras:[{index:0,name:'模拟外部相机'},{index:1,name:'模拟腕部相机'}]};
+      }
+      else if(req.url==='/api/cameras/activate') {camera.ready=true;data=camera;}
       else if(req.url.startsWith('/api/cameras/')) data=camera;
       else if(req.url.includes('/dataset/')) data={state:'IDLE'};
       res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({ok:true,data}));return;
@@ -71,6 +82,11 @@ const {chromium} = require('playwright');
     await page.route('**/*',route=>route.request().url().startsWith(base)?route.continue():route.abort());
     page.on('pageerror',e=>errors.push(e.message));
     await page.goto(base);await page.selectOption('#input-adapter','pi05');
+    await page.waitForFunction(()=>document.querySelector('#camera-power-pi05').textContent==='相机已打开');
+    assert.equal(await page.inputValue('#pi05-wrist-index'),'1','slow enumeration must preserve wrist index');
+    const cameraUpdates=requests.filter(r=>r.path==='/api/cameras/config');
+    assert.ok(cameraUpdates.length>0);
+    assert.ok(cameraUpdates.every(r=>r.body.cameras.external.index===0&&r.body.cameras.wrist.index===1),'never coerce an unloaded wrist selector to index 0');
     await page.addStyleTag({content:'.topbar{position:static!important}'});
     await page.waitForFunction(()=>document.querySelector('#inference-horizon').value==='10');
     assert.equal(await page.locator('#input-adapter option').allTextContents().then(x=>x.filter(v=>v.includes('模型推理')).length),1);
@@ -113,7 +129,7 @@ const {chromium} = require('playwright');
     assert.match(await page.locator('label').allTextContents().then(x=>x.join(' ')),/段末到位等待上限（ms）/);
     await page.click('#inference-save');
     await page.waitForFunction(()=>document.querySelector('#inference-mode').value==='rtc'&&!document.querySelector('#inference-save').disabled);
-    pi.rtc={state:'RUNNING',queue_remaining_ms:650,end_to_end_ms:150,replan_interval_steps:7};
+    pi.rtc={state:'RUNNING',queue_remaining_ms:650,end_to_end_ms:150,inference_delay:8,execute_horizon:10};
     await page.waitForFunction(()=>document.querySelector('#inference-rtc-state').textContent.includes('650 ms'));
     await page.locator('#pi05-panel').screenshot({path:path.join(output,'autodl-desktop.png')});
     await page.setViewportSize({width:390,height:844});
@@ -148,6 +164,20 @@ const {chromium} = require('playwright');
     assert.ok(await page.locator('#inference-error-detail').isVisible());
     await page.locator('.inference-details summary').click();
     pi.last_error=null;
+    pi.last_error='injected control failure, HOLD unconfirmed';
+    pi.rtc={state:'HOLD_UNCONFIRMED'};
+    pi.recovery={can_stop:true,stop_required:true};
+    pi.control_readiness={shadow:{allowed:false,reason:'请重试停止'},hardware:{allowed:false,reason:'请重试停止'}};
+    await page.waitForFunction(()=>document.querySelector('#pi05-stop').textContent==='重试停止');
+    assert.ok(await page.isDisabled('#pi05-start'));
+    assert.ok(await page.locator('#pi05-stop').isEnabled());
+    pi.chunk_sequence=88;pi.chunk_updated_at=Date.now()/1000;
+    await page.waitForFunction(()=>document.querySelector('#pi05-chunk-length').textContent==='88');
+    await page.click('#pi05-stop');
+    await page.waitForFunction(()=>document.querySelector('#inference-control-message').hidden);
+    assert.ok(await page.locator('#pi05-start').isEnabled());
+    assert.equal(requests.filter(r=>r.path==='/api/pi05/stop').length,1);
+    assert.equal(requests.filter(r=>r.path==='/api/pi05/start').length,0);
     await page.reload();await page.selectOption('#input-adapter','pi05');
     await page.waitForFunction(()=>document.querySelector('#inference-horizon').value==='13');
     await page.setViewportSize({width:390,height:844});
@@ -156,6 +186,15 @@ const {chromium} = require('playwright');
     assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1),'mobile page must not overflow horizontally');
     assert.deepEqual(errors,[]);
     assert.ok(!requests.some(r=>r.path.includes('/osc/command')||r.path.includes('/session/start')));
+    // Exercise the real button against a deliberately incomplete fake session
+    // response. Ordinary preview polling must not erase the startup rejection.
+    await page.click('#pi05-start');
+    await page.waitForFunction(()=>document.querySelector('#inference-control-message').textContent.includes('模型推理启动失败'));
+    await page.waitForTimeout(1200);
+    assert.ok(await page.locator('#inference-control-message').isVisible());
+    assert.match(await page.locator('#inference-control-message').textContent(),/会话尚未就绪/);
+    assert.equal(requests.filter(r=>r.path==='/api/osc/session/start').length,1);
+    assert.ok(!requests.some(r=>r.path==='/api/pi05/start'||r.path==='/api/osc/command'));
     console.log(JSON.stringify({passed:true,screenshots:output,errors,configurationRequests:requests.filter(r=>r.path==='/api/pi05/config').length}));
   }finally {
     if(browser) await browser.close();await new Promise(resolve=>server.close(resolve));

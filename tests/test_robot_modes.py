@@ -293,6 +293,48 @@ class RobotModeTests(unittest.TestCase):
         self.assertEqual(sdk.events, events)
         self.assertTrue(sdk.auto_set_motion_mode)
 
+    def test_profile_reconciles_mode_default_after_skipped_write_once(self) -> None:
+        robot,sdk = self.make_robot()
+        sdk.cpv_profile['cv'] = [2.]*7
+        getter,setter = sdk.get_cpv_cv,sdk.set_cpv_cv
+        reads,writes = [],[]
+        def delayed_default(**kwargs):
+            reads.append(kwargs['joint_index'])
+            if len(reads)==8:
+                sdk.cpv_profile['cv'] = [1.5]*7
+            return getter(**kwargs)
+        def record_write(**kwargs):
+            writes.append(kwargs['joint_index'])
+            return setter(**kwargs)
+        sdk.get_cpv_cv,sdk.set_cpv_cv = delayed_default,record_write
+        result = robot.configure_cpv_profile(2.,None,None)
+        self.assertEqual(writes,list(range(1,8)))
+        self.assertEqual(sdk.cpv_profile['cv'],[2.]*7)
+        self.assertTrue(all(r['reconciled_after_skipped_write']=='cv' for r in result['joints']))
+
+    def test_profile_reconciliation_never_accepts_failed_readback(self) -> None:
+        robot,sdk = self.make_robot()
+        reads,writes = [],[]
+        def delayed_default(**kwargs):
+            reads.append(kwargs['joint_index'])
+            return 2. if len(reads)<=7 else 1.5
+        def rejected_write(**kwargs):
+            writes.append(kwargs['joint_index'])
+            return False
+        sdk.get_cpv_cv,sdk.set_cpv_cv = delayed_default,rejected_write
+        with self.assertRaisesRegex(RuntimeError,'read-back mismatch at J1'):
+            robot.configure_cpv_profile(2.,None,None)
+        self.assertEqual(writes,[1])
+        self.assertTrue(sdk.auto_set_motion_mode)
+
+    def test_matching_profile_does_not_rewrite_flash(self) -> None:
+        robot,sdk = self.make_robot()
+        sdk.cpv_profile['cv'] = [2.]*7
+        def forbidden(**kwargs):
+            self.fail('matching profile must not be written')
+        sdk.set_cpv_cv = forbidden
+        self.assertTrue(robot.configure_cpv_profile(2.,None,None)['ok'])
+
     def test_cpv_read_suppresses_auto_mode_and_restores_on_success_and_error(self) -> None:
         robot, sdk = self.make_robot()
         events_before = list(sdk.events)

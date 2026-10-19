@@ -1352,6 +1352,67 @@ class OperationalSpaceController:
         self._osc.heartbeat(client_id, session_id)
         return {"ok": True, "state": self.osc_state()}
 
+    def osc_track_tcp_nonblocking(
+        self,
+        session_id: str,
+        client_id: str,
+        sequence: int,
+        target_pose: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Publish one model target directly to the OSC latest-value mailbox.
+
+        This is intentionally a separate ingress from ``osc_command``.  The
+        model executor runs on a 50 ms deadline, so it cannot afford the
+        generic OSC ingress bookkeeping (input-journal deep copy, context
+        construction, and full response/status assembly).  The OSC runtime
+        still performs the authoritative session, sequence, workspace,
+        finite-value, and servo-authority checks under its own lock.  A
+        successful return means only that the target was accepted into the
+        mailbox; it does not mean that the servo loop or hardware has
+        consumed it.
+        """
+        result = self._osc.publish_target_nonblocking(
+            str(session_id), str(client_id), int(sequence), dict(target_pose))
+        accepted = bool(result.get("accepted", False))
+        response = {
+            "ok": accepted,
+            "accepted": accepted,
+            "session_id": result.get("session_id", session_id),
+            "accepted_sequence": result.get("accepted_sequence", sequence),
+            "mailbox": "osc_target_latest_value",
+        }
+        if not accepted:
+            response["reason"] = result.get("reason", "OSC target was not accepted")
+            response["result"] = result
+        return response
+
+    def osc_fast_state(self) -> dict[str, Any]:
+        """Return only the cache required by model feedback refresh.
+
+        The complete ``osc_state`` response remains available to the UI and
+        diagnostics.  This path never assembles solver, transport, or CAN
+        status while the 50 Hz model input loop is running.
+        """
+        servo = dict(self._osc.fast_status())
+        sample = dict(servo.get("execution_sample") or {})
+        session = dict(servo.get("session") or {})
+        execution = {
+            key: sample.get(key)
+            for key in ("measured_tcp_pose", "estimated_tcp_pose", "target_tcp",
+                        "measured_joint_state_rad", "measured_joint_velocity_rad_s",
+                        "feedback_age_s", "sample_monotonic_ns")
+            if sample.get(key) is not None
+        }
+        diagnostics = dict(servo.get("diagnostics") or {})
+        return {
+            "session": session,
+            "command": dict(servo.get("target_pose") or {}),
+            "execution": execution,
+            "diagnostics": {"shadow_transport": diagnostics.get("shadow_transport", {"enabled": False}),
+                            "target_mailbox": diagnostics.get("target_mailbox", {})},
+            "target_generation": servo.get("target_generation"),
+        }
+
     def osc_input_hold(self, reason: str = "PICO right Grip released") -> dict[str, Any]:
         context = self.osc_input_context()
         body = {"session_id": context["session_id"], "client_id": context["client_id"],
@@ -1369,26 +1430,119 @@ class OperationalSpaceController:
         raise RuntimeError("PICO input HOLD requires an active OSC session")
 
     def osc_command(self, body: dict[str, Any]) -> dict[str, Any]:
-        return self._observe_osc_input(body, lambda: self._execute_osc_command(body))
+        command_type = str(body.get("type", "")).strip().lower()
+        # Keep the public HTTP envelope, but route high-rate TCP targets to
+        # the same latest-value mailbox used by model/PICO adapters.  HOLD,
+        # stop, gripper and move_tcp retain their synchronous semantics.
+        if command_type == "track_tcp" and callable(getattr(self._osc, "publish_target_nonblocking", None)):
+            return self._osc_command_track_tcp_mailbox(body)
+        timing = {} if command_type == "track_tcp" else None
+        return self._observe_osc_input(body, lambda: self._execute_osc_command(body, timing), timing=timing)
 
-    def _observe_osc_input(self, body: dict[str, Any], execute: Callable) -> dict[str, Any]:
+    def _osc_command_track_tcp_mailbox(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Handle the legacy HTTP track_tcp envelope without blocking on OSC.
+
+        The journal entry is retained for observability, while its context is
+        built from the lightweight servo snapshot.  The response deliberately
+        reports mailbox admission, not hardware consumption; callers should
+        read /api/osc/state when they need the complete state snapshot.
+        """
         received_ns = time.perf_counter_ns()
+        timing: dict[str, Any] = {"entered_perf_ns": received_ns}
+        fast = self._osc.fast_status()
+        session = dict(fast.get("session") or {})
+        context = self._osc_inputs.context(
+            session,
+            "cpv",
+            session.get("state") == "ACTIVE",
+        )
+        try:
+            payload = dict(body.get("payload") or {})
+            target_pose = dict(payload.get("target_pose") or body.get("target_pose") or {})
+            timing["precheck_finished_perf_ns"] = time.perf_counter_ns()
+            submit_started_ns = time.perf_counter_ns()
+            result = self.osc_track_tcp_nonblocking(
+                str(body.get("session_id", "")),
+                str(body.get("client_id", "anonymous")),
+                int(body.get("sequence", -1)),
+                target_pose,
+            )
+            submit_finished_ns = time.perf_counter_ns()
+            timing["submit_started_perf_ns"] = submit_started_ns
+            timing["submit_finished_perf_ns"] = submit_finished_ns
+            response = {
+                "ok": bool(result.get("ok")),
+                "result": {**result, "mode": "track_tcp"},
+                "mailbox": "osc_target_latest_value",
+            }
+            self._osc_inputs.append(
+                body, context, received_ns,
+                accepted=bool(response["ok"]),
+            )
+        except Exception as exc:
+            self._osc_inputs.append(
+                body, context, received_ns,
+                accepted=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        finally:
+            returned_ns = time.perf_counter_ns()
+            timing["returned_perf_ns"] = returned_ns
+            timing["precheck_ms"] = (
+                timing.get("precheck_finished_perf_ns", returned_ns) - received_ns
+            ) / 1e6
+            if "submit_started_perf_ns" in timing:
+                timing["submit_ms"] = (
+                    timing["submit_finished_perf_ns"] - timing["submit_started_perf_ns"]
+                ) / 1e6
+            timing["total_ms"] = (returned_ns - received_ns) / 1e6
+        response["track_tcp_timing"] = timing
+        return response
+
+    def _observe_osc_input(self, body: dict[str, Any], execute: Callable,
+                           *, timing: dict[str, Any] | None = None) -> dict[str, Any]:
+        received_ns = time.perf_counter_ns()
+        if timing is not None:
+            timing["entered_perf_ns"] = received_ns
         context = self.osc_input_context()
+        if timing is not None:
+            timing["precheck_finished_perf_ns"] = time.perf_counter_ns()
         try:
             result = execute()
         except Exception as exc:
-            self._osc_inputs.append(body, context, received_ns, accepted=False, error=f"{type(exc).__name__}: {exc}")
+            if timing is not None:
+                timing["returned_perf_ns"] = time.perf_counter_ns()
+                timing["precheck_ms"] = (timing["precheck_finished_perf_ns"] - timing["entered_perf_ns"]) / 1e6
+                if "submit_finished_perf_ns" in timing:
+                    timing["submit_ms"] = (timing["submit_finished_perf_ns"] - timing["submit_started_perf_ns"]) / 1e6
+                timing["total_ms"] = (timing["returned_perf_ns"] - timing["entered_perf_ns"]) / 1e6
+                detail = json.dumps(timing, separators=(",", ":"))
+                error = f"{type(exc).__name__}: {exc}; track_tcp_timing={detail}"
+            else:
+                error = f"{type(exc).__name__}: {exc}"
+            self._osc_inputs.append(body, context, received_ns, accepted=False, error=error)
             raise
         self._osc_inputs.append(body, context, received_ns,
             accepted=bool(result.get("ok", result.get("accepted", False))))
+        if timing is not None:
+            timing["returned_perf_ns"] = time.perf_counter_ns()
+            timing["precheck_ms"] = (timing["precheck_finished_perf_ns"] - timing["entered_perf_ns"]) / 1e6
+            timing["submit_ms"] = (timing["submit_finished_perf_ns"] - timing["submit_started_perf_ns"]) / 1e6
+            timing["total_ms"] = (timing["returned_perf_ns"] - timing["entered_perf_ns"]) / 1e6
+            result["track_tcp_timing"] = timing
         return result
 
-    def _execute_osc_command(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _execute_osc_command(self, body: dict[str, Any], timing: dict[str, Any] | None = None) -> dict[str, Any]:
         command_type = str(body.get("type", "")).strip().lower()
         payload = dict(body.get("payload") or {})
         acknowledgement_only = bool(body.get("acknowledgement_only", False)) and command_type == "track_tcp"
         if command_type in {"track_tcp", "move_tcp"}:
+            if timing is not None:
+                timing["submit_started_perf_ns"] = time.perf_counter_ns()
             result = self._osc.submit_absolute_target(body, mode=command_type)
+            if timing is not None:
+                timing["submit_finished_perf_ns"] = time.perf_counter_ns()
         elif command_type in {"hold", "stop"}:
             reason = str(payload.get("reason", "OSC HOLD requested"))
             session = self._osc.status().get("session") or {}
@@ -1416,6 +1570,8 @@ class OperationalSpaceController:
         # this compact response consume the normal /api/osc/state snapshot.
         if not acknowledgement_only:
             response["state"] = self.osc_state()
+        if timing is not None:
+            response["track_tcp_timing"] = timing
         return response
 
     def _output_switch_status(self, control: dict[str, Any]) -> dict[str, Any]:

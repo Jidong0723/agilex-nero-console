@@ -1323,6 +1323,19 @@ class NeroRobot:
                         # final safety authority; a false ACK is recorded but
                         # only rejected when the persisted value disagrees.
                         readback = self.read_cpv_parameter(joint_index, name)
+                        # Mode entry can finish applying its firmware default
+                        # after the first snapshot. If we skipped a write on
+                        # that snapshot, reconcile ONCE with this explicit
+                        # profile request; never accept the mismatching value
+                        # and never retry a setter that already ran.
+                        if (acknowledgement is None and readback is not None
+                                and abs(float(readback) - value) > 1e-6):
+                            setter = getattr(self.robot, f"set_cpv_{name}", None)
+                            if setter is None:
+                                raise RuntimeError(f"NERO SDK does not expose set_cpv_{name}")
+                            acknowledgement = bool(setter(joint_index=joint_index, **{name: value}, timeout=0.1))
+                            readback = self.read_cpv_parameter(joint_index, name)
+                            row_data[joint_index]["reconciled_after_skipped_write"] = name
                         row_data[joint_index]["acknowledgements"][name] = acknowledgement
                         row_data[joint_index]["readback"][name] = readback
                         if readback is None or abs(float(readback) - value) > 1e-6:

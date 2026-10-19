@@ -79,6 +79,9 @@ class RunCapture:
         self.write_lock=threading.Lock()
         self.stop_sampling=threading.Event()
         self.closed=False; self.error=None; self.lost=0
+        self.emit_count=0; self.slow_deepcopy_count=0; self.max_deepcopy_ms=0.0
+        self.json_count=0; self.slow_json_count=0; self.max_json_ms=0.0
+        self.write_count=0; self.max_write_ms=0.0
         self.sample_count=0; self.fresh_sample_count=0; self.reused_sample_count=0
         self.sample_first_ns=None; self.sample_last_ns=None
         self.max_sample_interval_ms=0.; self.max_cache_read_ms=0.
@@ -93,7 +96,11 @@ class RunCapture:
     def emit(self, event, **payload):
         # Copy caller-owned data outside the enqueue lock. Large model chunks
         # must not hold up the independent feedback sampler.
+        copy_started=time.perf_counter_ns()
         payload=copy.deepcopy(payload)
+        copy_ms=(time.perf_counter_ns()-copy_started)/1e6
+        self.emit_count+=1; self.max_deepcopy_ms=max(self.max_deepcopy_ms,copy_ms)
+        if copy_ms>=5.0: self.slow_deepcopy_count+=1
         with self.write_lock:
             if self.closed: return
             item={'event':event,'perf_ns':time.perf_counter_ns(),'wall_ns':time.time_ns(),**payload}
@@ -106,7 +113,15 @@ class RunCapture:
                 while True:
                     item=self.events.get()
                     if item is None: break
-                    stream.write(json.dumps(serializable(item),ensure_ascii=False,allow_nan=False)+'\n')
+                    serialise_started=time.perf_counter_ns()
+                    line=json.dumps(serializable(item),ensure_ascii=False,allow_nan=False)+'\n'
+                    json_ms=(time.perf_counter_ns()-serialise_started)/1e6
+                    self.json_count+=1; self.max_json_ms=max(self.max_json_ms,json_ms)
+                    if json_ms>=5.0: self.slow_json_count+=1
+                    write_started=time.perf_counter_ns()
+                    stream.write(line)
+                    self.write_count+=1
+                    self.max_write_ms=max(self.max_write_ms,(time.perf_counter_ns()-write_started)/1e6)
                 stream.flush()
         except Exception as exc: self.error=f'{type(exc).__name__}: {exc}'
 
@@ -169,6 +184,11 @@ class RunCapture:
     def status(self):
         span=(self.sample_last_ns-self.sample_first_ns)/1e9 if self.sample_first_ns is not None and self.sample_last_ns is not None else 0.
         return {'run_id':self.id,'finished':self.closed,'write_error':self.error,'lost_records':self.lost,
+                'logging_diagnostics':{'emit_count':self.emit_count,
+                'slow_deepcopy_count':self.slow_deepcopy_count,'max_deepcopy_ms':self.max_deepcopy_ms,
+                'json_count':self.json_count,'slow_json_count':self.slow_json_count,
+                'max_json_ms':self.max_json_ms,'write_count':self.write_count,
+                'max_write_ms':self.max_write_ms},
                 'sampling_target_hz':50.,'feedback_record_count':self.sample_count,
                 'actual_record_hz':(self.sample_count-1)/span if span>0 else None,
                 'fresh_feedback_count':self.fresh_sample_count,'reused_feedback_count':self.reused_sample_count,

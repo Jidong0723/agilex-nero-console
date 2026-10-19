@@ -2,7 +2,7 @@
 (function(root) {
   "use strict";
   const get = id => document.getElementById(id);
-  const fields = ["inference-host", "inference-port", "inference-horizon", "inference-prefix", "inference-wait", "inference-mode", "inference-rtc-min"];
+  const fields = ["inference-host", "inference-port", "inference-horizon", "inference-prefix", "inference-wait", "inference-mode", "inference-delay", "inference-execute-horizon"];
   let apiCall, acceptState, report, latest = null, busy = false, selected = null, notice = "";
   const drafts = new Map();
   const names = {local5090:"5090 本地", autodl:"AutoDL 云端"};
@@ -21,7 +21,8 @@
           <label>预测长度 H<input id="inference-horizon" type="number" min="1" step="1"></label>
           <label>每块执行步数 K<input id="inference-prefix" type="number" min="1" step="1"></label>
           <label>段末到位等待上限（ms）<input id="inference-wait" type="number" min="0" max="5000" step="1"></label>
-          <label>RTC 最小重规划间隔（步）<input id="inference-rtc-min" type="number" min="1" max="9" step="1"></label>
+          <label>RTC 推理延迟 inference_delay（步）<input id="inference-delay" type="number" min="0" max="19" step="1"></label>
+          <label>RTC 执行长度 execute_horizon（步）<input id="inference-execute-horizon" type="number" min="1" max="19" step="1"></label>
         </div>
         <div class="inference-settings-footer"><small>H 必须匹配模型返回长度；修改这里不会改变模型本身。1 ≤ K ≤ H。</small><button id="inference-save" class="button" type="button">保存并应用</button></div>
         <p id="inference-save-result" class="result" role="status"></p>
@@ -66,13 +67,13 @@
     const p = state.config.inference_profiles[name];
     return {host:p.host, port:String(p.port), horizon:String(p.expected_chunk_steps), prefix:String(p.replan_steps),
       wait:String(1000*(state.config.execution.arrival_wait_s ?? .1)),mode:state.config.execution.mode||"normal",
-      rtcMin:String(state.config.execution.rtc_min_replan_steps??6)};
+      inferenceDelay:String(state.config.execution.inference_delay??8),executeHorizon:String(state.config.execution.execute_horizon??10)};
   }
   function draft() {
     return {host:get(fields[0]).value,port:get(fields[1]).value,horizon:get(fields[2]).value,
-      prefix:get(fields[3]).value,wait:get(fields[4]).value,mode:get(fields[5]).value,rtcMin:get(fields[6]).value};
+      prefix:get(fields[3]).value,wait:get(fields[4]).value,mode:get(fields[5]).value,inferenceDelay:get(fields[6]).value,executeHorizon:get(fields[7]).value};
   }
-  function fill(value) { [value.host,value.port,value.horizon,value.prefix,value.wait,value.mode,value.rtcMin].forEach((v,i) => {get(fields[i]).value=v;}); }
+  function fill(value) { [value.host,value.port,value.horizon,value.prefix,value.wait,value.mode,value.inferenceDelay,value.executeHorizon].forEach((v,i) => {get(fields[i]).value=v;}); }
   function dirty() {
     if (!latest || !selected) return true;
     return selected !== latest.config.inference_profiles.active || JSON.stringify(draft()) !== JSON.stringify(savedDraft(latest, selected));
@@ -89,21 +90,23 @@
     const rtc=get("inference-mode").value==="rtc";
     get("inference-prefix").disabled=Boolean(locked||rtc);
     get("inference-wait").disabled=Boolean(locked||rtc);
-    get("inference-rtc-min").disabled=Boolean(locked||!rtc);
+    get("inference-delay").disabled=Boolean(locked||!rtc);
+    get("inference-execute-horizon").disabled=Boolean(locked||!rtc);
     get("pi05-prompt-save").disabled=Boolean(locked&&latest?.config.execution.mode==="rtc");
-    get("inference-mode-help").textContent=rtc?"RTC 要求 H20／50 ms；K 和段末到位等待不参与 RTC。异常 HOLD 后需手动重新开始。":"普通模式：请求、等待、执行前 K 行；段末最多等待指定时间。RTC 最小间隔仅用于 RTC。";
+    get("inference-mode-help").textContent=rtc?"每步 50 ms。inference_delay：旧轨迹保留步数；execute_horizon：每轮总执行步数（含旧轨迹）。引导重叠长度 = H − execute_horizon。K 和段末到位等待不参与 RTC。":"普通模式：请求、等待、执行前 K 行；段末最多等待指定时间。RTC 参数仅用于 RTC。";
     get("pi05-start").disabled = !canStart();
     if (!busy) get("inference-save-result").textContent = notice || (dirty() ? "有未保存的设置；保存并验证模型响应后可开始控制" : "");
     get("inference-start-reason").textContent=startReason();
   }
   async function save() {
     if (busy || latest?.execution_enabled || latest?.priming) return;
-    const value = draft(), H = Number(value.horizon), K = Number(value.prefix), port = Number(value.port), wait = Number(value.wait), rtcMin=Number(value.rtcMin);
+    const value = draft(), H = Number(value.horizon), K = Number(value.prefix), port = Number(value.port), wait = Number(value.wait), inferenceDelay=Number(value.inferenceDelay), executeHorizon=Number(value.executeHorizon);
     if (!value.host.trim() || !Number.isSafeInteger(port) || port<1 || port>65535 ||
         !Number.isSafeInteger(H) || !Number.isSafeInteger(K) || K<1 || H<K ||
         !value.wait.trim() || !Number.isFinite(wait) || wait<0 || wait>5000 ||
-        !Number.isInteger(rtcMin) || rtcMin<1 || rtcMin>9 || (value.mode==="rtc"&&H!==20)) {
-      notice = "保存失败：检查地址、端口、H/K、到达等待；RTC 要求 H20，最小重规划间隔为 1–9 步";
+        !value.inferenceDelay.trim() || !value.executeHorizon.trim() ||
+        !Number.isInteger(inferenceDelay) || !Number.isInteger(executeHorizon) || inferenceDelay<0 || executeHorizon<1 || executeHorizon>=20 || inferenceDelay>executeHorizon || inferenceDelay+executeHorizon>20 || (value.mode==="rtc"&&H!==20)) {
+      notice = "保存失败：RTC 要求 H20，0 ≤ inference_delay ≤ execute_horizon < 20，两者之和 ≤ 20";
       get("inference-save-result").textContent = notice;
       return false;
     }
@@ -112,7 +115,7 @@
     try {
       const state = await apiCall("/api/pi05/config","POST",{inference_profile:selected,
         policy_endpoint:{host:value.host.trim(),port},
-        execution:{expected_chunk_steps:H,replan_steps:K,arrival_wait_s:wait/1000,mode:value.mode,rtc_min_replan_steps:rtcMin}},15000);
+        execution:{expected_chunk_steps:H,replan_steps:K,arrival_wait_s:wait/1000,mode:value.mode,inference_delay:inferenceDelay,execute_horizon:executeHorizon}},15000);
       drafts.delete(selected); latest=state; fill(savedDraft(state,selected));
       acceptState(state);
       notice="设置已保存；正在验证模型连接与响应";
@@ -161,6 +164,7 @@
   }
   function startReason() {
     if(!latest) return "等待运行状态";
+    if(latest.recovery?.stop_required) return "停止尚未确认：请点击“重试停止”。只读预览继续，确认前不能重新开始控制。";
     if(["STOPPING","HOLD_PENDING","HOLD_UNCONFIRMED"].includes(latest.rtc?.state)) return "正在确认停止；HOLD 确认前不能重新开始";
     if(latest.execution_enabled) return "正在控制";
     if(latest.priming) return "正在准备控制";
@@ -171,7 +175,7 @@
     if(latest.model_state!=="CONNECTED") return "等待模型 WebSocket 连接";
     if(!latest.camera_ready) return "请先打开相机，提供推理观测";
     if(latest.protocol_compatibility?.status!=="compatible") return latest.protocol_compatibility?.status==="incompatible"?latest.protocol_compatibility.message:"等待实际推理响应通过 7D／H 验证";
-    return "";
+    return latest.last_error ? "控制故障已保留。预览继续；可手动重新开始，或点击“退出异常”。" : "";
   }
   function connections() {
     if(!latest) return;
@@ -193,14 +197,19 @@
   }
   function readableError(error, osc) {
     if(!error) return "";
+    if(/RTC.*(v2|协议不兼容)|nero\.rtc\.v1/.test(error)) return "云端 RTC 版本不兼容，请更新推理服务后再启动控制。";
     const cpv=osc?.diagnostics?.mailboxes?.cpv || osc?.transport?.cpv_mailbox;
     const cause=cpv?.last_result?.error || "";
     if(/joint limits|joint.*limit|关节.*限位/i.test(error+cause)) return "关节限位保护已触发，控制已停止。请先检查当前姿态。";
     if(/write authority|tracking authority|PermissionError/.test(error)) return "控制权限已撤销，机械臂保持停止。请检查故障详情后重新建立控制会话。";
     if(/workspace/.test(error)) return "模型目标超出允许工作范围，控制已停止。";
-    if(/feedback|stale|image\/TCP|camera.*older/i.test(error)) return "观测反馈不够新鲜，控制已停止。请检查相机和机械臂反馈。";
+    if(/measured TCP timestamp missing or stale|fresh measured TCP|measured TCP unavailable/i.test(error)) return "TCP 实测观测缺失或超过 100 ms，控制已停止。请检查本地反馈刷新链路。";
+    if(/camera feedback|camera.*older|camera pair skew/i.test(error)) return "相机图像缺失、过期或双路时间差过大，控制已停止。";
+    if(/hardware feedback is stale/i.test(error)) return "机械臂底层反馈超过 100 ms，控制已停止。";
+    if(/gripper.*stopped updating/i.test(error)) return "夹爪实测反馈停止更新，控制已停止。";
+    if(/feedback|stale|image\/TCP/i.test(error)) return "观测反馈不够新鲜，控制已停止。请展开技术详情确认具体来源。";
     if(/deadline|slot|runway|exhausted/i.test(error)) return "推理或控制未赶上执行节奏，控制已停止。";
-    return "控制发生异常，已停止。请展开技术详情查看原因。";
+    return "控制发生异常，已停止。可在技术详情查看原因，并通过右侧按钮退出异常或重试停止。";
   }
   function render(state, context={}) {
     if (!state?.config?.inference_profiles || !get("inference-save")) return;
@@ -225,18 +234,24 @@
     const metadata=state.policy_metadata || {};
     get("inference-model-report").textContent=metadata.deployment_label || metadata.checkpoint_dir ? `模型报告：${metadata.deployment_label || metadata.checkpoint_dir}` : (p.checkpoint_label?`预设备注：${p.checkpoint_label}（模型未报告名称）`:"模型未报告名称");
     get("pi05-run-state").textContent=state.execution_enabled?"控制中":(state.priming?"准备控制":(state.last_error||state.state==="ERROR"?"控制故障":(state.session_id?"已停止控制":"未控制")));
-    get("pi05-stop").disabled=!(state.execution_enabled || state.priming);
+    const recoverable=Boolean(state.last_error || context.startupError || state.recovery?.can_stop);
+    const needsStop=Boolean(state.recovery?.stop_required || ["HOLD_PENDING","HOLD_UNCONFIRMED","STOPPING"].includes(state.rtc?.state));
+    get("pi05-start").textContent=state.last_error&&!state.execution_enabled&&!state.priming?"重新开始推理控制":"开始推理控制";
+    get("pi05-stop").disabled=!(state.execution_enabled || state.priming || recoverable || needsStop);
+    get("pi05-stop").textContent=needsStop?"重试停止":recoverable&&!state.execution_enabled&&!state.priming?"退出异常":"停止推理控制";
     const rtc=state.rtc;
     const rtcNames={BOOTSTRAP:"初始化",RUNNING:"运行中",STOPPING:"正在停止",HOLD_PENDING:"等待保持确认",HOLD:"已保持",HOLD_UNCONFIRMED:"保持未确认",RELEASED:"已交出控制权"};
-    get("inference-rtc-state").textContent=state.config.execution.mode==="rtc"?`RTC：${rtcNames[rtc?.state]||"待启动"} · 队列 ${rtc?.queue_remaining_ms??0} ms · 端到端 ${rtc?.end_to_end_ms?.toFixed(1)??"--"} ms · 重规划 ${rtc?.replan_interval_steps??"--"} 步${rtc?.reason?" · "+rtc.reason:""}${rtc?.manual_restart_required?" · 需手动重新开始":""}`:"";
+    get("inference-rtc-state").textContent=state.config.execution.mode==="rtc"?`RTC：${rtcNames[rtc?.state]||"待启动"} · 队列 ${rtc?.queue_remaining_ms??0} ms · 端到端 ${rtc?.end_to_end_ms?.toFixed(1)??"--"} ms · inference_delay=${state.config.execution.inference_delay??8} · execute_horizon=${state.config.execution.execute_horizon??10}${rtc?.reason?" · "+rtc.reason:""}${rtc?.manual_restart_required?" · 需手动重新开始":""}`:"";
     const preview=state.preview||{}, previewNames={WAITING:"等待观测",INFERENCING:"推理中",READY:"自动更新中",PAUSED:"控制期间暂停",ERROR:"预览失败"};
-    get("inference-preview-state").textContent=`动作预览：${previewNames[preview.state]||"等待连接"}${preview.hz&&preview.state!=="PAUSED"?` · ${preview.hz.toFixed(1)} Hz`:""}${preview.error&&!state.last_error?" · 等待有效观测":""}`;
-    get("inference-control-state").textContent=`控制状态：${state.execution_enabled?"控制中":state.priming?"准备控制":state.last_error?"已停止":"未控制"}`;
+    get("inference-preview-state").textContent=`动作预览：${previewNames[preview.state]||"等待连接"}${preview.hz&&preview.state!=="PAUSED"?` · ${preview.hz.toFixed(1)} Hz`:""}${preview.error?" · "+preview.error:""}${preview.warning?" · "+preview.warning:""}`;
+    get("inference-control-state").textContent=`控制状态：${state.execution_enabled?"控制中":state.priming?"准备控制":state.last_error?"已停止":context.startupError?"启动失败":"未控制"}`;
     const message=get("inference-control-message");
-    message.textContent=readableError(state.last_error,context.osc);message.hidden=!state.last_error;
+    const controlError=state.last_error||context.startupError;
+    message.textContent=context.startupError&&!state.last_error?context.startupError:readableError(controlError,context.osc);
+    message.hidden=!controlError;
     get("inference-training-detail").textContent=state.training_notice||"";
     get("inference-training-detail").hidden=!state.training_notice;
-    get("inference-error-detail").textContent=[state.last_error,preview.error,(context.osc?.diagnostics?.mailboxes?.cpv?.last_result||{}).error].filter(Boolean).join("\n");
+    get("inference-error-detail").textContent=[state.last_error,state.last_control_error?"上次控制故障："+state.last_control_error:null,context.startupError,preview.error,(context.osc?.diagnostics?.mailboxes?.cpv?.last_result||{}).error].filter(Boolean).join("\n");
     get("inference-chunk-source").textContent=state.chunk_updated_at?`${state.chunk_source==="control"?"控制动作":"动作预测预览"}${state.chunk_stale?" · 历史结果，已停止更新":state.chunk_source!=="control"?" · 仅预览，不执行":""}`:"等待模型预测";
     get("inference-chunk-detail").textContent=state.chunk_updated_at?`第 ${state.chunk_sequence} 块 · H=${state.action_chunk_length} · ${state.inference_ms?.toFixed(1)??"--"} ms · ${new Date(state.chunk_updated_at*1000).toLocaleTimeString()}${state.chunk_source!=="control"&&state.config.execution.mode==="rtc"?" · 普通 H20 采样，未进行 RTC 衔接":""}`:"";
     if(["HOLD_PENDING","HOLD_UNCONFIRMED","STOPPING"].includes(rtc?.state)) get("pi05-stop").disabled=false;

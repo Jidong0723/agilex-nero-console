@@ -14,10 +14,13 @@ from dataclasses import dataclass
 import numpy as np
 
 from .inference_contract import action_rows
+from .inference_rtc_timing import RTCTiming, preserve_delay_prefix
 
-VERSION = "nero.rtc.v1"
+VERSION = "nero.rtc.v2"
 H = 20
 PERIOD = .05
+PERIOD_NS = 50_000_000
+TIME_CONTRACT = "observation_time_plus_row_index_times_period"
 
 
 def orientation_distance(a, b):
@@ -28,11 +31,19 @@ def orientation_distance(a, b):
 
 def compatibility(metadata, execution):
     if metadata.get("rtc_version") != VERSION or metadata.get("ready") is not True:
-        raise RuntimeError("RTC requires a ready nero.rtc.v1 server; no normal-mode fallback")
+        raise RuntimeError("RTC requires a ready nero.rtc.v2 server; no normal-mode fallback")
     if metadata.get("state_dim") != 7 or metadata.get("valid_action_dim") != 7 or metadata.get("action_horizon") != H:
         raise RuntimeError("RTC server must declare state7/action7/H20")
     if metadata.get("period_s") != PERIOD or metadata.get("action_contract") != "base_relative_observation_start_rotvec_gripper_absolute":
         raise RuntimeError("RTC server action/time contract mismatch")
+    if metadata.get('action_time_contract') != TIME_CONTRACT or metadata.get('action_row0_offset_s') != 0:
+        raise RuntimeError("RTC requires action row 0 at observation time, not response time")
+    if metadata.get('rtc_bootstrap_mode') != 'hold_prefix_v1':
+        raise RuntimeError('RTC requires a server with HOLD-prefix bootstrap support')
+    if metadata.get('rtc_schedule') != 'fixed_delay_execute_horizon_v1':
+        raise RuntimeError('RTC server must support fixed inference_delay / execute_horizon scheduling')
+    if metadata.get('rtc_bootstrap_attention') != 'full_hold_v2':
+        raise RuntimeError('RTC server must support full stationary HOLD bootstrap attention')
     if execution["expected_chunk_steps"] != H or execution.get("period_s", PERIOD) != PERIOD:
         raise RuntimeError("RTC requires H20 and 50 ms")
 
@@ -55,48 +66,201 @@ class Target:
         return [*self.position, *self.quaternion, self.gripper]
 
 
+def interpolate_target(a, b, fraction):
+    """Linear position/gripper and shortest-arc quaternion interpolation."""
+    qa, qb = np.asarray(a.quaternion, float), np.asarray(b.quaternion, float)
+    if np.dot(qa, qb) < 0:
+        qb = -qb
+    dot = float(np.clip(np.dot(qa, qb), -1, 1))
+    if dot > .9995:
+        quat = qa+(qb-qa)*fraction
+    else:
+        angle = math.acos(dot)
+        quat = (math.sin((1-fraction)*angle)*qa+math.sin(fraction*angle)*qb)/math.sin(angle)
+    quat /= np.linalg.norm(quat)
+    return Target(tuple(np.asarray(a.position)+(np.asarray(b.position)-a.position)*fraction),
+                  tuple(quat), a.gripper+(b.gripper-a.gripper)*fraction)
+
+
+def sample_rows(rows, origin_ns, target_ns):
+    index, remainder = divmod(target_ns-origin_ns, PERIOD_NS)
+    if index < 0 or index >= len(rows) or (remainder and index+1 >= len(rows)):
+        raise RuntimeError('RTC cannot extrapolate outside timestamped action rows')
+    return rows[index] if not remainder else interpolate_target(rows[index], rows[index+1], remainder/PERIOD_NS)
+
+
+def _terminal_bridge(rows, first, end, hold):
+    """Quintic from stationary HOLD through three unchanged future samples.
+
+    Fit the continuation rather than forcing zero terminal velocity before a
+    moving model row. All samples retain their original observation timestamps.
+    The caller still checks the entire seam against the same safety limits.
+    """
+    def product(a, b):
+        va, vb = np.asarray(a[:3],float), np.asarray(b[:3],float)
+        return np.r_[a[3]*vb+b[3]*va+np.cross(va,vb), a[3]*b[3]-np.dot(va,vb)]
+
+    inverse = np.r_[-np.asarray(hold.quaternion[:3]), hold.quaternion[3]]
+    values = []
+    for target in rows[end:end+3]:
+        q = product(target.quaternion, inverse)
+        q /= np.linalg.norm(q)
+        if q[3] < 0:
+            q = -q
+        norm = np.linalg.norm(q[:3])
+        rotation = q[:3]*(2*math.atan2(norm,q[3])/norm) if norm > 1e-12 else np.zeros(3)
+        values.append(np.r_[np.subtract(target.position,hold.position), rotation, target.gripper-hold.gripper])
+    n = end-first
+    times = np.asarray([1.,1+1/n,1+2/n])
+    coefficients = np.linalg.solve(np.stack([times**3,times**4,times**5],axis=1),np.asarray(values))
+    candidate = list(rows)
+    for tick in range(first,end):
+        s = (tick-first)/n
+        value = np.asarray([s**3,s**4,s**5])@coefficients
+        angle = np.linalg.norm(value[3:6])
+        delta = np.r_[value[3:6]*(math.sin(angle/2)/angle),math.cos(angle/2)] if angle > 1e-12 else np.asarray([0.,0.,0.,1.])
+        q = product(delta,hold.quaternion)
+        q /= np.linalg.norm(q)
+        candidate[tick] = Target(tuple(np.asarray(hold.position)+value[:3]),tuple(q),float(hold.gripper+value[6]))
+    return candidate
+
+
+def bootstrap_bridge(rows, first, hold, limits):
+    """Join HOLD to a future model row on its ORIGINAL observation time grid.
+
+    Only startup slots are locally generated; model rows are never time-shifted.
+    The actual bridge becomes the prefix sent to subsequent RTC requests.
+    """
+    linear = min(.05, float(limits.get('linear_speed_m_s', .05)))
+    angular = min(.2, float(limits.get('angular_speed_rad_s', .2)))
+    if linear <= 0 or angular <= 0:
+        raise RuntimeError('RTC bootstrap requires positive speed limits')
+    def safe(candidate, end):
+        # A terminal fit can overshoot: validate all generated points, not just
+        # the destination. Keep the existing envelope and gripper limits.
+        if any(not np.isfinite(t.absolute_row()).all()
+               or np.linalg.norm(np.subtract(t.position,hold.position)) > .02
+               or orientation_distance(t.quaternion,hold.quaternion) > math.radians(5)
+               or not 0 <= t.gripper <= 1 for t in candidate[first:end+1]):
+            return False
+        ordered = [hold, *candidate[first:]]
+        if any(np.linalg.norm(np.subtract(b.position,a.position)) > linear*PERIOD+1e-6
+               or orientation_distance(a.quaternion,b.quaternion) > angular*PERIOD+1e-6
+               or abs(b.gripper-a.gripper) > 2*PERIOD+1e-6
+               for a,b in zip(ordered,ordered[1:])):
+            return False
+        velocities = [np.subtract(b.position,a.position)/PERIOD for a,b in zip(ordered,ordered[1:])]
+        if any(np.linalg.norm(b-a) > .3*PERIOD+1e-6 for a,b in zip(velocities,velocities[1:])):
+            return False
+        angular_velocities = []
+        for a,b in zip(ordered,ordered[1:]):
+            va,wa = np.asarray(a.quaternion[:3]), a.quaternion[3]
+            vb,wb = np.asarray(b.quaternion[:3]), b.quaternion[3]
+            vector, scalar = wa*vb-wb*va-np.cross(vb,va), wa*wb+np.dot(va,vb)
+            if scalar < 0:
+                vector, scalar = -vector, -scalar
+            norm = np.linalg.norm(vector)
+            angular_velocities.append(vector*(2*math.atan2(norm,scalar)/norm/PERIOD) if norm > 1e-12 else np.zeros(3))
+        if any(np.linalg.norm(b-a) > PERIOD+1e-6 for a,b in zip(angular_velocities,angular_velocities[1:])):
+            return False
+        return True
+
+    # Leave two unchanged original rows as runway for the first replan.
+    for end in range(first+6, H-2):
+        destination = rows[end]
+        distance = float(np.linalg.norm(np.subtract(destination.position, hold.position)))
+        angle = orientation_distance(destination.quaternion, hold.quaternion)
+        duration = (end-first)*PERIOD
+        if distance > .02 or angle > math.radians(5):
+            continue
+        # These analytic peaks apply only to the zero-terminal smoothstep,
+        # not the continuation fit; both must pass the actual seam checks.
+        if (1.875*distance/duration <= linear and 5.78*distance/duration**2 <= .3
+                and 1.875*angle/duration <= angular and 5.78*angle/duration**2 <= 1.
+                and 1.875*abs(destination.gripper-hold.gripper)/duration <= 2.):
+            candidate = list(rows)
+            for tick in range(first, end+1):
+                s = (tick-first)/(end-first)
+                candidate[tick] = interpolate_target(hold, destination, 10*s**3-15*s**4+6*s**5)
+            if safe(candidate,end):
+                return candidate, end
+        candidate = _terminal_bridge(rows,first,end,hold)
+        if safe(candidate,end):
+            return candidate,end
+    raise RuntimeError('RTC bootstrap cannot safely join HOLD within remaining H20 horizon; restart required')
+
+
 class Timeline:
     """Small atomic timeline; immutable prefix ownership remains LOCAL."""
-    def __init__(self, epoch):
+    def __init__(self, epoch, origin_ns=0):
         self.epoch = epoch
         self.revision = 0
         self.next_tick = 0
         self.committed_until = 0
         self.targets = {}
+        self.history = {}
+        self.origin_ns = origin_ns
         self.lock = threading.RLock()
 
-    def seed(self, targets):
+    def seed(self, targets, now_ns=None, hold_target=None):
         if len(targets) != H:
             raise ValueError("Expected full H20 seed")
         with self.lock:
-            self.targets = dict(enumerate(targets))
+            first = 0 if now_ns is None else (now_ns-self.origin_ns)//PERIOD_NS+1
+            if not 0 <= first < H:
+                raise RuntimeError('RTC bootstrap has no future rows')
+            self.next_tick = self.committed_until = first
+            self.targets = {i: target for i, target in enumerate(targets) if i >= first}
+            # Past bootstrap slots were HOLD, never model actions executed late.
+            self.history = {i: hold_target for i in range(first)} if hold_target else {}
             self.revision += 1
 
-    def context(self, observation_tick, delay, request_id):
+    def context(self, observation_tick, delay, request_id, *, observation_ns=None, now_ns=None, minimum_freeze_tick=0, execute_horizon=None):
         with self.lock:
+            observation_ns = self.origin_ns+observation_tick*PERIOD_NS if observation_ns is None else observation_ns
+            observation_tick = (observation_ns-self.origin_ns)//PERIOD_NS
+            # Delay is relative to the observation, never the request/response
+            # clock. Round only the absolute boundary onto the execution grid.
+            freeze = max(self.next_tick, self.committed_until, minimum_freeze_tick,
+                (observation_ns+delay*PERIOD_NS-self.origin_ns+PERIOD_NS-1)//PERIOD_NS)
             prefix = []
-            tick = observation_tick
-            while tick in self.targets and len(prefix) < H:
-                prefix.append(self.targets[tick].absolute_row())
-                tick += 1
-            if len(prefix) <= delay:
+            known = {**self.history, **self.targets}
+            for i in range(H):
+                tick, rem = divmod(observation_ns+i*PERIOD_NS-self.origin_ns, PERIOD_NS)
+                if tick not in known or (rem and tick+1 not in known):
+                    break
+                target = known[tick] if not rem else interpolate_target(known[tick], known[tick+1], rem/PERIOD_NS)
+                prefix.append(target.absolute_row())
+            frozen_rows = (self.origin_ns+freeze*PERIOD_NS-observation_ns+PERIOD_NS-1)//PERIOD_NS
+            if len(prefix) < frozen_rows:
                 raise RuntimeError("RTC runway insufficient for another inference")
-            return {"version": VERSION, "phase": "replan", "run_epoch": self.epoch,
+            result = {"version": VERSION, "phase": "replan", "run_epoch": self.epoch,
                     "request_id": request_id, "observation_tick": observation_tick,
-                    "plan_revision": self.revision, "freeze_until": observation_tick+delay,
+                    "plan_revision": self.revision, "freeze_until": freeze,
+                    "observation_perf_ns": observation_ns, "timeline_origin_perf_ns": self.origin_ns,
+                    "freeze_until_perf_ns": self.origin_ns+freeze*PERIOD_NS,
+                    "action_row0_offset_s": 0,
                     "period_s": PERIOD, "absolute_prefix": prefix}
+            if execute_horizon is not None:
+                result.update(inference_delay=delay, execute_horizon=execute_horizon,
+                              prefix_attention_horizon=H-execute_horizon)
+            return result
 
-    def merged(self, context, targets):
+    def merged(self, context, targets, now_ns=None):
         """Build a candidate while locked; caller validates it before publish."""
         if context["run_epoch"] != self.epoch or context["plan_revision"] != self.revision:
             raise RuntimeError("Obsolete RTC plan")
-        start = context["observation_tick"]
+        observation_ns = context['observation_perf_ns']
+        last = (observation_ns+(H-1)*PERIOD_NS-self.origin_ns)//PERIOD_NS
         cut = max(context["freeze_until"], self.committed_until, self.next_tick)
-        if len(targets) != H or cut >= start+H:
+        if now_ns is not None:
+            cut = max(cut, (now_ns-self.origin_ns)//PERIOD_NS+1)
+        if len(targets) != H or cut > last:
             raise RuntimeError("RTC response has no usable future")
         result = {t: v for t, v in self.targets.items() if self.next_tick <= t < cut}
-        result.update({start+i: v for i, v in enumerate(targets) if start+i >= cut})
-        if any(t not in result for t in range(self.next_tick, start+H)):
+        result.update({tick: sample_rows(targets, observation_ns, self.origin_ns+tick*PERIOD_NS)
+                       for tick in range(cut, last+1)})
+        if any(t not in result for t in range(self.next_tick, last+1)):
             raise RuntimeError("RTC splice would create a queue gap")
         return result
 
@@ -112,7 +276,8 @@ class Timeline:
         with self.lock:
             if tick != self.next_tick:
                 raise RuntimeError("RTC dispatch order mismatch")
-            self.targets.pop(tick, None)
+            self.history[tick] = self.targets.pop(tick)
+            self.history = {t: v for t, v in self.history.items() if t >= tick-H}
             self.next_tick += 1
 
 
@@ -138,8 +303,8 @@ class ObservationAssembler:
         if abs(stamps[0]-stamps[1]) > 75_000_000:
             raise RuntimeError("RTC camera pair skew exceeds 75 ms")
         with a.lock:
-            osc = copy.deepcopy(a._osc_snapshot)
-            published = a._log_feedback_snapshot.get("cache_published_perf_ns", 0)
+            osc = a._inference_snapshot() if hasattr(a, '_inference_snapshot') else copy.deepcopy(a._osc_snapshot)
+            published = osc.get('inference_cache_perf_ns', a._log_feedback_snapshot.get("cache_published_perf_ns", 0))
         monotonic_now = time.monotonic_ns()
         now = time.perf_counter_ns()
         session = osc.get("session") or {}
@@ -147,6 +312,8 @@ class ObservationAssembler:
             raise RuntimeError("RTC control session no longer belongs to this run")
         execution = osc.get("execution") or {}
         measured = osc.get('inference_observation')
+        if session.get('execution_mode') == 'hardware' and callable(getattr(a.osc,'sensor_sample',None)) and not measured:
+            raise RuntimeError('RTC measured TCP unavailable: '+str(osc.get('inference_observation_error') or 'waiting for measured joint FK'))
         pose = measured['pose'] if measured else execution.get("measured_tcp_pose")
         if not pose or not 0 <= now-published <= 100_000_000:
             raise RuntimeError("RTC requires fresh measured TCP; target fallback is prohibited")
@@ -160,7 +327,8 @@ class ObservationAssembler:
             stamp = measured['perf_ns']
             execution = dict(execution, feedback_age_s=measured['feedback_age_s'], measured_tcp_pose=pose)
             osc['execution'] = execution
-            osc['gripper'] = dict(osc.get('gripper') or {}, width_m=measured['gripper_width_m'])
+            if 'gripper_width_m' in measured:
+                osc['gripper'] = dict(osc.get('gripper') or {}, width_m=measured['gripper_width_m'])
         if session.get("execution_mode") == "hardware":
             health = {"read_perf_ns": now, "sample_perf_ns": stamp,
                       "sample_age_ms": (now-stamp)/1e6 if isinstance(stamp, int) else None,
@@ -176,6 +344,8 @@ class ObservationAssembler:
             if float(execution.get("feedback_age_s", math.inf)) > .1:
                 raise RuntimeError("RTC hardware feedback is stale")
             diagnostic = osc.get("gripper_observation") or {}
+            if measured and 'gripper_width_m' not in measured and now-diagnostic.get('received_perf_ns',0) > 150_000_000:
+                raise RuntimeError('RTC measured gripper has stopped updating')
             if diagnostic.get("error") or diagnostic.get("sdk_timestamp") is None:
                 raise RuntimeError("RTC requires timestamped measured gripper")
             marker = diagnostic["sdk_timestamp"]
@@ -213,7 +383,11 @@ class ObservationAssembler:
             raise RuntimeError(f"RTC image/TCP skew exceeds 150 ms (TCP age={(now-stamp)/1e6:.1f} ms, "
                                f"image ages={[round((now-t)/1e6, 1) for t in stamps]} ms)")
         observation = a._observation(osc, *frames)
-        return observation, copy.deepcopy(pose), osc, now
+        # TCP sample time is the reference epoch; retain camera exposure times
+        # separately rather than pretending capture and cache-read are identical.
+        osc['rtc_observation_times'] = {'observation_perf_ns': stamp,
+                                       'image_perf_ns': list(stamps), 'read_perf_ns': now}
+        return observation, copy.deepcopy(pose), osc, stamp
 
 
 class RtcRun:
@@ -230,8 +404,6 @@ class RtcRun:
         self.hold_confirmed = False
         self.authority_released = False
         self._hold_lock = threading.Lock()
-        self.delay_budget = .3
-        self.last_request_tick = 0
         self.last_dispatch_started = None
 
     def live(self):
@@ -302,16 +474,21 @@ class RtcRun:
         self.request_id += 1
         context["request_id"] = self.request_id
         started = time.perf_counter()
-        self.a._event("rtc_request", context=context, observation_state=observation["observation/state"], base_tcp=base)
+        self.a._event("rtc_request", context=context, observation_state=observation["observation/state"], base_tcp=base,
+                      observation_times=osc.get('rtc_observation_times'))
         response = self.policy.infer(dict(observation, rtc_context=context))
         if not self.live():
             return None
         elapsed = time.perf_counter()-started
         echo = response.get("rtc", {})
-        for key in ("version", "phase", "run_epoch", "request_id", "observation_tick", "plan_revision", "freeze_until"):
+        for key in ("version", "phase", "run_epoch", "request_id", "observation_tick", "plan_revision", "freeze_until",
+                    "observation_perf_ns", "timeline_origin_perf_ns", "freeze_until_perf_ns", "action_row0_offset_s"):
             if echo.get(key) != context[key]:
                 raise RuntimeError(f"RTC response identity mismatch: {key}")
-        expected_sampler = "bootstrap_normal" if context["phase"] == "bootstrap" else "rtc_vjp"
+        for key in ('inference_delay', 'execute_horizon', 'prefix_attention_horizon'):
+            if key in context and echo.get(key) != context[key]:
+                raise RuntimeError(f'RTC response timing mismatch: {key}')
+        expected_sampler = "bootstrap_hold_vjp" if context["phase"] == "bootstrap_hold" else "rtc_vjp"
         if echo.get("sampler") != expected_sampler:
             raise RuntimeError("RTC sampler mismatch; normal fallback is prohibited")
         rows = action_rows(response, H)
@@ -325,7 +502,9 @@ class RtcRun:
                                 inference_base_tcp=base, action_chunk_length=H, last_response_steps=H,
                                 inference_ms=elapsed*1000, chunk_sequence=self.a.state["chunk_sequence"]+1,
                                 protocol_compatibility={"status": "compatible", "message": "RTC 7D/H20 响应验证通过"})
-        self.a._event("rtc_response", context=context, elapsed_ms=elapsed*1000, server_timing=response.get("policy_timing"))
+        self.a._event("rtc_response", context=context, actions=rows, absolute_targets=[t.absolute_row() for t in targets],
+                      elapsed_ms=elapsed*1000, server_timing=response.get("policy_timing"),
+                      row_target_perf_ns=[context['observation_perf_ns']+i*PERIOD_NS for i in range(H)])
         self.publish(end_to_end_ms=elapsed*1000, sampler=echo["sampler"])
         return targets, elapsed
 
@@ -344,33 +523,77 @@ class RtcRun:
                 with self.timeline.lock:
                     tick = self.timeline.next_tick
                 deadline = self.t0+tick*PERIOD
+                wait_started_ns = time.perf_counter_ns()
                 if self.cancel.wait(max(0, deadline-time.perf_counter())):
                     return
+                wake_ns = time.perf_counter_ns()
+                wake_lateness_ms = (wake_ns/1e9-deadline)*1000
+                self.a._event("rtc_executor_timing", tick=tick, stage="woke",
+                              deadline_perf_s=deadline, wait_started_perf_ns=wait_started_ns,
+                              wake_perf_ns=wake_ns, wake_lateness_ms=wake_lateness_ms)
                 if time.perf_counter() >= deadline+PERIOD:
                     raise RuntimeError("RTC dispatch missed its 50 ms slot")
-                with self.a._row_lock:
-                    if not self.live():
-                        return
-                    if self.last_dispatch_started is not None and time.perf_counter()-self.last_dispatch_started < PERIOD/2:
-                        raise RuntimeError("RTC dispatch jitter would require a catch-up burst")
-                    tick, target = self.timeline.commit_next()
-                    started = time.perf_counter()
-                    self.last_dispatch_started = started
-                    result = self.a.osc.track_tcp(self.session, self.client, self.a._next_sequence(), target.pose())
-                    if not result.get("ok"):
-                        raise RuntimeError(f"RTC TCP rejected: {result}")
-                    if not self.live():
-                        return
-                    if time.perf_counter() >= deadline+PERIOD:
-                        raise RuntimeError("RTC TCP acknowledgement exceeded its slot")
-                    self.a._send_gripper_if_needed(self.session, self.client, target.gripper)
-                    if time.perf_counter() >= deadline+PERIOD:
-                        raise RuntimeError("RTC control dispatch exceeded its slot")
-                    self.timeline.complete(tick)
-                    self.a._event("rtc_dispatch", tick=tick, deadline_perf_s=deadline, started_perf_s=started,
-                                  completed_perf_s=time.perf_counter(), target_tcp=target.pose(), gripper_ratio=target.gripper)
-                    with self.a.lock:
-                        self.a.state["executed_steps"] += 1
+                dispatch_timing = {"tick": tick, "deadline_perf_s": deadline,
+                                   "wake_perf_ns": wake_ns,
+                                   "wake_lateness_ms": wake_lateness_ms,
+                                   "row_lock_requested_perf_ns": time.perf_counter_ns(),
+                                   "stage": "waiting_for_row_lock"}
+                try:
+                    with self.a._row_lock:
+                        dispatch_timing["row_lock_acquired_perf_ns"] = time.perf_counter_ns()
+                        dispatch_timing["row_lock_wait_ms"] = (
+                            dispatch_timing["row_lock_acquired_perf_ns"]-
+                            dispatch_timing["row_lock_requested_perf_ns"])/1e6
+                        dispatch_timing["stage"] = "row_lock_acquired"
+                        if not self.live():
+                            return
+                        if time.perf_counter() >= deadline+PERIOD:
+                            raise RuntimeError('RTC target expired while waiting for output lock')
+                        if self.last_dispatch_started is not None and time.perf_counter()-self.last_dispatch_started < PERIOD/2:
+                            raise RuntimeError("RTC dispatch jitter would require a catch-up burst")
+                        tick, target = self.timeline.commit_next()
+                        started = time.perf_counter()
+                        dispatch_timing["dispatch_started_perf_ns"] = time.perf_counter_ns()
+                        dispatch_timing["stage"] = "track_tcp"
+                        self.last_dispatch_started = started
+                        sequence_started_ns = time.perf_counter_ns()
+                        sequence = self.a._next_sequence()
+                        sequence_finished_ns = time.perf_counter_ns()
+                        dispatch_timing["next_sequence_started_perf_ns"] = sequence_started_ns
+                        dispatch_timing["next_sequence_finished_perf_ns"] = sequence_finished_ns
+                        dispatch_timing["next_sequence_ms"] = (sequence_finished_ns-sequence_started_ns)/1e6
+                        dispatch_timing["osc_client_call_started_perf_ns"] = time.perf_counter_ns()
+                        result = self.a.osc.track_tcp(self.session, self.client, sequence, target.pose())
+                        dispatch_timing["osc_client_call_returned_perf_ns"] = time.perf_counter_ns()
+                        dispatch_timing["osc_client_call_ms"] = (dispatch_timing["osc_client_call_returned_perf_ns"]-
+                                                                   dispatch_timing["osc_client_call_started_perf_ns"])/1e6
+                        dispatch_timing["track_tcp_returned_perf_ns"] = time.perf_counter_ns()
+                        dispatch_timing["track_tcp_ms"] = (dispatch_timing["track_tcp_returned_perf_ns"]-
+                                                             dispatch_timing["dispatch_started_perf_ns"])/1e6
+                        timing = result.get("track_tcp_timing") if isinstance(result, dict) else None
+                        if isinstance(timing, dict):
+                            self.a._event("osc_track_tcp_timing", tick=tick, **timing)
+                        if not result.get("ok"):
+                            raise RuntimeError(f"RTC TCP rejected: {result}")
+                        if not self.live():
+                            return
+                        if time.perf_counter() >= deadline+PERIOD:
+                            raise RuntimeError("RTC TCP acknowledgement exceeded its slot")
+                        dispatch_timing["stage"] = "gripper_enqueue"
+                        self.a._send_gripper_if_needed(self.session, self.client, target.gripper)
+                        if time.perf_counter() >= deadline+PERIOD:
+                            raise RuntimeError("RTC control dispatch exceeded its slot")
+                        self.timeline.complete(tick)
+                        dispatch_timing["stage"] = "completed"
+                        self.a._event("rtc_dispatch", tick=tick, deadline_perf_s=deadline, started_perf_s=started,
+                                      completed_perf_s=time.perf_counter(), target_tcp=target.pose(), gripper_ratio=target.gripper)
+                        with self.a.lock:
+                            self.a.state["executed_steps"] += 1
+                finally:
+                    dispatch_timing["finished_perf_ns"] = time.perf_counter_ns()
+                    dispatch_timing["total_ms"] = (dispatch_timing["finished_perf_ns"]-
+                                                    dispatch_timing["row_lock_requested_perf_ns"])/1e6
+                    self.a._event("rtc_dispatch_timing", **dispatch_timing)
                 with self.timeline.lock:
                     remaining = len(self.timeline.targets)
                 self.publish(next_tick=tick+1, queue_remaining_ms=remaining*50, state="RUNNING")
@@ -380,13 +603,16 @@ class RtcRun:
     def run(self):
         try:
             compatibility(self.policy.metadata, self.a.config["execution"])
-            self.publish(state="BOOTSTRAP", reason=None, manual_restart_required=False, hold_confirmed=False)
+            timing = RTCTiming.from_execution(self.a.config['execution'])
+            self.publish(state="BOOTSTRAP", reason=None, manual_restart_required=False, hold_confirmed=False,
+                inference_delay=timing.inference_delay, execute_horizon=timing.execute_horizon,
+                prefix_attention_horizon=H)
             # Startup publishes the session immediately; the independent SDK
             # cache poll may need one cycle before measured gripper is ready.
             ready_by = time.perf_counter()+1
             while self.live():
                 try:
-                    observation, base, osc, _ = self.assembler.read()
+                    observation, base, osc, stamp = self.assembler.read()
                     break
                 except RuntimeError:
                     if time.perf_counter() >= ready_by:
@@ -397,55 +623,105 @@ class RtcRun:
                 return
             self.health = threading.Thread(target=self._health_loop, name="nero-model-rtc-health", daemon=True)
             self.health.start()
-            context = {"version": VERSION, "phase": "bootstrap", "run_epoch": self.epoch, "request_id": 0,
-                       "observation_tick": 0, "plan_revision": 0, "freeze_until": 0,
-                       "period_s": PERIOD, "absolute_prefix": []}
+            self.timeline.origin_ns = stamp
+            self.t0 = stamp/1e9
+            initial_hold = Target.from_decoded((base, float(observation['observation/state'][6])))
+            self.timeline.seed([initial_hold]*H)
+            # The robot is actually holding while inference is in flight.
+            # Guide startup against that real stationary plan, rather than
+            # generating an unconstrained moving chunk and joining mid-motion.
+            context = {"version": VERSION, "phase": "bootstrap_hold", "run_epoch": self.epoch, "request_id": 0,
+                       "observation_tick": 0, "plan_revision": self.timeline.revision, "freeze_until": timing.inference_delay,
+                       "observation_perf_ns": stamp, "timeline_origin_perf_ns": stamp,
+                       "freeze_until_perf_ns": stamp+timing.inference_delay*PERIOD_NS, "action_row0_offset_s": 0,
+                       "inference_delay": timing.inference_delay, "execute_horizon": timing.execute_horizon,
+                       "prefix_attention_horizon": H,
+                       "period_s": PERIOD, "absolute_prefix": [initial_hold.absolute_row() for _ in range(H)]}
             result = self.infer(observation, base, osc, context)
             if result is None:
                 return
             targets, elapsed = result
-            _, current, _, _ = self.assembler.read()
+            if time.perf_counter_ns() > context['freeze_until_perf_ns']:
+                raise RuntimeError('RTC bootstrap inference_delay exceeded; remain in HOLD and increase configured delay')
+            current_observation, current, _, _ = self.assembler.read()
             if np.linalg.norm(np.subtract(base["position_m"], current["position_m"])) > .002 or orientation_distance(base["orientation_xyzw"], current["orientation_xyzw"]) > math.radians(.5):
                 raise RuntimeError("RTC bootstrap observation anchor moved; restart required")
-            self.delay_budget = max(.3, elapsed)
-            initial_delay = math.ceil(self.delay_budget/PERIOD)+1
-            if max(int(self.a.config["execution"].get("rtc_min_replan_steps", 6)), initial_delay)+initial_delay >= H:
-                raise RuntimeError("RTC bootstrap latency leaves insufficient H20 runway")
-            self.timeline.seed(targets)
+            if time.perf_counter_ns() >= stamp+(H-1)*PERIOD_NS:
+                raise RuntimeError("RTC bootstrap response has no future H20 targets")
+            hold_target = Target.from_decoded((current, float(current_observation['observation/state'][6])))
+            # Official splice: old HOLD, not approximately guided model rows,
+            # owns all slots before inference_delay. Check the actual seam.
+            targets = preserve_delay_prefix([hold_target]*H, targets, timing.inference_delay)
+            now_ns = time.perf_counter_ns()
+            self.timeline.seed(targets, now_ns, hold_target)
+            join_tick = max(self.timeline.next_tick, timing.inference_delay)
+            first_target = self.timeline.targets[join_tick]
+            position_gap = float(np.linalg.norm(np.subtract(current['position_m'], first_target.position)))
+            angle_gap = orientation_distance(current['orientation_xyzw'], first_target.quaternion)
+            bridge_end = None
+            if position_gap > .002 or angle_gap > math.radians(.5):
+                targets, bridge_end = bootstrap_bridge(targets, join_tick, hold_target, osc.get('limits') or {})
+                self.timeline.targets = {i: targets[i] for i in range(self.timeline.next_tick,H)}
+            self.validate_targets([hold_target, *targets[self.timeline.next_tick:]], osc)
+            self.publish(bootstrap_strategy='bounded_bridge' if bridge_end is not None else 'direct',
+                         bootstrap_position_gap_m=position_gap, bootstrap_orientation_gap_rad=angle_gap,
+                         bootstrap_bridge_end_tick=bridge_end)
+            self.a._event('rtc_bootstrap_alignment', observation_perf_ns=stamp,
+                          response_ready_perf_ns=now_ns, skipped_rows=self.timeline.next_tick,
+                          position_gap_m=position_gap, orientation_gap_rad=angle_gap,
+                          bridge_end_tick=bridge_end, scheduled_targets=[t.absolute_row() for t in targets],
+                          first_target_perf_ns=stamp+self.timeline.next_tick*PERIOD_NS)
+            # Replan immediately at the first future slot: bootstrap has already
+            # consumed latency out of its H20 horizon, so do not wait another K.
+            next_request_ns = None  # First asynchronous request is immediate.
             with self.a.lock:
                 if not self.live():
                     return
                 self.a.state.update(priming=False, execution_enabled=True, state="RUNNING")
-            self.t0 = time.perf_counter()+PERIOD
             self.executor = threading.Thread(target=self._execute, name="nero-model-rtc-executor", daemon=True)
             self.executor.start()
             while self.live():
-                delay = math.ceil(self.delay_budget/PERIOD)+1
-                interval = max(int(self.a.config["execution"].get("rtc_min_replan_steps", 6)), delay)
-                if interval+delay >= H:
-                    raise RuntimeError("RTC measured latency leaves insufficient H20 runway")
-                request_tick = self.last_request_tick+interval
-                if self.cancel.wait(max(0, self.t0+request_tick*PERIOD-time.perf_counter())):
+                if next_request_ns is not None and self.cancel.wait(max(0, (next_request_ns-time.perf_counter_ns())/1e9)):
                     break
+                request_started_ns = time.perf_counter_ns()
                 observation, base, osc, stamp = self.assembler.read()
-                observation_tick = max(request_tick, math.ceil((stamp/1e9-self.t0)/PERIOD))
-                context = self.timeline.context(observation_tick, delay, self.request_id+1)
-                actual_interval = observation_tick-self.last_request_tick
-                self.last_request_tick = observation_tick
+                # Upstream advances the OBSERVATION index by execute_horizon,
+                # not the later request-preparation clock. Wait for a genuine
+                # sample at that boundary; never rewrite its timestamp.
+                while next_request_ns is not None and stamp < next_request_ns:
+                    if self.cancel.wait(.002):
+                        return
+                    observation, base, osc, stamp = self.assembler.read()
+                observation_tick = (stamp-self.timeline.origin_ns)//PERIOD_NS
+                context = self.timeline.context(observation_tick, timing.inference_delay, self.request_id+1,
+                                                observation_ns=stamp, now_ns=time.perf_counter_ns(),
+                                                minimum_freeze_tick=0 if bridge_end is None else bridge_end+1,
+                                                execute_horizon=timing.execute_horizon)
                 result = self.infer(observation, base, osc, context)
                 if result is None:
                     break
                 targets, elapsed = result
-                if time.perf_counter() >= self.t0+context["freeze_until"]*PERIOD:
-                    raise RuntimeError("RTC response missed its frozen-prefix deadline")
+                if time.perf_counter_ns() > context['freeze_until_perf_ns']:
+                    raise RuntimeError('RTC inference_delay exceeded before splice; increase configured delay or reduce latency')
                 with self.timeline.lock:
-                    candidate = self.timeline.merged(context, targets)
+                    candidate = self.timeline.merged(context, targets, now_ns=time.perf_counter_ns())
                     ordered = [candidate[t] for t in sorted(candidate)]
+                    previous = self.timeline.history.get(self.timeline.next_tick-1)
+                    if previous is not None:
+                        ordered.insert(0, previous)
                     self.validate_targets(ordered, osc)
                     self.timeline.targets = candidate
                     self.timeline.revision += 1
-                self.delay_budget = max(self.delay_budget, elapsed)
-                self.publish(delay_slots=delay, replan_interval_steps=actual_interval, plan_revision=self.timeline.revision)
+                self.a._event('rtc_splice', inference_delay=timing.inference_delay,
+                    execute_horizon=timing.execute_horizon, prefix_attention_horizon=timing.prefix_attention_horizon,
+                    observation_perf_ns=stamp, freeze_until_perf_ns=context['freeze_until_perf_ns'],
+                    request_started_perf_ns=request_started_ns, next_request_perf_ns=stamp+timing.execute_horizon*PERIOD_NS,
+                    first_future_tick=min(candidate), last_future_tick=max(candidate),
+                    plan_revision=self.timeline.revision)
+                next_request_ns = stamp+timing.execute_horizon*PERIOD_NS
+                self.publish(inference_delay=timing.inference_delay, execute_horizon=timing.execute_horizon,
+                    prefix_attention_horizon=timing.prefix_attention_horizon,
+                    queue_remaining_ms=len(candidate)*50, plan_revision=self.timeline.revision)
         except Exception as exc:
             self.fail(f"RTC stopped: {exc}")
         finally:

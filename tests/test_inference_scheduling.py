@@ -20,6 +20,34 @@ class CountingBroker(_Broker):
         return r
 
 class SchedulingTests(unittest.TestCase):
+    def test_failed_poll_retains_only_unexpired_measurement_from_same_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a,camera,broker=self.make(tmp)
+            fail=threading.Event()
+            def refresh(snapshot):
+                if fail.is_set(): raise RuntimeError('temporary sensor read failure')
+                snapshot['inference_observation']={'perf_ns':time.perf_counter_ns(),
+                    'pose':{'position_m':[0,0,.3],'orientation_xyzw':[0,0,0,1]},
+                    'gripper_width_m':.05,'feedback_age_s':0.}
+                return snapshot
+            a._observation_source.refresh=refresh
+            def wait(predicate):
+                end=time.perf_counter()+1
+                while time.perf_counter()<end and not predicate():time.sleep(.002)
+                self.assertTrue(predicate())
+            try:
+                wait(lambda:'inference_observation' in a._osc_snapshot)
+                with a.lock:
+                    stamp=a._osc_snapshot['inference_observation']['perf_ns']
+                    fail.set()
+                wait(lambda:'inference_observation_error' in a._osc_snapshot)
+                self.assertEqual(a._osc_snapshot['inference_observation']['perf_ns'],stamp)
+                with a.lock:
+                    a._osc_snapshot['inference_observation']['perf_ns']=time.perf_counter_ns()-200_000_000
+                wait(lambda:'inference_observation' not in a._osc_snapshot)
+                self.assertIn('temporary sensor',a._osc_snapshot['inference_observation_error'])
+            finally:a.close()
+
     def test_active_camera_status_reads_metadata_not_driver_properties(self):
         from types import SimpleNamespace
         a=Pi05InputAdapter.__new__(Pi05InputAdapter)

@@ -100,6 +100,16 @@ class DirectCpvTests(unittest.TestCase):
         self.assertEqual(published["joint_target_rad"], result["final_joint_target_rad"])
         self.assertEqual(published["max_joint_acceleration_rad_s2"], 2.0)
 
+    def test_repeated_stop_does_not_reopen_confirmed_hold_or_demote_fault(self):
+        for state in ('HOLD_READY', 'FAULT'):
+            self.servo.trajectory_state = state
+            self.servo._invalidate_motion('repeated session cleanup')
+            self.assertEqual(self.servo.trajectory_state, state)
+            self.assertIsNone(self.servo.command)
+        self.servo.trajectory_state = 'RUNNING'
+        self.servo._invalidate_motion('moving stop still brakes')
+        self.assertEqual(self.servo.trajectory_state, 'BRAKING')
+
     def test_sender_uses_outer_cpv_bounds_without_changing_pink_bounds(self):
         requests = []
         solve = self.servo.solver.solve_current

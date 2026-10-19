@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
+from .inference_rtc_timing import RTCTiming
 
 SCHEMA = "nero.inference.v2"
 PROFILES = ("local5090", "autodl")
@@ -58,12 +59,13 @@ def canonical(config):
     execution = result.setdefault("execution", {})
     execution.pop('action_delta_scale', None)  # Drop retired settings on migration.
     execution.setdefault("mode", "normal")
-    execution.setdefault("rtc_min_replan_steps", 6)
+    # Retired adaptive scheduling is not an alias for execute_horizon.
+    execution.pop('rtc_min_replan_steps', None)
+    execution.setdefault('inference_delay', 8)
+    execution.setdefault('execute_horizon', 10)
     if execution["mode"] not in ("normal", "rtc"):
         raise ValueError("Unknown inference execution mode")
-    positive_integer(execution["rtc_min_replan_steps"], "RTC minimum replan steps")
-    if execution["rtc_min_replan_steps"] > 9:
-        raise ValueError("RTC minimum replan steps must be <=9 for H20")
+    RTCTiming.from_execution(execution)
     model = result.setdefault("model", {})
     legacy = result.get("schema_version") != SCHEMA
     horizon = execution.get("expected_chunk_steps", 10)
@@ -136,11 +138,12 @@ def prepare_update(config, request):
         if execution["mode"] not in ("normal", "rtc"):
             raise ValueError("Unknown inference execution mode")
         result["execution"]["mode"] = execution["mode"]
-    if "rtc_min_replan_steps" in execution:
-        steps = positive_integer(execution["rtc_min_replan_steps"], "RTC minimum replan steps")
-        if steps > 9:
-            raise ValueError("RTC minimum replan steps must be <=9 for H20")
-        result["execution"]["rtc_min_replan_steps"] = steps
+    if 'rtc_min_replan_steps' in execution:
+        raise ValueError('rtc_min_replan_steps is retired; use inference_delay and execute_horizon')
+    for key in ('inference_delay', 'execute_horizon'):
+        if key in execution:
+            result['execution'][key] = execution[key]
+    RTCTiming.from_execution(result['execution'])
     if result["execution"]["mode"] == "rtc" and preset["expected_chunk_steps"] != 20:
         raise ValueError("RTC requires H20; apply H=20 together with RTC mode")
     model = request.get("model", {})

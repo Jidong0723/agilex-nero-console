@@ -11,6 +11,16 @@
 | `raw/robot_states.jsonl` | 实测关节、速度、夹爪、实测/目标 TCP、反馈 revision 和控制样本标识 | 目标 50 Hz |
 | `raw/camera_frames.jsonl`、`raw/images` | 外部/腕部 RGB，独立保存和打时间戳 | 每路目标 20 Hz |
 
+当前 Dabai DC1 双路共用一个采集资源：DirectShow、640×480 YUY2、请求 30 Hz、
+手动曝光 −7，实测帧率通过独立时间戳统计。PICO 和模型推理消费同一缓存，不分别打开设备。
+记录器逐帧保存原生图像及各自时间戳，不强制成对、不补帧、不改成 50 ms 网格；
+`training_view_hz` 仍仅属于后处理契约。请求/协商帧率不代表实际采集频率，
+验收同时检查平均频率、最大帧间隔、生产序号缺口和写盘失败。
+可在控制及数采空闲时执行 `python -m scripts.camera_shared_acceptance --seconds 120 --output <独立诊断目录>`，
+它会暂时释放控制台相机、运行共享采集与 JPEG95 写盘负载，并恢复原先打开状态。
+曝光 −7 是在当前光照下与自动曝光画面比较后选择的固定值；光照明显变化时需重新校准。
+此驱动自动曝光期间的 `CAP_PROP_EXPOSURE` 可能保留上次手动值，不能直接照搬。
+
 `track_tcp` / `move_tcp` 在 OSC 入口已是**基座坐标系绝对位姿**：XYZ 单位 m，
 旋转为 XYZW 四元数。适配器内部的 delta、手柄消息、摇杆事件、推理 action chunk
 不属于该采集流。HOLD、停止、FREEDRIVE 和夹爪命令同样保留；心跳不作为运动输入。

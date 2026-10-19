@@ -23,6 +23,7 @@ from .inference_contract import metadata_compatibility, make_observation, action
 from .inference_connection import local_listener, loopback
 from .inference_rtc import run_adapter as run_rtc_adapter, compatibility as rtc_compatibility
 from .inference_preview import ObservationSource, preview_once
+from .inference_feedback import MeasuredTCPFeed
 
 
 LOGGER = logging.getLogger(__name__)
@@ -146,14 +147,31 @@ class Pi05InputAdapter:
         self._capture: RunCapture | None = None
         self._completed_capture: RunCapture | None = None
         self._pending_gripper: dict[str, Any] | None = None
+        # Gripper SDK calls are deliberately kept out of the 50 ms TCP
+        # dispatch path.  A slow CAN/SDK acknowledgement must not consume the
+        # next TCP slot; at most one not-yet-sent target is retained and newer
+        # targets replace it.
+        self._gripper_condition = threading.Condition()
+        self._gripper_stop = threading.Event()
+        self._gripper_job: dict[str, Any] | None = None
+        self._gripper_inflight_target: float | None = None
+        self._gripper_worker = threading.Thread(target=self._gripper_loop,
+                                                 name="nero-pi05-gripper",
+                                                 daemon=True)
         self._rtc_run = None
+        self._closing = False
         self._preview_busy = False
         self._observation_source = ObservationSource(self)
+        self._tcp_feed = (MeasuredTCPFeed(self._observation_source, self._feedback_context, self._osc_state_stop)
+                          if callable(getattr(self.osc, 'sensor_sample', None)) else None)
         self._gripper_observation_identity = None
         self._gripper_observation_cache: dict[str, Any] | None = None
         self.state: dict[str, Any] = self._new_state()
+        self._gripper_worker.start()
         self._connection_thread.start()
         self._osc_state_thread.start()
+        if self._tcp_feed:
+            self._tcp_feed.thread.start()
 
     def _new_state(self) -> dict[str, Any]:
         return {"preview": {"state": "WAITING", "error": None, "updated_at": None, "sequence": 0, "stale": True},
@@ -173,6 +191,7 @@ class Pi05InputAdapter:
                 # operator can distinguish floating-point round-off from a
                 # genuinely invalid policy output.
                 "gripper_ratio_diagnostic": None,
+                "gripper_transport": {"state": "idle", "error": None, "updated_at": None},
                 "decoded_first_target": None,
                 "websocket_diagnostics": {"connect_attempts": 0, "connect_successes": 0,
                                           "disconnects": 0, "ping_failures": 0,
@@ -186,6 +205,11 @@ class Pi05InputAdapter:
                 rtc_compatibility(metadata, self.config["execution"])
                 return {"status": "compatible", "message": "RTC 能力已确认；启动时验证实际 H20 响应"}
             except Exception as exc:
+                from .inference_rtc import VERSION
+                if metadata.get('rtc_version') != VERSION:
+                    return {'status': 'incompatible', 'message':
+                            f"云端 RTC 协议不兼容：当前 {metadata.get('rtc_version') or '未声明'}，需要 {VERSION}；请更新云端推理服务",
+                            'detail': str(exc)}
                 return {"status": "incompatible", "message": str(exc)}
         return status
 
@@ -227,6 +251,7 @@ class Pi05InputAdapter:
             result["camera_ready"] = shared["ready"]; result["frame_version"] = shared["frame_version"]
             result["camera"] = shared
             result["connections"] = copy.deepcopy(self._connections)
+            result['measured_tcp_feedback'] = self._tcp_feed.status() if self._tcp_feed else None
             capture = self._capture or self._completed_capture
             result['inference_log'] = capture.status() if capture else None
             result['log_export_ready'] = bool(self._completed_capture and self._completed_capture.status()['export_ready'])
@@ -235,21 +260,42 @@ class Pi05InputAdapter:
             preview = result['preview']
             preview['stale'] = bool(preview.get('stale') or not preview.get('updated_at') or time.time()-preview['updated_at'] > 1)
             result['chunk_stale'] = not result.get('chunk_updated_at') or time.time()-result['chunk_updated_at'] > 1
+            if self.config['execution'].get('mode') == 'rtc' and result['model_state'] == 'CONNECTED':
+                contract = self._metadata_status(result['policy_metadata'])
+                if contract['status'] == 'incompatible':
+                    result['protocol_compatibility'] = contract
             basic = (None if result['camera_ready'] and result['model_state'] == 'CONNECTED'
                      and result['protocol_compatibility']['status'] == 'compatible'
                      and result.get('last_response_steps') == self.config['execution']['expected_chunk_steps']
                      and not result['chunk_stale'] and not result.get('observation_wait_reason')
                      and result['preview'].get('state') != 'ERROR'
-                     else result.get('observation_wait_reason') or result['preview'].get('error') or '等待连接、有效观测和实际动作响应')
+                     else (result['protocol_compatibility']['message'] if result['protocol_compatibility']['status'] == 'incompatible' else None)
+                     or result.get('observation_wait_reason') or result['preview'].get('error') or '等待连接、有效观测和实际动作响应')
             control_busy = bool(result['execution_enabled'] or result['priming'] or self._changing_connection
                                 or result.get('rtc', {}).get('state') in {'STOPPING','HOLD_PENDING','HOLD_UNCONFIRMED'})
+            rtc_run = self._rtc_run
+            control_active = bool(result['execution_enabled'] or result['priming'])
+            old_run_pending = bool(rtc_run and not rtc_run.finished.is_set() and not control_active)
+            stop = result.get('control_stop') or {}
+            stop_unconfirmed = bool((rtc_run and not rtc_run.stop_confirmed and not control_active) or
+                                    stop.get('state') in {'HOLD_PENDING', 'HOLD_UNCONFIRMED'})
+            if stop_unconfirmed:
+                basic = '停止尚未确认，请点击“重试停止”；只读预览可继续'
+            elif old_run_pending:
+                basic = '等待旧控制请求退出；不会自动恢复控制'
+            elif result['preview'].get('control_valid') is False:
+                basic = result['preview'].get('warning') or '当前预测不适合执行，预览继续'
+            result['recovery'] = {'stop_required': stop_unconfirmed,
+                                  'old_run_pending': old_run_pending,
+                                  'can_stop': bool(stop_unconfirmed or result.get('last_error') or control_busy),
+                                  'can_restart': not basic and not control_busy}
             training = bool(result['policy_metadata'].get('training_contract_verified'))
             rtc = self.config['execution'].get('mode') == 'rtc'
             result['control_readiness'] = {
                 'shadow': {'allowed': not basic and not control_busy, 'reason': basic or ('控制正在运行或停止确认中' if control_busy else None)},
                 'hardware': {'allowed': not basic and not control_busy,
                              'reason': basic or ('控制正在运行或停止确认中' if control_busy else None)}}
-            result['training_notice'] = 'RTC训练时间对齐尚未核验；此信息不阻止手动启动控制' if rtc and not training else None
+            result['training_notice'] = '第0行=t_obs已由用户确认；完整训练产物溯源尚未核验，此信息不阻止手动启动控制' if rtc and not training else None
             return result
 
     def _camera_ui_snapshot(self, active: bool) -> dict[str, Any]:
@@ -504,6 +550,21 @@ class Pi05InputAdapter:
         if policy is not None:
             policy.close()
 
+    def _feedback_context(self):
+        with self.lock:
+            source = self._osc_snapshot
+            context = {'session': copy.deepcopy(source.get('session') or {})}
+            if context['session'].get('execution_mode') == 'shadow':
+                context['execution'] = copy.deepcopy(source.get('execution') or {})
+                context['diagnostics'] = {'shadow_transport': copy.deepcopy(
+                    (source.get('diagnostics') or {}).get('shadow_transport') or {})}
+            return context
+
+    def _inference_snapshot(self):
+        with self.lock:
+            snapshot = copy.deepcopy(self._osc_snapshot)
+        return self._tcp_feed.attach(snapshot) if self._tcp_feed else snapshot
+
     def _osc_state_loop(self) -> None:
         """Refresh OSC feedback independently from inference and UI state reads."""
         period_s = max(0.02, float((self.config.get("execution") or {}).get("osc_state_poll_s", 0.05)))
@@ -512,17 +573,37 @@ class Pi05InputAdapter:
         while not self._osc_state_stop.is_set():
             poll_ns = time.perf_counter_ns()
             try:
-                snapshot = self.osc.state()
+                # Feedback refresh only needs the session and the latest
+                # measured execution sample. Full osc.state() includes
+                # solver/transport diagnostics and can block target ingress.
+                fast_state = getattr(self.osc, "fast_state", None)
+                snapshot = fast_state() if callable(fast_state) else self.osc.state()
                 returned_ns = time.perf_counter_ns()
                 try:
-                    snapshot = self._observation_source.refresh(snapshot)
+                    if self._tcp_feed:
+                        snapshot = self._tcp_feed.attach(snapshot)
+                    else:
+                        snapshot = self._observation_source.refresh(snapshot)
                     with self.lock:
                         self.state['observation_wait_reason'] = None
                 except Exception as observation_error:
                     with self.lock:
                         self.state['observation_wait_reason'] = str(observation_error)
+                        prior = self._osc_snapshot
+                        identity = lambda s: tuple((s.get('session') or {}).get(k) for k in ('id','client_id','execution_mode'))
+                        measured = prior.get('inference_observation') or {}
+                        stamp = measured.get('perf_ns')
+                        if (identity(prior) == identity(snapshot) and isinstance(stamp,int)
+                                and 0 <= time.perf_counter_ns()-stamp <= 100_000_000):
+                            # Retain only the timestamped real measurement.
+                            # Never refresh its age or replace it with HOLD's
+                            # frozen execution sample after one failed poll.
+                            snapshot['inference_observation'] = copy.deepcopy(measured)
+                    snapshot['inference_observation_error'] = str(observation_error)
                 snapshot = self._refresh_gripper_observation(snapshot)
                 publish_ns = time.perf_counter_ns()
+                if not self._tcp_feed:
+                    snapshot['inference_cache_perf_ns'] = publish_ns
                 observed = snapshot.get('inference_observation') or {}
                 observation_timing = dict(observed.get('timing') or {})
                 if observation_timing:
@@ -551,7 +632,7 @@ class Pi05InputAdapter:
             deadline += period_s
             now = time.perf_counter()
             if deadline < now:
-                deadline += (int((now-deadline)/period_s)+1)*period_s
+                deadline = now
             self._osc_state_stop.wait(max(0.,deadline-time.perf_counter()))
 
     def _refresh_gripper_observation(self, snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -560,7 +641,7 @@ class Pi05InputAdapter:
         with self.lock:
             participates = (identity == (self.state.get('session_id'),self.state.get('client_id'))
                 and bool(self.state.get('execution_enabled') or self.state.get('priming')))
-        if not participates or session.get('state') != 'ACTIVE' or session.get('execution_mode') != 'hardware':
+        if session.get('execution_mode') == 'shadow':
             self._gripper_observation_cache = None
             self._gripper_observation_identity = None
             return snapshot
@@ -580,11 +661,13 @@ class Pi05InputAdapter:
             old_marker = self._gripper_sdk_marker(self._gripper_observation_cache or {})
             if old_marker is None or marker > old_marker:
                 self._gripper_observation_cache = copy.deepcopy(candidate)
+                self._gripper_received_perf_ns = time.perf_counter_ns()
                 diagnostic['new_sdk_feedback'] = True
             elif marker < old_marker:
                 diagnostic['error'] = 'SDK gripper timestamp regressed; previous feedback retained'
             diagnostic['sdk_timestamp'] = self._gripper_sdk_marker(self._gripper_observation_cache or {})
             diagnostic['width_m'] = (self._gripper_observation_cache or {}).get('width_m')
+            diagnostic['received_perf_ns'] = getattr(self, '_gripper_received_perf_ns', 0)
         except Exception as exc:
             diagnostic['error'] = f'{type(exc).__name__}: {exc}'
             self._event('gripper_observation_error',**diagnostic)
@@ -696,7 +779,7 @@ class Pi05InputAdapter:
                     raise RuntimeError("Stop RTC output before changing model settings")
                 switch = ("inference_profile" in value or "policy_endpoint" in value or "model" in value
                           or "expected_chunk_steps" in execution or "replan_steps" in execution
-                          or "mode" in execution or "rtc_min_replan_steps" in execution)
+                          or "mode" in execution or "inference_delay" in execution or "execute_horizon" in execution)
                 cameras = value.get("cameras")
                 if cameras is not None:
                     if not isinstance(cameras, dict):
@@ -748,6 +831,8 @@ class Pi05InputAdapter:
             return self.snapshot()
 
     def start(self, session_id: str, client_id: str) -> dict[str, Any]:
+        if (self.state.get('control_stop') or {}).get('state') in {'HOLD_PENDING', 'HOLD_UNCONFIRMED'}:
+            raise RuntimeError('Previous control HOLD is unconfirmed; retry stop first')
         previous_rtc = self._rtc_run
         if previous_rtc and (not previous_rtc.finished.is_set() or not previous_rtc.stop_confirmed):
             raise RuntimeError("Previous RTC run is still exiting or HOLD is unconfirmed")
@@ -778,6 +863,8 @@ class Pi05InputAdapter:
         with self.lock:
             if self._changing_connection or startup_revision != self._run_revision:
                 raise RuntimeError('Inference startup cancelled or connection changed')
+            if (self.state.get('control_stop') or {}).get('state') in {'HOLD_PENDING', 'HOLD_UNCONFIRMED'}:
+                raise RuntimeError('Previous control HOLD is unconfirmed; retry stop first')
             if self._capture is not None: raise RuntimeError('Inference output already started')
             self._osc_snapshot = published
             self._publish_logging_feedback(osc)
@@ -785,6 +872,7 @@ class Pi05InputAdapter:
             if session.get("state") != "ACTIVE" or session.get("id") != session_id or session.get("client_id") != client_id:
                 raise PermissionError("Model inference requires the caller's active OSC session")
             rtc = self.config["execution"].get("mode") == "rtc"
+            self._cancel_queued_gripper('new control run')
             self._last_gripper_target = None
             self._run_revision += 1
             self._wait_cancel = threading.Event()
@@ -794,6 +882,8 @@ class Pi05InputAdapter:
                     {'session':session,'config':copy.deepcopy(self.config)},self._logging_feedback)
             except Exception as exc: self.state['log_error'] = f'{type(exc).__name__}: {exc}'
             needs_priming = rtc or session.get("execution_mode") == "hardware"
+            if self.state.get('last_error'):
+                self.state['last_control_error'] = self.state['last_error']
             self.state.update({"state": "PRIMING" if needs_priming else "RUNNING",
                                "execution_enabled": not needs_priming, "priming": needs_priming,
                                "session_id": session_id, "client_id": client_id,
@@ -843,6 +933,7 @@ class Pi05InputAdapter:
             self.state.update({"state": "RUNNING" if self.state.get("state") == "PRIMING" else self.state.get("state"),
                                "execution_enabled": False, "priming": False, "updated_at": time.time()})
             rtc_run = self._rtc_run
+        self._cancel_queued_gripper(reason)
         if rtc_run and not rtc_run.stop_confirmed:
             with self.lock:
                 self.state.setdefault("rtc", {}).update(state="STOPPING", hold_confirmed=False)
@@ -858,15 +949,36 @@ class Pi05InputAdapter:
                     self.state.setdefault("rtc", {}).update(state="HOLD_UNCONFIRMED", hold_confirmed=False)
                     self.state["last_error"] = f"RTC stop unconfirmed: {exc}"
                 raise
-        if was_active and (rtc_run is None or self.config['execution'].get('mode') != 'rtc') and session_id and client_id:
+        retry_hold = (self.state.get('control_stop') or {}).get('state') in {'HOLD_PENDING', 'HOLD_UNCONFIRMED'}
+        if (was_active or retry_hold) and (rtc_run is None or self.config['execution'].get('mode') != 'rtc'):
+            self._confirm_nonrtc_hold(session_id, client_id, reason)
+        with self._row_lock: self._finish_capture(reason)
+        with self.lock:
+            if self.state.get('last_error'):
+                self.state['last_control_error'] = self.state['last_error']
+            self.state.update(state='RUNNING', last_error=None, last_rejection=None)
+        if not self._closing and not self._connection_stop.is_set():
+            self._ensure_worker()
+        return self.snapshot()
+
+    def _confirm_nonrtc_hold(self, session_id, client_id, reason):
+        with self.lock:
+            self.state['control_stop'] = {'state': 'HOLD_PENDING', 'reason': reason}
+        try:
             with self._row_lock:
                 current = self.osc.state().get('session') or {}
-                if (current.get('id'), current.get('client_id')) == (session_id, client_id):
+                owned = (current.get('id'), current.get('client_id')) == (session_id, client_id) and session_id is not None
+                if owned:
                     result = self.osc.hold(session_id, client_id, self._next_sequence(), reason)
                     if not result.get('ok'):
                         raise RuntimeError('Control HOLD not confirmed')
-        with self._row_lock: self._finish_capture(reason)
-        return self.snapshot()
+            with self.lock:
+                self.state['control_stop'] = {'state': 'HOLD' if owned else 'RELEASED', 'reason': reason,
+                                              'hold_confirmed': owned, 'authority_released': not owned}
+        except Exception as exc:
+            with self.lock:
+                self.state['control_stop'] = {'state': 'HOLD_UNCONFIRMED', 'reason': str(exc), 'hold_confirmed': False}
+            raise
 
     def _prime_startup_hold(self, session_id: str, client_id: str, revision: int | None = None) -> bool:
         """Send one zero-motion target before releasing Model actions."""
@@ -922,7 +1034,7 @@ class Pi05InputAdapter:
         # The AutoDL training state is expressed directly in the NERO base
         # frame.  Do not apply LIBERO axis flips or arbitrary normalisation.
         rotvec = _quaternion_rotvec(_finite(pose.get("orientation_xyzw"), 4, "TCP orientation"))
-        gripper = observed['gripper_width_m'] if observed else (osc.get("gripper") or {}).get("width_m")
+        gripper = (observed or {}).get('gripper_width_m', (osc.get("gripper") or {}).get("width_m"))
         if gripper is None:
             raise ObservationNotReady('waiting for measured gripper opening')
         minimum = float(self.config["gripper"]["min_width_m"])
@@ -974,9 +1086,9 @@ class Pi05InputAdapter:
         )
 
     def _target_from_action(self, action: Any, base: dict[str, Any],
-                            action_index: int | None = None) -> tuple[dict[str, Any], float]:
+                            action_index: int | None = None, *, preview_only: bool = False) -> tuple[dict[str, Any], float]:
         values = _finite(action, 7, "AutoDL Nero action")
-        gripper_ratio = self._normalise_gripper_ratio(values[6], action_index)
+        gripper_ratio = min(1., max(0., values[6])) if preview_only else self._normalise_gripper_ratio(values[6], action_index)
         delta, rotvec = values[:3], values[3:6]
         position = [float(base["position_m"][i]) + delta[i] for i in range(3)]
         orientation = _quat_product(_rotvec_quaternion(rotvec), _finite(base["orientation_xyzw"], 4, "TCP orientation"))
@@ -1014,40 +1126,151 @@ class Pi05InputAdapter:
                 raise RuntimeError(f"Model target {index} is outside the OSC workspace")
 
     def _send_gripper_if_needed(self, session_id: str, client_id: str, action_value: float) -> None:
-        """Send the trained continuous gripper opening target when it changes."""
+        """Queue the trained gripper target without blocking TCP dispatch.
+
+        The physical command is submitted by ``_gripper_loop``.  This method
+        is called while the RTC row lock is held, so it must remain a bounded
+        bookkeeping operation and never wait for the SDK/CAN response.
+        """
         minimum, maximum = float(self.config["gripper"]["min_width_m"]), float(self.config["gripper"]["max_width_m"])
         target_width = minimum + float(action_value) * (maximum - minimum)
         tolerance = float(self.config["gripper"].get("dedupe_tolerance_ratio", 0.01)) * (maximum - minimum)
-        if isinstance(self._last_gripper_target, (int, float)) and abs(float(self._last_gripper_target) - target_width) <= tolerance:
-            return
-        sequence = self._next_sequence()
-        started_ns = time.perf_counter_ns()
         with self.lock:
             shadow = self.state.get('execution_mode') == 'shadow'
             revision = self._run_revision
-        self._event('gripper_request',sequence=sequence,width_m=target_width,opening_ratio=action_value,
-                    mode='simulated' if shadow else 'position_inference')
-        result = {'ok':True,'result':{'sent':False,'simulated':True,'feedback_pending':False}} if shadow else self.osc.gripper(session_id, client_id, sequence, {
-            "mode": "position_inference", "width_m": target_width,
-            "force_n": self.config["gripper"]["force_n"],
-        })
-        self._event('gripper_return',sequence=sequence,width_m=target_width,result=result,
-                    started_perf_ns=started_ns,duration_ms=(time.perf_counter_ns()-started_ns)/1e6)
-        if not result.get("ok"):
-            raise RuntimeError(f"Model gripper command rejected: {result}")
-        receipt = result.get('result') or {}
-        if not shadow and not receipt.get('sent'):
-            raise RuntimeError(f"Model gripper was not sent: {result}")
-        with self.lock:
-            if revision != self._run_revision or not self.state.get('execution_enabled'): return
-            self._cancel_pending_gripper('replaced by new target')
-            self._last_gripper_target = target_width
+            last_target = self._last_gripper_target
+        if isinstance(last_target, (int, float)) and abs(float(last_target) - target_width) <= tolerance:
+            return
+
+        if shadow:
+            # Shadow mode intentionally preserves its immediate, simulated
+            # confirmation and never starts a physical SDK call.
+            sequence = self._next_sequence()
+            started_ns = time.perf_counter_ns()
+            self._event('gripper_request', sequence=sequence, width_m=target_width,
+                        opening_ratio=action_value, mode='simulated')
             confirmation = {'sequence':sequence,'target_width_m':target_width,'sent_perf_ns':started_ns,
-                'status':'simulated' if shadow else 'pending_feedback','health_confirmed':False,
-                'target_reached':None,'session_id':session_id,'client_id':client_id,'run_revision':revision,
+                'status':'simulated','health_confirmed':False,'target_reached':None,
+                'session_id':session_id,'client_id':client_id,'run_revision':revision,
+                'last_sdk_marker':None}
+            with self.lock:
+                if revision != self._run_revision or not self.state.get('execution_enabled'):
+                    return
+                self._last_gripper_target = target_width
+                self.state['gripper_confirmation'] = copy.deepcopy(confirmation)
+            return
+
+        job = {'session_id': session_id, 'client_id': client_id,
+               'action_value': float(action_value), 'target_width_m': target_width,
+               'revision': revision, 'queued_perf_ns': time.perf_counter_ns()}
+        with self._gripper_condition:
+            queued = self._gripper_job
+            inflight = self._gripper_inflight_target
+            if ((queued and abs(float(queued['target_width_m']) - target_width) <= tolerance)
+                    or (inflight is not None and abs(inflight - target_width) <= tolerance)):
+                return
+            self._gripper_job = job
+            self._gripper_condition.notify()
+        if queued:
+            self._event('gripper_coalesced', old_width_m=queued['target_width_m'],
+                        new_width_m=target_width, reason='newer target replaced unsent command')
+        with self.lock:
+            transport = self.state.setdefault('gripper_transport', {})
+            transport.update({'state': 'queued', 'error': None, 'updated_at': time.time(),
+                              'target_width_m': target_width})
+
+    def _cancel_queued_gripper(self, reason: str) -> None:
+        """Drop an unsent command; an SDK call already in progress is stale."""
+        with self._gripper_condition:
+            job = self._gripper_job
+            self._gripper_job = None
+            self._gripper_condition.notify()
+        if job:
+            self._event('gripper_queue_cancelled', width_m=job['target_width_m'], reason=reason)
+
+    def _gripper_loop(self) -> None:
+        """Submit gripper commands independently of the TCP/RTC scheduler."""
+        while not self._gripper_stop.is_set():
+            with self._gripper_condition:
+                while self._gripper_job is None and not self._gripper_stop.is_set():
+                    self._gripper_condition.wait(.1)
+                if self._gripper_stop.is_set():
+                    return
+                job = self._gripper_job
+                self._gripper_job = None
+                self._gripper_inflight_target = float(job['target_width_m']) if job else None
+            if job is not None:
+                self._dispatch_gripper(job)
+            with self._gripper_condition:
+                self._gripper_inflight_target = None
+
+    def _dispatch_gripper(self, job: dict[str, Any]) -> None:
+        session_id, client_id = job['session_id'], job['client_id']
+        with self.lock:
+            live = (job['revision'] == self._run_revision and
+                    bool(self.state.get('execution_enabled')) and
+                    self.state.get('session_id') == session_id and
+                    self.state.get('client_id') == client_id)
+        if not live:
+            self._event('gripper_queue_cancelled', width_m=job['target_width_m'], reason='run changed before send')
+            return
+        sequence = self._next_sequence()
+        started_ns = time.perf_counter_ns()
+        self._event('gripper_request', sequence=sequence, width_m=job['target_width_m'],
+                    opening_ratio=job['action_value'], mode='position_inference')
+        try:
+            result = self.osc.gripper(session_id, client_id, sequence, {
+                "mode": "position_inference", "width_m": job['target_width_m'],
+                "force_n": self.config["gripper"]["force_n"],
+            })
+        except Exception as exc:
+            result = {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
+        duration_ms = (time.perf_counter_ns() - started_ns) / 1e6
+        self._event('gripper_return', sequence=sequence, width_m=job['target_width_m'],
+                    result=result, started_perf_ns=started_ns, duration_ms=duration_ms)
+        ok = bool(result.get('ok'))
+        receipt = result.get('result') or {}
+        if ok and not receipt.get('sent'):
+            ok = False
+        with self.lock:
+            still_live = (job['revision'] == self._run_revision and
+                           bool(self.state.get('execution_enabled')))
+            transport = self.state.setdefault('gripper_transport', {})
+            transport.update({'state': 'sent' if ok else 'rejected',
+                              'error': None if ok else ('command rejected' if result.get('ok') else result.get('error')),
+                              'updated_at': time.time(), 'duration_ms': duration_ms,
+                              'target_width_m': job['target_width_m']})
+        if not still_live:
+            return
+        if not ok:
+            reason = f"Model gripper command rejected: {result}" if not result.get('ok') \
+                     else f"Model gripper was not sent: {result}"
+            # RTC owns its own HOLD/release state machine.  Route an
+            # asynchronous submission failure through it instead of the
+            # ordinary chunk rejection path, otherwise the TCP run could be
+            # marked ERROR while the RTC card incorrectly remains RUNNING.
+            rtc_run = self._rtc_run
+            if (self.config['execution'].get('mode') == 'rtc' and rtc_run is not None
+                    and rtc_run.epoch == job['revision']):
+                with self.lock:
+                    self.state['last_rejection'] = reason
+                rtc_run.fail(reason)
+                return
+            self._reject_chunk(session_id, client_id, reason,
+                               expected_revision=(self._connection_revision, job['revision']))
+            return
+        with self.lock:
+            if job['revision'] != self._run_revision or not self.state.get('execution_enabled'):
+                return
+            self._cancel_pending_gripper('replaced by new target')
+            self._last_gripper_target = job['target_width_m']
+            confirmation = {'sequence':sequence,'target_width_m':job['target_width_m'],
+                'sent_perf_ns':started_ns,'status':'pending_feedback','health_confirmed':False,
+                'target_reached':None,'session_id':session_id,'client_id':client_id,
+                'run_revision':job['revision'],
                 'last_sdk_marker':self._gripper_sdk_marker(receipt.get('before') or {})}
             self.state['gripper_confirmation'] = copy.deepcopy(confirmation)
-            if not shadow: self._pending_gripper = confirmation
+            self._pending_gripper = confirmation
 
     @staticmethod
     def _gripper_sdk_marker(gripper: dict[str, Any]) -> Any:
@@ -1117,19 +1340,28 @@ class Pi05InputAdapter:
                                "last_error": reason, "last_rejection": reason,
                                "updated_at": time.time()})
             self._cancel_pending_gripper(reason)
-            self.stop_event.set()
+            self.state['priming'] = False
+            self._run_revision += 1
             self._wait_cancel.set()
         if session_id and client_id:
             try:
-                self.osc.hold(str(session_id), str(client_id), sequence, reason)
-            except Exception:
-                pass
+                self._confirm_nonrtc_hold(session_id, client_id, reason)
+            except Exception as exc:
+                with self.lock:
+                    self.state['stop_error'] = str(exc)
         self._finish_capture(reason)
 
     def _run(self) -> None:
         if self.config["execution"].get("mode") == "rtc":
             run_rtc_adapter(self)
             return
+        # Control failures end one run, not the read-only prediction worker.
+        lifetime = self.stop_event
+        while not lifetime.is_set():
+            self._run_normal()
+            lifetime.wait(.05)
+
+    def _run_normal(self) -> None:
         policy = None
         try:
             while not self.stop_event.is_set():
@@ -1177,7 +1409,7 @@ class Pi05InputAdapter:
                     # complete RGB pair instead of terminating AutoDL
                     # inference with a misleading ERROR state.
                     with self.lock:
-                        self.state.update({"camera_state": "WAITING", "last_error": None,
+                        self.state.update({"camera_state": "WAITING",
                                            "camera_wait_reason": f"waiting for complete RGB pair: {type(exc).__name__}: {exc}",
                                            "updated_at": time.time()})
                     self.stop_event.wait(.1)
@@ -1347,31 +1579,45 @@ class Pi05InputAdapter:
             with self.lock:
                 session_id, client_id = self.state.get("session_id"), self.state.get("client_id")
                 needs_hold = bool(self.state.get('execution_enabled') or self.state.get('priming'))
+                if needs_hold:
+                    self.state['control_stop'] = {'state': 'HOLD_PENDING', 'reason': 'Model inference failed'}
                 self.state.update(execution_enabled=False, priming=False)
                 if self.stop_event.is_set() and self.state.get("state") != "ERROR":
                     self.state["state"] = "IDLE"
                 self.state["updated_at"] = time.time()
             if needs_hold and session_id and client_id and not self.stop_event.is_set():
                 try:
-                    owner = self.osc.state().get('session') or {}
-                    if (owner.get('id'),owner.get('client_id')) == (session_id,client_id):
-                        self.osc.hold(str(session_id), str(client_id), self._next_sequence(), "Model inference failed")
-                except Exception:
-                    pass
+                    self._confirm_nonrtc_hold(session_id, client_id, "Model inference failed")
+                except Exception as exc:
+                    with self.lock:
+                        self.state['stop_error'] = str(exc)
 
     def close(self) -> None:
+        self._closing = True
         self.stop_event.set()
-        self.stop("service closing")
+        try:
+            self.stop("service closing")
+        except Exception as exc:
+            # Retain the failure, but still terminate all input producers.
+            with self.lock:
+                self.state['stop_error'] = str(exc)
         self._connection_stop.set()
         self._osc_state_stop.set()
+        self._gripper_stop.set()
+        with self._gripper_condition:
+            self._gripper_condition.notify_all()
         if self._connection_thread is not threading.current_thread():
             self._connection_thread.join(timeout=1.0)
         if self._osc_state_thread is not threading.current_thread():
             self._osc_state_thread.join(timeout=1.0)
+        if self._tcp_feed and self._tcp_feed.thread is not threading.current_thread():
+            self._tcp_feed.thread.join(timeout=2.0)
         with self.lock:
             worker = self.worker
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=2.0)
+        if self._gripper_worker is not threading.current_thread():
+            self._gripper_worker.join(timeout=2.0)
         with self.lock:
             policy = self._policy
             self._policy = None

@@ -45,6 +45,7 @@
   })();
 
   const state = {
+    pi05StartupError: null,
     status: null,
     osc: null,
     broker: null,
@@ -442,8 +443,13 @@
     const note = document.querySelector(".osc-panel .section-note");
     if (note) note.textContent = pi ? "模型推理会查看两路相机画面，按起点相对 Nero Chunk 自动生成并执行下一步机械臂动作。" : pico ? "用 PICO 手柄遥控机械臂：按住右手 Grip 才会移动，松开即停止。" : "用网页摇杆控制机械臂；系统会自动把摇杆动作变成机械臂末端的目标位置。";
     if (pi || pico) {
-      void loadSharedCameras();
-      if (!state.cameras?.ready) void activateSharedCameras();
+      const adapter = selectedAdapter();
+      // Populate both selectors before opening: an empty select coerces to
+      // index 0 and can accidentally open the external camera twice.
+      void (async () => {
+        await loadSharedCameras();
+        if (selectedAdapter() === adapter && !state.cameras?.ready) await activateSharedCameras();
+      })();
     }
     render();
   }
@@ -767,7 +773,7 @@
     $("pi05-stop").disabled = pi.execution_enabled !== true;
     $("pi05-start").textContent = "开始推理控制";
     $("pi05-stop").textContent = "停止推理控制";
-    window.NeroInferencePanel.render(pi,{osc:state.osc});
+    window.NeroInferencePanel.render(pi,{osc:state.osc,startupError:state.pi05StartupError});
     if (inferenceStartup.busy) {
       $("pi05-start").disabled = true;
       $("pi05-stop").disabled = false;
@@ -777,10 +783,18 @@
     }
   }
 
-  function cameraConfigBody() { return { cameras: {
-    external: { index: Number($(selectedAdapter() === "pico" ? "pico-external-index" : "pi05-external-index")?.value), width: 640, height: 480 },
-    wrist: { index: Number($(selectedAdapter() === "pico" ? "pico-wrist-index" : "pi05-wrist-index")?.value), width: 640, height: 480 },
-  }}; }
+  function cameraConfigBody() {
+    const prefix = selectedAdapter() === "pico" ? "pico" : "pi05";
+    const saved = state.cameras?.config || state.pi05?.config?.cameras || {};
+    const index = (source, fallback) => {
+      const value = $(`${prefix}-${source}-index`)?.value;
+      return value == null || value === "" ? Number(saved[source]?.index ?? fallback) : Number(value);
+    };
+    return { cameras: {
+      external: { index: index("external", 0), width: 640, height: 480 },
+      wrist: { index: index("wrist", 1), width: 640, height: 480 },
+    }};
+  }
 
   async function loadSharedCameras() {
     const selectionVersion = state.cameraSelectionVersion || 0;
@@ -1506,6 +1520,7 @@
   const inferenceStartup = window.NeroInferenceStartup.create();
   async function startPi05() {
     if (inferenceStartup.busy || !window.NeroInferencePanel.canStart()) return;
+    state.pi05StartupError = null;
     try {
       const desiredPrompt = ($("pi05-prompt")?.value || "").trim();
       const existing = state.pi05?.config;
@@ -1521,15 +1536,25 @@
         ? "影子推理控制已开始，模型动作交给虚拟机械臂执行"
         : "真机推理控制已开始，模型动作交给 OSC 执行");
       render();
-    } catch (error) { phase(`模型推理启动失败：${error.message}`, true); await refresh(); }
+    } catch (error) {
+      state.pi05StartupError = `模型推理启动失败：${error.message}`;
+      phase(state.pi05StartupError, true);
+      await refresh();
+      renderPi05();
+    }
   }
 
   async function stopPi05() {
     if (inferenceStartup.busy) { inferenceStartup.cancel(); renderPi05(); }
     try {
       state.pi05 = await api("/api/pi05/stop", "POST", { reason: "operator stopped pi05 adapter" });
+      state.pi05StartupError = null;
       phase("控制已停止，动作预览继续"); render();
-    } catch (error) { phase(`模型推理停止失败：${error.message}`, true); }
+    } catch (error) {
+      state.pi05StartupError = `停止确认失败：${error.message}；请重试停止`;
+      phase(state.pi05StartupError, true);
+      await refresh(); renderPi05();
+    }
   }
 
   function stopWebAdapterForPageExit(reason) {
