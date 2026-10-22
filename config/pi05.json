@@ -24,11 +24,11 @@
     "startup_hold_s": 0.3,
     "arrival_wait_s": 0.1,
     "mode": "rtc",
-    "inference_delay": 6,
+    "inference_delay": 5,
     "execute_horizon": 6
   },
   "inference_profiles": {
-    "active": "autodl",
+    "active": "local5090",
     "autodl": {
       "host": "127.0.0.1",
       "port": 18762,
@@ -38,10 +38,10 @@
     },
     "local5090": {
       "host": "127.0.0.1",
-      "port": 8000,
+      "port": 8002,
       "checkpoint_label": "NERO 11649 H10",
-      "expected_chunk_steps": 10,
-      "replan_steps": 5
+      "expected_chunk_steps": 20,
+      "replan_steps": 10
     }
   },
   "gripper": {

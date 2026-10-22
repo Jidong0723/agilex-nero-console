@@ -24,6 +24,7 @@ from .inference_connection import local_listener, loopback
 from .inference_rtc import run_adapter as run_rtc_adapter, compatibility as rtc_compatibility
 from .inference_preview import ObservationSource, preview_once
 from .inference_feedback import MeasuredTCPFeed
+from .inference_gripper_feedback import GripperFeedbackCache
 
 
 LOGGER = logging.getLogger(__name__)
@@ -637,44 +638,18 @@ class Pi05InputAdapter:
 
     def _refresh_gripper_observation(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         session = snapshot.get('session') or {}
-        identity = (session.get('id'),session.get('client_id'))
-        with self.lock:
-            participates = (identity == (self.state.get('session_id'),self.state.get('client_id'))
-                and bool(self.state.get('execution_enabled') or self.state.get('priming')))
         if session.get('execution_mode') == 'shadow':
-            self._gripper_observation_cache = None
-            self._gripper_observation_identity = None
             return snapshot
         reader = getattr(self.osc,'inference_gripper_feedback',None)
         if not callable(reader): return snapshot
-        if identity != self._gripper_observation_identity:
-            self._gripper_observation_cache = None
-            self._gripper_observation_identity = identity
-        diagnostic = {'source':'sdk_receive_cache','session_id':identity[0],'new_sdk_feedback':False}
-        started_ns = time.perf_counter_ns()
-        try:
-            candidate = reader()
-            marker = self._gripper_sdk_marker(candidate)
-            width = candidate.get('width_m')
-            if marker is None or not isinstance(width,(int,float)) or not math.isfinite(width):
-                raise ValueError('SDK gripper cache has no valid timestamp/width')
-            old_marker = self._gripper_sdk_marker(self._gripper_observation_cache or {})
-            if old_marker is None or marker > old_marker:
-                self._gripper_observation_cache = copy.deepcopy(candidate)
-                self._gripper_received_perf_ns = time.perf_counter_ns()
-                diagnostic['new_sdk_feedback'] = True
-            elif marker < old_marker:
-                diagnostic['error'] = 'SDK gripper timestamp regressed; previous feedback retained'
-            diagnostic['sdk_timestamp'] = self._gripper_sdk_marker(self._gripper_observation_cache or {})
-            diagnostic['width_m'] = (self._gripper_observation_cache or {}).get('width_m')
-            diagnostic['received_perf_ns'] = getattr(self, '_gripper_received_perf_ns', 0)
-        except Exception as exc:
-            diagnostic['error'] = f'{type(exc).__name__}: {exc}'
-            self._event('gripper_observation_error',**diagnostic)
-        diagnostic['cache_read_ms'] = (time.perf_counter_ns()-started_ns)/1e6
+        with self.lock:
+            if not hasattr(self, '_measured_gripper_cache'):
+                self._measured_gripper_cache = GripperFeedbackCache()
+            cache = self._measured_gripper_cache
+        sample, diagnostic = cache.read(reader, session.get('id'))
         result = dict(snapshot)
-        if self._gripper_observation_cache is not None:
-            result['gripper'] = copy.deepcopy(self._gripper_observation_cache)
+        if sample is not None:
+            result['gripper'] = sample
         result['gripper_observation'] = diagnostic
         return result
 
@@ -1044,46 +1019,24 @@ class Pi05InputAdapter:
         return make_observation(position, rotvec, ratio, external, wrist, self.config["model"]["prompt"])
 
     def _normalise_gripper_ratio(self, ratio: float, action_index: int | None = None) -> float:
-        """Saturate bounded model overshoot; reject outputs beyond that envelope.
+        """Project finite model predictions onto the physical command domain.
 
-        The upper endpoint allows 5% prediction overshoot by operator choice;
-        the lower endpoint retains its existing 0.5% allowance. These are
-        model-output allowances, never permission to exceed hardware opening.
+        Raw predictions remain in the model-chunk log. Only gripper commands
+        are saturated; TCP, OSC and hardware checks are not changed.
         """
-        # Only the command is clipped; raw model outputs remain in the log.
-        tolerance = float(self.config["gripper"].get("ratio_boundary_tolerance", 0.005))
-        upper_tolerance = float(self.config["gripper"].get("ratio_upper_boundary_tolerance", 0.05))
-        if any(not math.isfinite(value) or value < 0.0 for value in (tolerance, upper_tolerance)):
-            raise RuntimeError("Model gripper ratio boundary tolerance must be finite and non-negative")
+        if not math.isfinite(ratio):
+            raise RuntimeError(f'Model gripper ratio at row {action_index} must be finite')
         if 0.0 <= ratio <= 1.0:
             return ratio
-        row = "unknown" if action_index is None else str(action_index)
-        if -tolerance <= ratio <= 1.0 + upper_tolerance:
-            command_ratio = min(1.0, max(0.0, ratio))
-            diagnostic = {"status": "boundary_normalized", "action_index": action_index,
-                          "raw_ratio": ratio, "command_ratio": command_ratio,
-                          "tolerance": tolerance, "upper_tolerance": upper_tolerance,
-                          "accepted_min": -tolerance, "accepted_max": 1.0+upper_tolerance,
-                          "updated_at": time.time()}
-            with self.lock:
-                self.state["gripper_ratio_diagnostic"] = diagnostic
-            # This is a recoverable model-output boundary condition.  The
-            # state diagnostic is deliberately user-visible; keep the process
-            # log at debug level so a sustained endpoint command does not
-            # drown out actual safety events.
-            LOGGER.debug("Model gripper ratio boundary-normalized at row %s: %.9g -> %.9g (accepted [%.9g, %.9g])",
-                         row, ratio, command_ratio, -tolerance, 1.0+upper_tolerance)
-            return command_ratio
-        diagnostic = {"status": "rejected", "action_index": action_index,
-                      "raw_ratio": ratio, "tolerance": tolerance, "upper_tolerance": upper_tolerance,
-                      "accepted_min": -tolerance, "accepted_max": 1.0+upper_tolerance,
-                      "updated_at": time.time()}
+        command_ratio = min(1.0, max(0.0, ratio))
+        diagnostic = {"status": "boundary_normalized", "mode": "finite_saturation",
+                      "action_index": action_index, "raw_ratio": ratio,
+                      "command_ratio": command_ratio, "command_min": 0.0,
+                      "command_max": 1.0, "updated_at": time.time()}
         with self.lock:
             self.state["gripper_ratio_diagnostic"] = diagnostic
-        raise RuntimeError(
-            f"Model gripper ratio at row {row} is {ratio:.9g}; expected [0, 1] "
-            f"(model endpoint overshoot within [{-tolerance:.9g}, {1.0+upper_tolerance:.9g}] is normalized)"
-        )
+        self._event('gripper_ratio_saturated', **diagnostic)
+        return command_ratio
 
     def _target_from_action(self, action: Any, base: dict[str, Any],
                             action_index: int | None = None, *, preview_only: bool = False) -> tuple[dict[str, Any], float]:

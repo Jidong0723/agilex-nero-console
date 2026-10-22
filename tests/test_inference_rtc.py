@@ -594,7 +594,7 @@ class RuntimeTests(unittest.TestCase):
             return result
         self.broker.state = state
         self.broker.inference_gripper_feedback = lambda: {"width_m": .02,
-            "raw": {"value": {"timestamp": time.perf_counter_ns()}},
+            "raw": {"value": {"timestamp": time.time()}},
             "status": {"foc_status": {"driver_enable_status": True}}}
         self.a.start("session-1", "client-1")
         self.wait_for(lambda: self.a.state.get("rtc", {}).get("hold_confirmed"))

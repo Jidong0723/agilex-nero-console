@@ -151,26 +151,32 @@ class Pi05AdapterTests(unittest.TestCase):
         self.assertAlmostEqual(target["position_m"][2], .42)
         self.assertEqual(ratio, .75)
 
-    def test_invalid_gripper_ratio_rejects_action_without_clipping(self):
+    def test_finite_out_of_range_gripper_is_clipped_without_changing_tcp(self):
         adapter = Pi05InputAdapter(_Broker(), Path(__file__).resolve().parents[1] / "config" / "pi05.json")
         try:
-            with self.assertRaisesRegex(RuntimeError, "row unknown.*1.051"):
-                adapter._target_from_action([0., 0., 0., 0., 0., 0., 1.051], {"position_m": [0., 0., .3], "orientation_xyzw": [0., 0., 0., 1.]})
+            target, ratio = adapter._target_from_action([0., 0., 0., 0., 0., 0., 1.051], {"position_m": [0., 0., .3], "orientation_xyzw": [0., 0., 0., 1.]})
+            self.assertEqual(ratio, 1.)
+            self.assertEqual(target['position_m'], [0., 0., .3])
             diagnostic = adapter.snapshot()["gripper_ratio_diagnostic"]
         finally:
             adapter.close()
-        self.assertEqual(diagnostic["status"], "rejected")
+        self.assertEqual(diagnostic["status"], "boundary_normalized")
+        self.assertEqual(diagnostic['mode'], 'finite_saturation')
         self.assertEqual(diagnostic["action_index"], None)
         self.assertAlmostEqual(diagnostic["raw_ratio"], 1.051)
 
-    def test_upper_overshoot_up_to_105_percent_saturates_but_lower_limit_is_unchanged(self):
+    def test_all_finite_gripper_predictions_are_saturated_nonfinite_rejected(self):
         adapter = Pi05InputAdapter(_Broker(), Path(__file__).resolve().parents[1] / "config" / "pi05.json")
         try:
-            for value in (1.00538116, 1.00601659, 1.01, 1.05, float(np.float32(1.05))):
+            for value in (1.00538116, 1.00601659, 1.01, 1.05, 1.2, 1e100, float(np.float32(1.05))):
                 self.assertEqual(adapter._normalise_gripper_ratio(value, 3), 1.0)
-            self.assertAlmostEqual(adapter.snapshot()['gripper_ratio_diagnostic']['accepted_max'], 1.05)
-            self.assertEqual(adapter._normalise_gripper_ratio(-.005), 0.)
-            for value in (1.050001, -.005001, float('nan'), float('inf')):
+            self.assertEqual(adapter.snapshot()['gripper_ratio_diagnostic']['command_max'], 1.)
+            for value in (-.005, -.0352615372, -.103109718, -.05, -1., -1e100, float(np.float32(-.05))):
+                self.assertEqual(adapter._normalise_gripper_ratio(value, 10), 0.)
+            diagnostic = adapter.snapshot()['gripper_ratio_diagnostic']
+            self.assertEqual(diagnostic['command_ratio'], 0.)
+            self.assertEqual(diagnostic['command_min'], 0.)
+            for value in (float('nan'), float('inf'), float('-inf')):
                 with self.assertRaises(RuntimeError):
                     adapter._normalise_gripper_ratio(value, 3)
         finally:

@@ -381,21 +381,10 @@ class ObservationAssembler:
             if float(execution.get("feedback_age_s", math.inf)) > .1:
                 raise RuntimeError("RTC hardware feedback is stale")
             diagnostic = osc.get("gripper_observation") or {}
-            if measured and 'gripper_width_m' not in measured and now-diagnostic.get('received_perf_ns',0) > 150_000_000:
-                raise RuntimeError('RTC measured gripper has stopped updating')
-            if diagnostic.get("error") or diagnostic.get("sdk_timestamp") is None:
-                raise RuntimeError("RTC requires timestamped measured gripper")
-            marker = diagnostic["sdk_timestamp"]
-            with self._gripper_lock:
-                if self._gripper_marker is None:
-                    self._gripper_marker, self._gripper_received_ns = marker, now
-                elif marker > self._gripper_marker:
-                    self._gripper_has_advanced = True
-                    self._gripper_marker, self._gripper_received_ns = marker, now
-                if not self._gripper_has_advanced:
-                    raise RuntimeError("RTC waiting for a new measured gripper sample")
-                if now-self._gripper_received_ns > 150_000_000:
-                    raise RuntimeError("RTC measured gripper has stopped updating")
+            # Use the producer's actual source age, not when this consumer first
+            # noticed a marker. A fresh first frame needs no extra inference cycle.
+            from .inference_gripper_feedback import require_fresh
+            require_fresh(diagnostic, now)
         else:
             stamp = stamp or published
             # CPV HOLD freezes its TCP sample while the shadow plant continues
