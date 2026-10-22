@@ -27,6 +27,8 @@ class MeasuredTCPFeed:
                 'sample_age_ms': (now-stamp)/1e6 if isinstance(stamp,int) else None,
                 'cache_age_ms': (now-value['published_perf_ns'])/1e6 if value.get('published_perf_ns') else None,
                 'poll_interval_ms': value.get('poll_interval_ms'), 'refresh_ms': value.get('refresh_ms'),
+                'sensor_path': (observation.get('timing') or {}).get('sensor_path'),
+                'sensor_ipc': copy.deepcopy((observation.get('timing') or {}).get('sensor_ipc')),
                 'error': value.get('error'), 'errors': value.get('errors',0), 'thread_alive':self.thread.is_alive()}
 
     def attach(self, snapshot):

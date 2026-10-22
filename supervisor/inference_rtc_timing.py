@@ -11,8 +11,8 @@ def preserve_delay_prefix(previous, predicted, inference_delay):
 
 @dataclass(frozen=True)
 class RTCTiming:
-    inference_delay: int = 8
-    execute_horizon: int = 10
+    inference_delay: int = 6
+    execute_horizon: int = 6
 
     def __post_init__(self):
         for name in ('inference_delay', 'execute_horizon'):
@@ -30,4 +30,4 @@ class RTCTiming:
 
     @classmethod
     def from_execution(cls, execution):
-        return cls(execution.get('inference_delay', 8), execution.get('execute_horizon', 10))
+        return cls(execution.get('inference_delay', 6), execution.get('execute_horizon', 6))

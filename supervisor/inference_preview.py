@@ -37,7 +37,8 @@ class ObservationSource:
                 raise RuntimeError("影子反馈不可用")
             stamp, age, source = now, 0., "shadow_joint_fk"
         else:
-            sample = reader(now, 0.)
+            model_reader = getattr(self.a.osc, 'inference_sensor_sample', None)
+            sample = model_reader() if callable(model_reader) else reader(now, 0.)
             # The IPC may return feedback received AFTER the request began.
             # Compare against read completion, never the earlier query time.
             now = time.perf_counter_ns()
@@ -77,6 +78,8 @@ class ObservationSource:
                     'sample_after_query_ms': (stamp-query_ns)/1e6,
                     'sample_age_at_read_ms': (sample_read_ns-stamp)/1e6,
                     'sensor_read_ms': (sample_read_ns-started_ns)/1e6,
+                    'sensor_path': sample.get('sensor_path') if not shadow else 'shadow',
+                    'sensor_ipc': sample.get('sensor_ipc') if not shadow else None,
                     'fk_ms': (fk_finished_ns-fk_started_ns)/1e6,
                     'fk_reused': fk_reused,
                     'refresh_ms': (time.perf_counter_ns()-started_ns)/1e6}}

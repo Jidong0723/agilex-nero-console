@@ -1371,8 +1371,12 @@ class OperationalSpaceController:
         mailbox; it does not mean that the servo loop or hardware has
         consumed it.
         """
+        entered_ns = time.perf_counter_ns()
+        entered_cpu_ns = time.thread_time_ns()
         result = self._osc.publish_target_nonblocking(
             str(session_id), str(client_id), int(sequence), dict(target_pose))
+        published_ns = time.perf_counter_ns()
+        published_cpu_ns = time.thread_time_ns()
         accepted = bool(result.get("accepted", False))
         response = {
             "ok": accepted,
@@ -1380,6 +1384,13 @@ class OperationalSpaceController:
             "session_id": result.get("session_id", session_id),
             "accepted_sequence": result.get("accepted_sequence", sequence),
             "mailbox": "osc_target_latest_value",
+            "track_tcp_timing": {
+                "path": "osc_target_latest_value",
+                "control_entered_perf_ns": entered_ns,
+                "mailbox_returned_perf_ns": published_ns,
+                "mailbox_wall_ms": (published_ns-entered_ns)/1e6,
+                "mailbox_thread_cpu_ms": (published_cpu_ns-entered_cpu_ns)/1e6,
+            },
         }
         if not accepted:
             response["reason"] = result.get("reason", "OSC target was not accepted")
@@ -1806,6 +1817,30 @@ class OperationalSpaceController:
             "gripper": snapshot.get("gripper"),
             "authority": self.authority_status(snapshot.get("control")),
             "active_action": snapshot.get("active_action"),
+        }
+
+    def osc_inference_sensor_sample(self) -> dict[str, Any] | None:
+        """Read raw measured joints for model FK, without UI/gripper decoration.
+
+        Select near backend read time; a request queued in another process
+        must not select a historical sample near its old send timestamp.
+        Preserve the producer's real alignment timestamp unchanged.
+        """
+        selected_ns = time.perf_counter_ns()
+        sample = self._osc.rx_sample_nearest(selected_ns, 0.)
+        if not sample:
+            return None
+        return {
+            'feedback_revision': sample.get('revision'),
+            'joint_position_rad': sample.get('joints'),
+            'joint_velocity_rad_s': sample.get('velocities'),
+            'feedback_monotonic_ns': sample.get('alignment_monotonic_ns'),
+            'sdk_fresh_monotonic_ns': sample.get('fresh_received_at_monotonic_ns'),
+            'sdk_joint_timestamp': sample.get('sdk_joint_timestamp'),
+            'joint_feedback_hz': sample.get('joint_feedback_hz'),
+            'latest_feedback_age_s': sample.get('latest_feedback_age_s'),
+            'selection_perf_ns': selected_ns,
+            'sensor_path': 'raw_inference_feedback',
         }
 
     def osc_sensor_sample(self, target_monotonic_ns: int, wait_s: float = 0.0) -> dict[str, Any] | None:

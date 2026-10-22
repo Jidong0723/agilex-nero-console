@@ -61,8 +61,8 @@ def canonical(config):
     execution.setdefault("mode", "normal")
     # Retired adaptive scheduling is not an alias for execute_horizon.
     execution.pop('rtc_min_replan_steps', None)
-    execution.setdefault('inference_delay', 8)
-    execution.setdefault('execute_horizon', 10)
+    execution.setdefault('inference_delay', 6)
+    execution.setdefault('execute_horizon', 6)
     if execution["mode"] not in ("normal", "rtc"):
         raise ValueError("Unknown inference execution mode")
     RTCTiming.from_execution(execution)

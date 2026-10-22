@@ -1,5 +1,7 @@
 # NERO H20 推理式 RTC
 
+**当前云端唯一启动入口与双窗口操作说明见 [RTC_CLOUD_START.md](RTC_CLOUD_START.md)。旧云端部署已归档移除，不再使用下文历史实验入口启动生产。**
+
 普通模式与 RTC 共用 WebSocket 协议、单份 π0.5 模型参数和原有 OSC 输出接口。RTC 只扩展模型推理控制源；没有修改 OSC 求解器、伺服循环、公共命令协议或硬件参数。
 
 ## 自动预览与推理控制
@@ -107,6 +109,35 @@ RTC 额外携带 `rtc_context`，版本升级为 `nero.rtc.v2`。metadata 必须
 本次还复现固件模式切换的参数恢复竞态：读到CV=2而跳过写入后，后续读回已变为1.5。显式参数恢复函数仅对这种跳过后不匹配补写一次并重新核验；已写过仍不匹配继续报错。另观察到停止返回HOLD后CV再次为1.5，已用维护接口恢复2／10／10；这不代表固件重置来源已根治。OSC模块本轮未修改。
 
 模型端继续沿用 OpenPI 递减时间采样方向及已验证的 VJP 符号。新增 metadata `rtc_schedule=fixed_delay_execute_horizon_v1`，请求与回显携带 D、E、`prefix_attention_horizon`；缺少新能力的旧云端服务会被拒绝用于 RTC，普通预览仍兼容。必须协调部署云端 `codec.py`、`serve.py` 与本地修改。
+
+### 2026-10-21 生产采样配置与重连入口
+
+此前末端细化配置仅在独立离线进程验证；直接启动旧目录的 `serve.py` 会再次使用默认的 exp / 10 steps / cap5 / 均匀积分，不能视为部署了离线改进。
+
+生产恢复统一执行 `bash /root/autodl-tmp/nero_rtc_production/start_production.sh`。该路径指向已完成固定样本验证的版本目录；最新 `start_production.sh` 显式选择 exp、20 RTC steps、cap1000、terminal_noise_time=0.001、terminal_refinement_steps=10、prefix_mask_mode=timestamp_frozen、compact prefix、BF16。直接运行 `start_terminal_refined.sh` 默认保留 ones及旧单末端网格，可通过 `RTC_NUM_STEPS`、`RTC_PREFIX_ATTENTION_SCHEDULE`、`RTC_TERMINAL_REFINEMENT_STEPS` 对照。episode16后经用户确认，当前exp控制台恢复 H20、inference_delay=6、execute_horizon=6，按官方 D≤E、D+E≤20 检查；8/8仍可显式选择，但不推荐将其视作更平滑的方案。旧ones/linear配置仍保留额外D+2E≤20限制。普通采样仍为独立的 10 个均匀积分步。
+
+此方案沿用 IIGDM VJP 引导，但修改了 Euler 求值网格，不是上游均匀步长的逐行原样实现。需要官方均匀网格对照时，显式使用 `start.sh` 的默认参数；生产重连不要跳过 `start_production.sh`。
+
+启动后通过实际 WebSocket metadata 确认 `ready=true`、`rtc_profile=terminal_refined_multistep_v2`、`guidance_cap=1000`、`prefix_attention_schedule=exp`、`rtc_integration_grid=terminal_refined_multistep_v2`、`terminal_noise_time=0.001` 和 `terminal_refinement_steps=10`。当前还发布`rtc_requires_execution_within_prefix=false`、`rtc_late_response_policy=guided_same_time_continuity_v1`、`rtc_prefix_mask_mode=timestamp_frozen`及`rtc_warmup_timing={inference_delay:6,execute_horizon:6}`。云端每次依据请求里的D/E及真实冻结时间戳生成mask，预热信息不是另一个时序配置源。诊断包装层返回逐行物理残差及噪声/源文件摘要；仅端口监听或模型名称相同不能证明采样配置正确。
+
+### 编译、预热与归一化诊断（2026-10-21）
+
+- 本服务使用JAX/XLA，不可把任何慢请求直接归因于PyTorch CUDA graph capture失败。使用`JAX_LOG_COMPILES=1 JAX_EXPLAIN_CACHE_MISSES=1`启动可保存真实编译证据；预热阶段几十秒的编译不等于在线推理耗时。
+- 普通路径与RTC路径本来就是不同计算图；HOLD首块和后续RTC则使用同一采样函数、固定`[1,20,32]`参考/权重，仅mask数值不同。prompt限制在64/128/200三个预热桶。显式noise与内部随机noise是不同JAX输入签名，二者均在监听端口开放前预热。
+- `rtc_signature_guard=warmed_shapes_and_static_options_v1`表示RTC在线拒绝未预热的形状、dtype、pytree和静态采样参数。`prepared_before_call`、`signature_sha256`、同步采样耗时及准备/后处理耗时在`policy_timing`中返回。该保护不是CUDA graph profiler，也不保证XLA缓存永不失效；内存、驱动、网络和CPU调度尖峰仍需独立诊断。
+- 固定噪声且显式指定`rtc_diagnostic_sampler`的离线实验可以编译额外配置，但不会把它加入在线允许集。切勿在真机控制同时运行此类GPU对照实验。启动`--validate`的离线矩阵同样在服务监听前执行。
+- `normalization_audit`核对实际checkpoint的quantile变换与逆变换往返，含分位数范围之外的值，防止误裁剪、重复归一化等基本错误。旧绝对目标先以本次观测转换为物理7D，再单次归一化、补到32D；仅前7D带引导权重。往返正确不等于训练数据语义已获得完整溯源。
+- 无运动覆盖探针：`python scripts/rtc_runtime_stability_probe.py --rounds 3`，保存普通/首块/后续、三个prompt桶及有无固定噪声的结果。不创建OSC会话，不发送机械臂命令。
+
+episode_000010 的三种固定噪声、每种240步记录观测重放显示：ones虽保持亚毫米级同刻位置接缝，却会继承参考末尾的速度突变。改用官方已有linear权重后，目标加速度P95下降约78–83%、jerk P95下降约84–86%，计算仍约155ms。重放不是闭环真机仿真，不能证明任务成功或真机抖动消失。延迟回复仍须在真实参考覆盖内，且同刻位置差≤2mm、姿态差≤0.5°；linear的弱权重不保证这些条件，超限仍HOLD。没有修改OSC、反馈100ms阈值或延迟保护。
+
+随后依据episode_000013及用户要求改为官方exp权重。只换权重会增加同刻修正；新增可选末端多步数值网格：20次求值中，14步从1到0.02，5步几何下降到0.001，最后一步到0。IIGDM场、cap、exp mask及时间戳拼接不变，不是官方原样均匀积分；没有动作低通、跨块平均或扩大保护阈值。三种噪声、各120步同观测重放，exp旧网格接缝最大5.62mm，多末端网格最大1.03mm；计算约153ms。4Hz以上分量总体下降，但2Hz以上总分量并未一致优于linear，不能宣称彻底解决抖动。episode10交叉复核也不是所有指标都改善，详见episode13分析报告。
+
+后续8/8调整：D8=400ms名义延迟预算，E8=400ms名义观测重规划间隔；H20仍为训练预测长度，不延长模型或改成H24。mask为0..7强权重、8..11指数软权重、12..19零权重（按真实参考长度裁剪）。允许执行参考之外的新预测是官方拼接的一部分，而不是移除队列/实测反馈保护。迟到接收仍必须有真实参考覆盖及同刻≤2mm/0.5°证据，没参考就HOLD，不把自由预测当迟到参考。8/8下选末端细化10步，总求值仍20次：episode13三种噪声各128步中，最大同刻接缝约1.92mm；计算约153–157ms。episode10快速运动样本则约4.03mm，提示更长执行段/更短软重叠可能降低平顺性，不能承诺8/8总比6/6好。完整证据见`runtime/rtc_d8e8_20261021/`。
+
+episode16的真实8/8记录暴露了此前整步验证未覆盖的误差：参考缩短到10/11行时不应一并压短名义H-E衰减曲线；真实冻结边界含小数step时，应冻结所有时间早于边界的模型行。`guidance_bounds()`将名义end、有效长度和实际冻结start分离；缺失行只对其自身清零，不外推参考、不改写观测时间戳。整数网格仍与官方离散exp一致。所有响应现在都接受同刻≤2mm/0.5°检查，不再只有迟到响应才检查。配对真实时间戳样本中，旧8/8误差中位/最大13.5/27.8mm，修复8/8为2.5/5.5mm，恢复6/6为0.65/1.13mm、18/18通过连续性检查。后者不是闭环真机验收；300ms以外延迟尖峰仍可能HOLD。详见episode16的analysis/rtc_diagnosis/report.md。
+
+`scripts/rtc_prefix_diagnostic_probe.py` 从保存的 episode 重放固定观测，不导入机器人接口。需把每轮结果写入独立 `--output` 目录，避免覆盖旧基线。保存图像为 JPEG 的近邻帧，因此固定观测对照可复现，但不等于复现原运行未记录的 RGB 和噪声。
 
 2026-10-19 后续部署：SSH43198实例已更新，GPU无运动验证通过。实际网页启动发现并修复完整物理前缀长度与引导重叠长度混用的数组错误。再次网页启动在首块约336 ms返回后，因无法在现有启动安全包络内衔接HOLD而拒绝运动；两次CPV发送增量均0、最终正常HOLD，不能宣称已完成1秒真机验收。随后补充的本地首D步严格保留HOLD修正通过单测，尚未重载。详情见 `runtime/diagnostics/rtc_fixed_de_delivery_20261019.md`，仍需解决冷启动衔接，不能通过取消保护验收。
 

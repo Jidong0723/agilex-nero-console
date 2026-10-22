@@ -10,6 +10,28 @@ PERIOD_NS = 50_000_000
 TIME_CONTRACT = "observation_time_plus_row_index_times_period"
 
 
+def compact_inputs(inputs):
+    """Trim trailing masked prompt tokens after checking the absent third view."""
+    masks = inputs.get('image_mask') or {}
+    if np.any(np.asarray(masks.get('right_wrist_0_rgb', True))):
+        raise ValueError('Compact dual-RGB RTC requires a masked right-wrist padding image')
+    prompt_mask = np.asarray(inputs['tokenized_prompt_mask'])
+    if prompt_mask.ndim != 1:
+        raise ValueError('Compact RTC expects one unbatched tokenized prompt')
+    valid = np.flatnonzero(prompt_mask)
+    used = int(valid[-1] + 1) if len(valid) else 1
+    # Stable buckets prevent a new JAX compilation whenever prompt length
+    # changes by one token. Never truncate an unmasked token.
+    end = min(next((size for size in (64, 128) if used <= size), len(prompt_mask)), len(prompt_mask))
+    result = dict(inputs)
+    for name in ('tokenized_prompt', 'tokenized_prompt_mask', 'token_ar_mask', 'token_loss_mask'):
+        if inputs.get(name) is not None:
+            if inputs[name].shape[-1] != len(prompt_mask):
+                raise ValueError(f'Compact RTC token length mismatch: {name}')
+            result[name] = inputs[name][..., :end]
+    return result
+
+
 def pack_normalized_prefix(normalized):
     """Physical prefix length is independent of its guidance overlap length."""
     values = np.asarray(normalized, dtype=np.float32)
@@ -85,6 +107,22 @@ def validate_context(context):
     if 'execute_horizon' in context:
         return context['inference_delay'], min(len(targets), context['prefix_attention_horizon'])
     return delay, len(targets)
+
+
+def guidance_bounds(context, mode='timestamp_frozen'):
+    """Map physical frozen timestamps to rows, independently of valid padding.
+
+    Preserve nominal H-E decay; missing reference rows only zero their own
+    weights. Timestamp mode freezes every sample strictly before the actual
+    absolute frozen boundary (the paper assumes observations on this grid).
+    """
+    delay, length = validate_context(context)
+    if mode not in {'legacy_compressed', 'nominal', 'timestamp_frozen'}:
+        raise ValueError('Invalid RTC prefix mask mode')
+    end = length if mode == 'legacy_compressed' else context.get('prefix_attention_horizon', length)
+    if mode == 'timestamp_frozen' and context['phase'] != 'bootstrap':
+        delay = (context['freeze_until_perf_ns']-context['observation_perf_ns']+PERIOD_NS-1)//PERIOD_NS
+    return min(delay, end), end, length
 
 
 def echo_context(context):

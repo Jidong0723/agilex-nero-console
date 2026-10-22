@@ -30,6 +30,19 @@ def targets(value):
 
 
 class TimelineTests(unittest.TestCase):
+    def test_refined_profile_requires_full_execution_inside_overlap(self):
+        metadata=dict(METADATA,rtc_requires_execution_within_prefix=True)
+        execution={'expected_chunk_steps':20,'inference_delay':7,'execute_horizon':8}
+        with self.assertRaisesRegex(RuntimeError,r'D\+2E'):
+            compatibility(metadata,execution)
+        compatibility(metadata,dict(execution,inference_delay=6,execute_horizon=6))
+        compatibility(METADATA,execution)  # Legacy official grid remains selectable.
+        exp=dict(METADATA,prefix_attention_schedule='exp',rtc_requires_execution_within_prefix=False,
+                 rtc_late_response_policy='guided_same_time_continuity_v1')
+        compatibility(exp,dict(execution,inference_delay=8,execute_horizon=8))
+        with self.assertRaises(ValueError):
+            compatibility(exp,dict(execution,inference_delay=11,execute_horizon=11))
+
     def test_startup_bridge_joins_future_row_without_retiming_or_rewriting_model(self):
         hold = Target((0,0,.3),(0,0,0,1),.5)
         rows = [Target((.006,0,.3),(0,0,0,1),.5)]*20

@@ -96,9 +96,29 @@ class LeaseError(RuntimeError):
     """Local representation of a lease error returned by the backend process."""
 
 
-def _backend_worker_main(connection: Any, config: str) -> None:
+def _backend_fast_requests(connection: Any, controller: Any, stopping: threading.Event, allowed_methods: Any = None) -> None:
+    """Serve only mailbox admission/cache reads independently of general RPC."""
+    try:
+        while not stopping.is_set():
+            request = connection.recv()
+            try:
+                name = str(request.get('method'))
+                allowed = {'osc_track_tcp_nonblocking', 'osc_fast_state'} if allowed_methods is None else allowed_methods
+                if name not in allowed:
+                    raise PermissionError('Method is not allowed on the OSC fast channel')
+                result = getattr(controller, name)(*request.get('args', ()), **request.get('kwargs', {}))
+                connection.send({'kind': 'result', 'id': request['id'], 'result': result})
+            except Exception as exc:
+                connection.send({'kind': 'error', 'id': request.get('id'),
+                                 'error_type': type(exc).__name__, 'error': str(exc)})
+    except (BrokenPipeError, EOFError, OSError):
+        pass
+
+
+def _backend_worker_main(connection: Any, config: str, fast_connection: Any = None, sensor_connection: Any = None) -> None:
     """Own every SDK/CAN object in a disposable child process."""
     osc = None
+    stopping = threading.Event()
     try:
         # Windows ``spawn`` may otherwise start from the base interpreter of a
         # virtual environment.  Reassert the project import roots in the
@@ -127,6 +147,13 @@ def _backend_worker_main(connection: Any, config: str) -> None:
 
         osc = OperationalSpaceController(Path(config))
         initial = osc.start()
+        if fast_connection is not None:
+            threading.Thread(target=_backend_fast_requests, args=(fast_connection, osc, stopping),
+                             name='nero-osc-fast-ipc', daemon=True).start()
+        if sensor_connection is not None:
+            threading.Thread(target=_backend_fast_requests,
+                args=(sensor_connection, osc, stopping, {'osc_inference_sensor_sample'}),
+                name='nero-model-sensor-ipc', daemon=True).start()
         connection.send({"kind": "ready", "initial": initial})
         while True:
             request = connection.recv()
@@ -149,6 +176,11 @@ def _backend_worker_main(connection: Any, config: str) -> None:
         except (BrokenPipeError, EOFError, OSError):
             pass
     finally:
+        stopping.set()
+        if fast_connection is not None:
+            fast_connection.close()
+        if sensor_connection is not None:
+            sensor_connection.close()
         if osc is not None:
             try:
                 osc.close()
@@ -160,12 +192,18 @@ def _backend_worker_main(connection: Any, config: str) -> None:
 class BackendProcessProxy:
     """RPC facade for the one process permitted to own the hardware transport."""
 
-    def __init__(self, process: Any, connection: Any, call_timeout_s: float = 30.0) -> None:
+    def __init__(self, process: Any, connection: Any, call_timeout_s: float = 30.0, fast_connection: Any = None, sensor_connection: Any = None) -> None:
         self.process = process
         self.connection = connection
         self.call_timeout_s = call_timeout_s
         self._lock = threading.Lock()
         self._request_id = 0
+        self._fast_connection = fast_connection
+        self._fast_lock = threading.Lock()
+        self._fast_request_id = 0
+        self._sensor_connection = sensor_connection
+        self._sensor_lock = threading.Lock()
+        self._sensor_request_id = 0
 
     def __getattr__(self, method: str) -> Any:
         def invoke(*args: Any, **kwargs: Any) -> Any:
@@ -173,15 +211,28 @@ class BackendProcessProxy:
         return invoke
 
     def call(self, method: str, *args: Any, **kwargs: Any) -> Any:
-        with self._lock:
+        use_fast = self._fast_connection is not None and method in {'osc_track_tcp_nonblocking', 'osc_fast_state'}
+        use_sensor = self._sensor_connection is not None and method == 'osc_inference_sensor_sample'
+        connection = self._sensor_connection if use_sensor else (self._fast_connection if use_fast else self.connection)
+        requested_ns = time.perf_counter_ns()
+        lock = self._sensor_lock if use_sensor else (self._fast_lock if use_fast else self._lock)
+        with lock:
+            acquired_ns = time.perf_counter_ns()
             if not self.process.is_alive():
                 raise ControlServiceUnavailable(
                     f"hardware backend process exited (code={self.process.exitcode})"
                 )
-            self._request_id += 1
-            request_id = self._request_id
+            if use_sensor:
+                self._sensor_request_id += 1
+                request_id = self._sensor_request_id
+            elif use_fast:
+                self._fast_request_id += 1
+                request_id = self._fast_request_id
+            else:
+                self._request_id += 1
+                request_id = self._request_id
             try:
-                self.connection.send({
+                connection.send({
                     "id": request_id,
                     "method": method,
                     "args": args,
@@ -190,17 +241,28 @@ class BackendProcessProxy:
                 # Whole-profile maintenance includes 21 firmware writes plus
                 # full pre/post readback; legacy firmware can omit ACKs.
                 timeout_s = max(self.call_timeout_s, 60.0) if method == "osc_set_cpv_parameters" else self.call_timeout_s
-                if not self.connection.poll(timeout_s):
+                if not connection.poll(timeout_s):
                     raise ControlServiceUnavailable(
                         f"hardware backend call {method} exceeded {timeout_s:.0f}s; use Reset to release it"
                     )
-                response = self.connection.recv()
+                response = connection.recv()
             except (BrokenPipeError, EOFError, OSError) as exc:
                 raise ControlServiceUnavailable(
                     f"hardware backend process unavailable (code={self.process.exitcode})"
                 ) from exc
             if response.get("kind") == "result" and response.get("id") == request_id:
-                return response.get("result")
+                result = response.get("result")
+                if use_sensor and isinstance(result, dict):
+                    result = dict(result, sensor_ipc={
+                        'path': 'dedicated_sensor_pipe',
+                        'lock_wait_ms': (acquired_ns-requested_ns)/1e6,
+                        'roundtrip_ms': (time.perf_counter_ns()-acquired_ns)/1e6})
+                if use_fast and method == 'osc_track_tcp_nonblocking' and isinstance(result, dict):
+                    result = dict(result)
+                    result['track_tcp_timing'] = dict(result.get('track_tcp_timing') or {},
+                        ipc_path='dedicated_fast_pipe', ipc_lock_wait_ms=(acquired_ns-requested_ns)/1e6,
+                        ipc_roundtrip_ms=(time.perf_counter_ns()-acquired_ns)/1e6)
+                return result
             error_type = str(response.get("error_type", "RuntimeError"))
             message = str(response.get("error") or f"backend request failed: {response!r}")
             if error_type == "PermissionError":
@@ -257,14 +319,18 @@ class ServiceRuntime:
                 multiprocessing.set_executable(str(CONTROL_PYTHON))
                 context = multiprocessing.get_context("spawn")
                 parent_connection, child_connection = context.Pipe()
+                parent_fast, child_fast = context.Pipe()
+                parent_sensor, child_sensor = context.Pipe()
                 process = context.Process(
                     target=_backend_worker_main,
-                    args=(child_connection, str(Path(config).resolve())),
+                    args=(child_connection, str(Path(config).resolve()), child_fast, child_sensor),
                     name="nero-hardware-backend",
                     daemon=False,
                 )
                 process.start()
                 child_connection.close()
+                child_fast.close()
+                child_sensor.close()
                 self._backend_process = process
                 # The worker's broker has its own bounded startup timeout. A
                 # native SDK crash closes the pipe without taking HTTP down.
@@ -283,7 +349,8 @@ class ServiceRuntime:
                         f"{response.get('error', 'hardware backend startup failed')}"
                     )
                 initial = response.get("initial")
-                broker = BackendProcessProxy(process, parent_connection)
+                broker = BackendProcessProxy(process, parent_connection, fast_connection=parent_fast,
+                                             sensor_connection=parent_sensor)
         except BaseException as exc:
             # SystemExit raised by a dependency must not take down the page.
             with self._lock:

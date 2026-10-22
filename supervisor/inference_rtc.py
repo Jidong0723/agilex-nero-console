@@ -46,6 +46,10 @@ def compatibility(metadata, execution):
         raise RuntimeError('RTC server must support full stationary HOLD bootstrap attention')
     if execution["expected_chunk_steps"] != H or execution.get("period_s", PERIOD) != PERIOD:
         raise RuntimeError("RTC requires H20 and 50 ms")
+    timing=RTCTiming.from_execution(execution)
+    if metadata.get('rtc_requires_execution_within_prefix'):
+        if timing.inference_delay+2*timing.execute_horizon > H:
+            raise RuntimeError('当前 RTC 采样配置要求整段执行位于引导重叠区：D+2E≤20；已验证配置为 inference_delay=6、execute_horizon=6')
 
 
 @dataclass(frozen=True)
@@ -272,6 +276,39 @@ class Timeline:
             self.committed_until = tick+1
             return tick, self.targets[tick]
 
+    def merge_response(self, context, targets, now_ns, metadata):
+        """Replies may replace only continuous, uncommitted future slots.
+
+        D defines the original frozen prefix, not a blanket response timeout.
+        Keep the observation epoch and sample at the actual replacement time.
+        For a late reply, require an explicitly supported guided profile,
+        surviving old targets, and millimetre-scale same-time continuity.
+        """
+        candidate = self.merged(context, targets, now_ns=now_ns)
+        cut = max(context['freeze_until'], self.committed_until, self.next_tick,
+                  (now_ns-self.origin_ns)//PERIOD_NS+1)
+        late_ns = max(0, now_ns-context['freeze_until_perf_ns'])
+        evidence = dict(replacement_tick=cut, response_lateness_ms=late_ns/1e6)
+        if late_ns:
+            bounded_late = (metadata.get('rtc_late_response_policy') == 'guided_same_time_continuity_v1'
+                            or metadata.get('rtc_requires_execution_within_prefix'))
+            if (metadata.get('prefix_attention_schedule') not in {'ones', 'linear', 'exp'}
+                    or not bounded_late):
+                raise RuntimeError('RTC inference_delay exceeded without supported future guidance')
+        row = (self.origin_ns+cut*PERIOD_NS-context['observation_perf_ns'])/PERIOD_NS
+        last_guided = min(len(context['absolute_prefix']), context['prefix_attention_horizon'])-1
+        old = self.targets.get(cut)
+        if old is None or row > last_guided:
+            raise RuntimeError('RTC late response has no guided old-plan continuation' if late_ns
+                               else 'RTC response has no same-time old-plan continuation')
+        position_gap = float(np.linalg.norm(np.subtract(candidate[cut].position, old.position)))
+        angle_gap = orientation_distance(candidate[cut].quaternion, old.quaternion)
+        if position_gap > .002 or angle_gap > math.radians(.5):
+            raise RuntimeError(f'RTC response does not safely match the old plan: {position_gap*1000:.3f} mm / {math.degrees(angle_gap):.3f} deg')
+        evidence.update(same_time_position_gap_m=position_gap, same_time_orientation_gap_rad=angle_gap,
+                        continuity_checked=True)
+        return candidate, evidence
+
     def complete(self, tick):
         with self.lock:
             if tick != self.next_tick:
@@ -494,6 +531,10 @@ class RtcRun:
         rows = action_rows(response, H)
         targets = [Target.from_decoded(self.a._target_from_action(row, base, action_index=i)) for i, row in enumerate(rows)]
         self.validate_targets(targets, osc)
+        diagnostics = {key: echo[key] for key in ("sampler_config", "prefix_residuals",
+                                                   "prefix_position_rmse_m", "prefix_gripper_rmse",
+                                                   "hard_prefix_position_rmse_m", "soft_prefix_position_rmse_m")
+                       if key in echo}
         with self.a.lock:
             if not self.live():
                 return None
@@ -501,9 +542,10 @@ class RtcRun:
                                 chunk_source="control", chunk_updated_at=time.time(),
                                 inference_base_tcp=base, action_chunk_length=H, last_response_steps=H,
                                 inference_ms=elapsed*1000, chunk_sequence=self.a.state["chunk_sequence"]+1,
+                                rtc_diagnostics=diagnostics,
                                 protocol_compatibility={"status": "compatible", "message": "RTC 7D/H20 响应验证通过"})
         self.a._event("rtc_response", context=context, actions=rows, absolute_targets=[t.absolute_row() for t in targets],
-                      elapsed_ms=elapsed*1000, server_timing=response.get("policy_timing"),
+                      elapsed_ms=elapsed*1000, server_timing=response.get("policy_timing"), rtc_diagnostics=diagnostics,
                       row_target_perf_ns=[context['observation_perf_ns']+i*PERIOD_NS for i in range(H)])
         self.publish(end_to_end_ms=elapsed*1000, sampler=echo["sampler"])
         return targets, elapsed
@@ -701,10 +743,9 @@ class RtcRun:
                 if result is None:
                     break
                 targets, elapsed = result
-                if time.perf_counter_ns() > context['freeze_until_perf_ns']:
-                    raise RuntimeError('RTC inference_delay exceeded before splice; increase configured delay or reduce latency')
                 with self.timeline.lock:
-                    candidate = self.timeline.merged(context, targets, now_ns=time.perf_counter_ns())
+                    candidate, splice_evidence = self.timeline.merge_response(
+                        context, targets, now_ns=time.perf_counter_ns(), metadata=self.policy.metadata)
                     ordered = [candidate[t] for t in sorted(candidate)]
                     previous = self.timeline.history.get(self.timeline.next_tick-1)
                     if previous is not None:
@@ -717,7 +758,7 @@ class RtcRun:
                     observation_perf_ns=stamp, freeze_until_perf_ns=context['freeze_until_perf_ns'],
                     request_started_perf_ns=request_started_ns, next_request_perf_ns=stamp+timing.execute_horizon*PERIOD_NS,
                     first_future_tick=min(candidate), last_future_tick=max(candidate),
-                    plan_revision=self.timeline.revision)
+                    plan_revision=self.timeline.revision, **splice_evidence)
                 next_request_ns = stamp+timing.execute_horizon*PERIOD_NS
                 self.publish(inference_delay=timing.inference_delay, execute_horizon=timing.execute_horizon,
                     prefix_attention_horizon=timing.prefix_attention_horizon,
