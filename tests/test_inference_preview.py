@@ -7,6 +7,14 @@ import unittest
 import numpy as np
 
 from supervisor.inference_preview import preview_once, ObservationSource
+from supervisor.pi05_adapter import Pi05InputAdapter
+
+
+def observation_adapter(broker):
+    from types import SimpleNamespace
+    adapter = SimpleNamespace(osc=broker, lock=threading.RLock())
+    adapter._refresh_gripper_observation = lambda snapshot: Pi05InputAdapter._refresh_gripper_observation(adapter, snapshot)
+    return adapter
 from tests import test_inference_rtc as rtc
 
 
@@ -109,17 +117,18 @@ class PreviewTests(unittest.TestCase):
 
     def test_readonly_observation_rejects_stopped_gripper_timestamp(self):
         from types import SimpleNamespace
+        sdk_stamp = time.time()
         broker=SimpleNamespace(sensor_sample=lambda now, wait: {
             'joint_position_rad':[0.]*7,'feedback_monotonic_ns':now,'latest_feedback_age_s':0.},
-            inference_gripper_feedback=lambda:{'width_m':.02,'raw':{'value':{'timestamp':1}}})
-        source=ObservationSource(SimpleNamespace(osc=broker))
+            inference_gripper_feedback=lambda:{'width_m':.02,'raw':{'value':{'timestamp':sdk_stamp}}})
+        source=ObservationSource(observation_adapter(broker))
         source.last_joints=(0.,)*7
         source.last_pose={'position_m':[0,0,.3],'orientation_xyzw':[0,0,0,1]}
         observed = source.refresh({'session':{'state':'IDLE'}})['inference_observation']
         self.assertEqual(observed['timing']['sample_perf_ns'], observed['perf_ns'])
         self.assertTrue(observed['timing']['fk_reused'])
         self.assertGreaterEqual(observed['timing']['refresh_ms'], observed['timing']['fk_ms'])
-        source.gripper_seen_ns-=200_000_000
+        source.a._measured_gripper_cache.received_ns-=200_000_000
         with self.assertRaisesRegex(RuntimeError,'150 ms'):
             source.refresh({'session':{'state':'IDLE'}})
 
@@ -132,7 +141,7 @@ class PreviewTests(unittest.TestCase):
             returned.append(stamp)
             return {'joint_position_rad':[0.]*7,'feedback_monotonic_ns':stamp,'latest_feedback_age_s':.0001}
         broker=SimpleNamespace(sensor_sample=reader,inference_gripper_feedback=lambda:{'width_m':.02,'raw':{'value':{'timestamp':time.time()}}})
-        source=ObservationSource(SimpleNamespace(osc=broker))
+        source=ObservationSource(observation_adapter(broker))
         source.last_joints=(0.,)*7;source.last_pose={'position_m':[0,0,.3],'orientation_xyzw':[0,0,0,1]}
         result=source.refresh({'session':{'state':'IDLE'}})['inference_observation']
         self.assertEqual(result['perf_ns'],returned[-1])
@@ -160,13 +169,33 @@ class PreviewTests(unittest.TestCase):
         self.assertFalse(self.a.snapshot()['control_readiness']['hardware']['allowed'])
         self.a._rtc_run=None
 
-    def test_out_of_range_gripper_prediction_remains_visible_without_execution(self):
+    def test_small_negative_gripper_preview_remains_control_valid_and_raw_logged(self):
+        self.policy.infer=lambda _: {'actions':np.asarray([[0,0,0,0,0,0,-.0352615372]]*20,np.float32)}
+        preview_once(self.a)
+        self.assertTrue(self.a.state['preview']['control_valid'])
+        self.assertAlmostEqual(self.a.state['action_chunk'][10][6], -.0352615372, places=7)
+        self.assertEqual(self.f.broker.commands, [])
+
+    def test_rtc_negative_gripper_chunk_executes_without_range_fault(self):
+        class NegativePolicy(rtc.Policy):
+            def infer(self, obs):
+                response = super().infer(obs)
+                response['actions'][:, 6] = -.103109718
+                return response
+        self.a._policy = NegativePolicy(.03)
+        self.a.start('session-1', 'client-1')
+        self.f.wait_for(lambda: self.a.state['executed_steps'] >= 8)
+        self.assertIsNone(self.a.state['last_error'])
+        self.assertEqual(self.a.state['gripper_ratio_diagnostic']['command_ratio'], 0.)
+        self.assertAlmostEqual(self.a.state['gripper_ratio_diagnostic']['raw_ratio'], -.103109718, places=7)
+
+    def test_out_of_range_gripper_preview_retains_raw_and_warns_without_sending(self):
         self.policy.infer=lambda _: {'actions':np.asarray([[0,0,0,0,0,0,1.2]]*20,np.float32)}
         preview_once(self.a)
         self.assertAlmostEqual(self.a.state['action_chunk'][0][6],1.2)
         self.assertEqual(self.a.state['preview']['state'],'READY')
-        self.assertFalse(self.a.state['preview']['control_valid'])
-        self.assertFalse(self.a.snapshot()['control_readiness']['hardware']['allowed'])
+        self.assertTrue(self.a.state['preview']['control_valid'])
+        self.assertIsNotNone(self.a.state['preview']['warning'])
         self.assertEqual(self.f.broker.commands,[])
 
     def test_rtc_fault_with_unconfirmed_hold_keeps_preview_and_allows_stop_retry(self):

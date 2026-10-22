@@ -9,6 +9,7 @@ import time
 import numpy as np
 
 from .inference_contract import action_rows, metadata_compatibility
+from .inference_gripper_feedback import require_fresh
 
 
 class ObservationSource:
@@ -86,15 +87,9 @@ class ObservationSource:
             return snapshot
         gripper = copy.deepcopy(snapshot.get("gripper") or {})
         if not shadow:
-            feedback = self.a.osc.inference_gripper_feedback()
-            gripper.update(width_m=feedback.get("width_m"), raw=feedback.get("raw"))
-            marker = ((feedback.get('raw') or {}).get('value') or {}).get('timestamp')
-            if marker is None:
-                raise RuntimeError('等待带时间戳的实测夹爪反馈')
-            if marker != self.gripper_marker:
-                self.gripper_marker, self.gripper_seen_ns = marker, time.perf_counter_ns()
-            if time.perf_counter_ns()-self.gripper_seen_ns > 150_000_000:
-                raise RuntimeError('实测夹爪反馈已停更超过150 ms')
+            snapshot = self.a._refresh_gripper_observation(snapshot)
+            require_fresh(snapshot.get('gripper_observation') or {})
+            gripper = copy.deepcopy(snapshot.get('gripper') or {})
         width = gripper.get("width_m")
         if width is None or not math.isfinite(float(width)):
             raise RuntimeError("等待实测夹爪开度")
@@ -155,8 +150,7 @@ def preview_once(a):
                 osc["gripper"] = dict(osc.get("gripper") or {}, width_m=measured["gripper_width_m"])
             else:
                 diagnostic = osc.get('gripper_observation') or {}
-                if diagnostic.get('error') or time.perf_counter_ns()-diagnostic.get('received_perf_ns', 0) > 150_000_000:
-                    raise RuntimeError('等待新鲜实测夹爪反馈（150 ms以内）')
+                require_fresh(diagnostic)
         elif callable(getattr(a.osc, "sensor_sample", None)):
             raise RuntimeError(a.state.get("observation_wait_reason") or "等待实测TCP与夹爪")
         pose = (osc.get("execution") or {}).get("measured_tcp_pose")
@@ -176,10 +170,8 @@ def preview_once(a):
         rows = action_rows(response, config["execution"]["expected_chunk_steps"])
         decoded = [a._target_from_action(row, pose, action_index=i, preview_only=True)
                    for i, row in enumerate(rows)]
-        grip = config['gripper']
-        low = -float(grip.get('ratio_boundary_tolerance', .005))
-        high = 1+float(grip.get('ratio_upper_boundary_tolerance', .05))
-        control_valid = all(low <= row[6] <= high for row in rows)
+        control_valid = all(math.isfinite(row[6]) for row in rows)
+        gripper_saturated = any(not 0.0 <= row[6] <= 1.0 for row in rows)
         ended = time.perf_counter()
         with a.lock:
             if revision != (a._connection_revision, a._run_revision) or a.state.get("priming") or a.state.get("execution_enabled"):
@@ -188,7 +180,8 @@ def preview_once(a):
             previous = preview.get("last_completed_perf_s")
             preview.update(state="READY", error=None, updated_at=time.time(), last_completed_perf_s=ended,
                 control_valid=control_valid,
-                warning=None if control_valid else '预测夹爪比例超出控制允许范围；仅展示，不执行',
+                warning=('夹爪预测超出[0,1]，执行时将限幅；原始预测保留'
+                         if gripper_saturated else None),
                 hz=1/(ended-previous) if previous and ended>previous else None,
                 source="ordinary_h20_preview" if config["execution"].get("mode") == "rtc" else "ordinary_preview",
                 sequence=preview.get("sequence", 0)+1, stale=False)
