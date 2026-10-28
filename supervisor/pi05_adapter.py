@@ -16,7 +16,7 @@ import threading
 import time
 from typing import Any
 from .camera_resource import SharedCameraResource
-from .inference_recording import RunCapture, await_target
+from .inference_recording import RunCapture, CompletedRun, latest_completed_run, await_target
 from .openpi_client import OpenPIClient, _pack_array, _unpack_array
 from .inference_config import project, prepare_update, save_config, endpoint_uri
 from .inference_contract import metadata_compatibility, make_observation, action_rows
@@ -24,7 +24,7 @@ from .inference_connection import local_listener, loopback
 from .inference_rtc import run_adapter as run_rtc_adapter, compatibility as rtc_compatibility
 from .inference_preview import ObservationSource, preview_once
 from .inference_feedback import MeasuredTCPFeed
-from .inference_gripper_feedback import GripperFeedbackCache
+from .inference_gripper_feedback import GripperFeedbackCache, GripperFeedbackFeed
 
 
 LOGGER = logging.getLogger(__name__)
@@ -146,7 +146,8 @@ class Pi05InputAdapter:
         self._row_lock = threading.RLock()
         self._wait_cancel = threading.Event()
         self._capture: RunCapture | None = None
-        self._completed_capture: RunCapture | None = None
+        self._completed_capture: RunCapture | CompletedRun | None = latest_completed_run(
+            self.config_path.parent.parent/'runtime/logs/inference_runs')
         self._pending_gripper: dict[str, Any] | None = None
         # Gripper SDK calls are deliberately kept out of the 50 ms TCP
         # dispatch path.  A slow CAN/SDK acknowledgement must not consume the
@@ -167,9 +168,15 @@ class Pi05InputAdapter:
                           if callable(getattr(self.osc, 'sensor_sample', None)) else None)
         self._gripper_observation_identity = None
         self._gripper_observation_cache: dict[str, Any] | None = None
+        self._measured_gripper_cache = GripperFeedbackCache()
+        self._gripper_feed = (GripperFeedbackFeed(self.osc.inference_gripper_feedback,
+            self._feedback_context, self._osc_state_stop, self._measured_gripper_cache, self._event)
+            if callable(getattr(self.osc, 'inference_gripper_feedback', None)) else None)
         self.state: dict[str, Any] = self._new_state()
         self._gripper_worker.start()
         self._connection_thread.start()
+        if self._gripper_feed:
+            self._gripper_feed.thread.start()
         self._osc_state_thread.start()
         if self._tcp_feed:
             self._tcp_feed.thread.start()
@@ -640,6 +647,10 @@ class Pi05InputAdapter:
         session = snapshot.get('session') or {}
         if session.get('execution_mode') == 'shadow':
             return snapshot
+        feed = getattr(self, '_gripper_feed', None)
+        if feed is not None:
+            # A pure cache read: no SDK/RPC call on the UI/state polling thread.
+            return feed.attach(snapshot)
         reader = getattr(self.osc,'inference_gripper_feedback',None)
         if not callable(reader): return snapshot
         with self.lock:
@@ -1221,6 +1232,8 @@ class Pi05InputAdapter:
                 'sent_perf_ns':started_ns,'status':'pending_feedback','health_confirmed':False,
                 'target_reached':None,'session_id':session_id,'client_id':client_id,
                 'run_revision':job['revision'],
+                'reported_in_tolerance_samples':0, 'reported_target_reached':False,
+                'physical_opening_verified':False, 'arrival_basis':'sdk_reported_width',
                 'last_sdk_marker':self._gripper_sdk_marker(receipt.get('before') or {})}
             self.state['gripper_confirmation'] = copy.deepcopy(confirmation)
             self._pending_gripper = confirmation
@@ -1261,8 +1274,12 @@ class Pi05InputAdapter:
             if not foc.get('driver_enable_status'): faults.append('driver_disabled')
             width = gripper.get('width_m')
             width_error = abs(float(width)-pending['target_width_m']) if isinstance(width,(int,float)) and math.isfinite(width) else None
+            count = pending.get('reported_in_tolerance_samples',0)+1 if width_error is not None and width_error <= .003 else 0
             pending.update(last_sdk_marker=marker,status='feedback_fault' if faults else 'feedback_received',
                 health_confirmed=not faults,actual_width_m=width,target_error_m=width_error,
+                sdk_reported_width_m=width, reported_in_tolerance_samples=count,
+                reported_target_reached=count>=2, physical_opening_verified=False,
+                feedback_after_command_ms=(time.perf_counter_ns()-pending['sent_perf_ns'])/1e6,
                 # Width error is diagnostic, not a new reached/grasp gate.
                 target_reached=None,faults=faults,feedback_observed_perf_ns=time.perf_counter_ns())
             self.state['gripper_confirmation'] = copy.deepcopy(pending)
@@ -1565,6 +1582,8 @@ class Pi05InputAdapter:
             self._osc_state_thread.join(timeout=1.0)
         if self._tcp_feed and self._tcp_feed.thread is not threading.current_thread():
             self._tcp_feed.thread.join(timeout=2.0)
+        if self._gripper_feed and self._gripper_feed.thread is not threading.current_thread():
+            self._gripper_feed.thread.join(timeout=2.0)
         with self.lock:
             worker = self.worker
         if worker is not None and worker is not threading.current_thread():

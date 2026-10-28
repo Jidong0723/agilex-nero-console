@@ -149,8 +149,27 @@ test('control faults remain visible in plain Chinese while raw diagnostics and e
   assert.match(f.element('inference-error-detail').textContent,/SERVO write authority/);
   assert.equal(f.element('inference-log-state').textContent,'');
   assert.equal(f.element('inference-log-state').hidden,true);
-  assert.equal(f.element('inference-export').hidden,true);
+  assert.equal(f.element('inference-export').hidden,false);
+  assert.equal(f.element('inference-export').disabled,true);
   assert.match(f.panel.readableError(raw),/控制权限已撤销/);
+});
+
+test('export stays visible and a restored completed log enables download',()=>{
+  const f=fixture(),s=structuredClone(f.state());
+  s.log_export_ready=false;
+  f.panel.render(s);
+  assert.equal(f.element('inference-export').hidden,false);
+  assert.equal(f.element('inference-export').disabled,true);
+  s.log_export_ready=true;
+  s.inference_log={run_id:'20261027T155555-92dbe55b',finished:true,export_ready:true};
+  f.panel.render(s);
+  assert.equal(f.element('inference-export').hidden,false);
+  assert.equal(f.element('inference-export').disabled,false);
+  assert.match(f.element('inference-export').title,/重启后仍保留/);
+  s.log_export_ready=false;s.inference_log.write_error='disk full';
+  f.panel.render(s);
+  assert.equal(f.element('inference-export').disabled,true);
+  assert.match(f.element('inference-export').title,/disk full/);
 });
 
 test('startup rejection stays visible through successful preview refreshes',()=>{

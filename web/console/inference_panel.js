@@ -256,7 +256,12 @@
     get("inference-chunk-detail").textContent=state.chunk_updated_at?`第 ${state.chunk_sequence} 块 · H=${state.action_chunk_length} · ${state.inference_ms?.toFixed(1)??"--"} ms · ${new Date(state.chunk_updated_at*1000).toLocaleTimeString()}${state.chunk_source!=="control"&&state.config.execution.mode==="rtc"?" · 普通 H20 采样，未进行 RTC 衔接":""}`:"";
     if(["HOLD_PENDING","HOLD_UNCONFIRMED","STOPPING"].includes(rtc?.state)) get("pi05-stop").disabled=false;
     get("inference-export").disabled=!state.log_export_ready;
-    get("inference-export").hidden=!state.log_export_ready;
+    get("inference-export").hidden=false;
+    get("inference-export").title=state.log_export_ready
+      ? "导出最近一轮已结束的推理日志（服务重启后仍保留）"
+      : state.inference_log?.write_error
+        ? `日志不可导出：${state.inference_log.write_error}`
+        : "暂无完整且已结束的推理日志";
     const log=state.inference_log;
     get("inference-log-state").textContent=state.log_error || (log ? `${log.run_id} · ${log.finished?"已结束":"记录中"}${log.write_error?" · "+log.write_error:""}` : "");
     get("inference-log-state").hidden=!get("inference-log-state").textContent;

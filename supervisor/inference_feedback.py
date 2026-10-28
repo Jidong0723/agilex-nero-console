@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import threading
 import time
+from .inference_alignment import SampleHistory
 
 
 def identity(snapshot):
@@ -15,6 +16,7 @@ class MeasuredTCPFeed:
         self.source, self.context, self.stop_event = source, context, stop_event
         self.lock = threading.Lock()
         self.value = {}
+        self.history = SampleHistory()
         self.thread = threading.Thread(target=self.run, name='nero-model-measured-tcp', daemon=True)
 
     def status(self):
@@ -62,6 +64,8 @@ class MeasuredTCPFeed:
                 result = self.source.refresh(snapshot, tcp_only=True)
                 completed = time.perf_counter_ns()
                 observation = result['inference_observation']
+                if observation.get('joint_position_rad') is not None and identity(self.context()) == key:
+                    self.history.append(key, observation['perf_ns'], observation['joint_position_rad'])
                 observation['timing'].update(published_perf_ns=completed,
                     sample_age_at_publish_ms=(completed-observation['perf_ns'])/1e6)
                 value = {'identity': key, 'observation': observation,

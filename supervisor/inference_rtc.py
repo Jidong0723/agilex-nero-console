@@ -15,6 +15,8 @@ import numpy as np
 
 from .inference_contract import action_rows
 from .inference_rtc_timing import RTCTiming, preserve_delay_prefix
+from .inference_alignment import SampleHistory, AlignmentPending, nearest_frames, next_grid_anchor
+from .inference_feedback import identity
 
 VERSION = "nero.rtc.v2"
 H = 20
@@ -325,6 +327,8 @@ class ObservationAssembler:
         self._gripper_received_ns = 0
         self._gripper_has_advanced = False
         self._gripper_lock = threading.Lock()
+        self._simulated_history = SampleHistory()
+        self._simulated_gripper = SampleHistory()
 
     def read(self):
         a = self.a
@@ -413,7 +417,76 @@ class ObservationAssembler:
         # separately rather than pretending capture and cache-read are identical.
         osc['rtc_observation_times'] = {'observation_perf_ns': stamp,
                                        'image_perf_ns': list(stamps), 'read_perf_ns': now}
+        if session.get('execution_mode') == 'shadow':
+            self._simulated_history.append(identity(osc), stamp,
+                [*pose['position_m'], *pose['orientation_xyzw']])
+            self._simulated_gripper.append(identity(osc), stamp,
+                [float(observation['observation/state'][6])])
         return observation, copy.deepcopy(pose), osc, stamp
+
+    def read_aligned(self, anchor_ns, cancel):
+        """Real feedback brackets a scheduled tick; no retimestamped latest pose.
+
+        Waiting is bounded by the existing 100 ms TCP freshness budget, and
+        remains inside D, not an extra allowance to dispatch expired rows.
+        """
+        deadline = anchor_ns+100_000_000
+        while not cancel.is_set():
+            _, _, osc, raw_stamp = self.read()  # Existing health/session checks.
+            try:
+                key = identity(osc)
+                feed = getattr(self.a, '_tcp_feed', None)
+                if feed is not None:
+                    joints, state_evidence = feed.history.at(key, anchor_ns)
+                    pose = self.a._observation_source.pose_for_joints(joints)
+                    state_evidence['joint_position_rad'] = joints.tolist()
+                elif (osc.get('session') or {}).get('execution_mode') == 'shadow':
+                    # Direct fake clients have explicit simulated poses but no
+                    # hardware FK producer. Never use this for real hardware.
+                    def interpolate_pose(a, b, f):
+                        t = interpolate_target(Target(tuple(a[:3]),tuple(a[3:]),0),
+                                               Target(tuple(b[:3]),tuple(b[3:]),0),f)
+                        return np.asarray([*t.position,*t.quaternion])
+                    row, state_evidence = self._simulated_history.at(key, anchor_ns,
+                        interpolate=interpolate_pose)
+                    pose = {'position_m': row[:3].tolist(), 'orientation_xyzw': row[3:].tolist()}
+                    state_evidence['method'] = 'simulated_pose_interpolation'
+                else:
+                    raise RuntimeError('RTC aligned hardware observation requires measured joint history')
+                if key[2] == 'hardware':
+                    cache = getattr(self.a, '_measured_gripper_cache', None)
+                    if cache is None:
+                        raise AlignmentPending('RTC alignment waiting for measured gripper history')
+                    width, grip_evidence = cache.history.at(key[0], anchor_ns)
+                    width = float(width[0])
+                else:
+                    ratio, grip_evidence = self._simulated_gripper.at(key, anchor_ns)
+                    bounds = self.a.config['gripper']
+                    width = bounds['min_width_m']+float(ratio[0])*(bounds['max_width_m']-bounds['min_width_m'])
+                frames, stamps = nearest_frames(self.a.camera_resource, anchor_ns)
+                now = time.perf_counter_ns()
+                if not 0 <= now-anchor_ns <= 100_000_000:
+                    raise RuntimeError('RTC alignment anchor exceeds existing TCP freshness budget')
+                if any(not 0 <= now-t <= 150_000_000 for t in stamps):
+                    raise RuntimeError('RTC aligned camera feedback absent or older than 150 ms')
+                observed = copy.deepcopy(osc.get('inference_observation') or {})
+                observed.update(pose=pose, perf_ns=anchor_ns, gripper_width_m=width,
+                                source='grid_aligned_measured_feedback')
+                osc['inference_observation'] = observed
+                evidence = {'observation_perf_ns': anchor_ns, 'raw_latest_tcp_perf_ns': raw_stamp,
+                    'image_perf_ns': stamps, 'image_offset_ms': [(t-anchor_ns)/1e6 for t in stamps],
+                    'read_perf_ns': now, 'state_alignment': state_evidence,
+                    'gripper_alignment': grip_evidence, 'alignment_wait_ms': (now-anchor_ns)/1e6}
+                osc['rtc_observation_times'] = evidence
+                observation = self.a._observation(osc, *frames)
+                self.a._event('rtc_observation_alignment', **evidence)
+                return observation, copy.deepcopy(pose), osc, anchor_ns
+            except AlignmentPending:
+                if time.perf_counter_ns() >= deadline:
+                    raise RuntimeError('RTC alignment missing bracketing feedback within 100 ms; no extrapolation')
+                if cancel.wait(.002):
+                    break
+        return None
 
 
 class RtcRun:
@@ -704,7 +777,9 @@ class RtcRun:
                           first_target_perf_ns=stamp+self.timeline.next_tick*PERIOD_NS)
             # Replan immediately at the first future slot: bootstrap has already
             # consumed latency out of its H20 horizon, so do not wait another K.
-            next_request_ns = None  # First asynchronous request is immediate.
+            # First regular request uses the next global slot. Bootstrap's
+            # original observation and bridge remain untouched.
+            next_request_ns = next_grid_anchor(self.timeline.origin_ns, time.perf_counter_ns(), PERIOD_NS)
             with self.a.lock:
                 if not self.live():
                     return
@@ -715,14 +790,10 @@ class RtcRun:
                 if next_request_ns is not None and self.cancel.wait(max(0, (next_request_ns-time.perf_counter_ns())/1e9)):
                     break
                 request_started_ns = time.perf_counter_ns()
-                observation, base, osc, stamp = self.assembler.read()
-                # Upstream advances the OBSERVATION index by execute_horizon,
-                # not the later request-preparation clock. Wait for a genuine
-                # sample at that boundary; never rewrite its timestamp.
-                while next_request_ns is not None and stamp < next_request_ns:
-                    if self.cancel.wait(.002):
-                        return
-                    observation, base, osc, stamp = self.assembler.read()
+                aligned = self.assembler.read_aligned(next_request_ns, self.cancel)
+                if aligned is None or not self.live():
+                    break
+                observation, base, osc, stamp = aligned
                 observation_tick = (stamp-self.timeline.origin_ns)//PERIOD_NS
                 context = self.timeline.context(observation_tick, timing.inference_delay, self.request_id+1,
                                                 observation_ns=stamp, now_ns=time.perf_counter_ns(),

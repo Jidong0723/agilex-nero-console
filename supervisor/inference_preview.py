@@ -5,6 +5,7 @@ import copy
 import json
 import math
 import time
+import threading
 
 import numpy as np
 
@@ -20,6 +21,22 @@ class ObservationSource:
         self.last_pose = None
         self.gripper_marker = None
         self.gripper_seen_ns = 0
+        self.fk_lock = threading.Lock()
+
+    def pose_for_joints(self, joints):
+        """Same FK/model as live observations, also used for aligned joints."""
+        key = tuple(float(x) for x in joints)
+        with self.fk_lock:
+            if key != self.last_joints:
+                from motion.osc import KinematicsClient, pose_from_tcp
+                if self.fk is None:
+                    root = self.a.config_path.parent.parent
+                    config = json.loads((root/'config/osc.json').read_text(encoding='utf-8'))
+                    self.fk = KinematicsClient(root, config)
+                self.fk.start()
+                self.last_pose = pose_from_tcp(self.fk.fk(list(key)))
+                self.last_joints = key
+            return copy.deepcopy(self.last_pose)
 
     def refresh(self, snapshot, *, tcp_only=False):
         """Read cached feedback; never acquire a lease or send a command."""
@@ -59,21 +76,11 @@ class ObservationSource:
         key = tuple(values)
         fk_started_ns = time.perf_counter_ns()
         fk_reused = key == self.last_joints
-        if key != self.last_joints:
-            from motion.osc import KinematicsClient, pose_from_tcp
-            if self.fk is None:
-                root = self.a.config_path.parent.parent
-                config = json.loads((root/"config/osc.json").read_text(encoding="utf-8"))
-                self.fk = KinematicsClient(root, config)
-            # Start outside fk()/submit()'s client lock: the reader needs that
-            # lock before publishing its startup message.
-            self.fk.start()
-            self.last_pose = pose_from_tcp(self.fk.fk(list(key)))
-            self.last_joints = key
+        pose = self.pose_for_joints(key)
         fk_finished_ns = time.perf_counter_ns()
         if tcp_only:
             snapshot['inference_observation'] = {
-                'pose': copy.deepcopy(self.last_pose), 'perf_ns': stamp,
+                'pose': pose, 'joint_position_rad': list(key), 'perf_ns': stamp,
                 'feedback_age_s': age, 'source': source,
                 'timing': {'sample_perf_ns': stamp, 'query_perf_ns': query_ns,
                     'sample_after_query_ms': (stamp-query_ns)/1e6,
@@ -93,7 +100,7 @@ class ObservationSource:
         width = gripper.get("width_m")
         if width is None or not math.isfinite(float(width)):
             raise RuntimeError("等待实测夹爪开度")
-        snapshot["inference_observation"] = {"pose": copy.deepcopy(self.last_pose), "perf_ns": stamp,
+        snapshot["inference_observation"] = {"pose": pose, "joint_position_rad": list(key), "perf_ns": stamp,
             "feedback_age_s": age, "source": source, "gripper_width_m": float(width),
             "timing": {"refresh_started_perf_ns": started_ns,
                        "sample_read_perf_ns": sample_read_ns, "sample_perf_ns": stamp,

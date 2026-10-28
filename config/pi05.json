@@ -24,7 +24,7 @@
     "startup_hold_s": 0.3,
     "arrival_wait_s": 0.1,
     "mode": "rtc",
-    "inference_delay": 5,
+    "inference_delay": 6,
     "execute_horizon": 6
   },
   "inference_profiles": {

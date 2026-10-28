@@ -6,6 +6,7 @@ import json
 import math
 from pathlib import Path
 import queue
+import re
 import threading
 import time
 import uuid
@@ -68,6 +69,55 @@ def serializable(value):
     if isinstance(value,(list,tuple)): return [serializable(v) for v in value]
     if hasattr(value,'tolist'): return serializable(value.tolist())
     return value
+
+
+class CompletedRun:
+    """Read-only handle to a finalized on-disk run; never starts worker threads."""
+    def __init__(self, path, summary):
+        self.path = Path(path)
+        self.id = self.path.name
+        self._summary = copy.deepcopy(summary)
+        if not (self.path/'events.jsonl').is_file():
+            self._summary.update(export_ready=False, write_error='Completed run events.jsonl is missing')
+
+    def status(self):
+        return copy.deepcopy(self._summary)
+
+    def zip_bytes(self):
+        if not self.status().get('export_ready'):
+            raise RuntimeError('Only fully written, loss-free completed runs can be exported')
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w', compression=zipfile.ZIP_DEFLATED) as bundle:
+            for name in ('events.jsonl', 'summary.json'):
+                bundle.write(self.path/name, name)
+        return self.id+'.zip', buffer.getvalue()
+
+
+def latest_completed_run(directory):
+    """Restore the newest finalized run once at startup, not on every UI poll.
+
+    A summary is written only by finish(), after the writer has been joined.
+    Running/partial runs are not exported. A finalized run with a recorded
+    write failure remains visible but disabled; do not silently hide data loss
+    by falling back to an older successful run.
+    """
+    root = Path(directory)
+    if not root.is_dir():
+        return None
+    for path in sorted(root.iterdir(), key=lambda p: p.name, reverse=True):
+        if not re.fullmatch(r'\d{8}T\d{6}-[0-9a-f]{8}', path.name) or not path.is_dir() or path.is_symlink():
+            continue
+        try:
+            summary = json.loads((path/'summary.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(summary, dict) or summary.get('run_id') != path.name or summary.get('finished') is not True:
+            continue
+        summary['export_ready'] = (summary.get('export_ready') is True
+                                   and summary.get('write_error') is None
+                                   and summary.get('lost_records') == 0)
+        return CompletedRun(path, summary)
+    return None
 
 
 class RunCapture:

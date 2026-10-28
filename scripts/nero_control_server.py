@@ -96,6 +96,9 @@ class LeaseError(RuntimeError):
     """Local representation of a lease error returned by the backend process."""
 
 
+INFERENCE_SENSOR_READ_METHODS = frozenset({'osc_inference_sensor_sample', '_dataset_read_gripper'})
+
+
 def _backend_fast_requests(connection: Any, controller: Any, stopping: threading.Event, allowed_methods: Any = None) -> None:
     """Serve only mailbox admission/cache reads independently of general RPC."""
     try:
@@ -152,7 +155,7 @@ def _backend_worker_main(connection: Any, config: str, fast_connection: Any = No
                              name='nero-osc-fast-ipc', daemon=True).start()
         if sensor_connection is not None:
             threading.Thread(target=_backend_fast_requests,
-                args=(sensor_connection, osc, stopping, {'osc_inference_sensor_sample'}),
+                args=(sensor_connection, osc, stopping, INFERENCE_SENSOR_READ_METHODS),
                 name='nero-model-sensor-ipc', daemon=True).start()
         connection.send({"kind": "ready", "initial": initial})
         while True:
@@ -212,7 +215,9 @@ class BackendProcessProxy:
 
     def call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         use_fast = self._fast_connection is not None and method in {'osc_track_tcp_nonblocking', 'osc_fast_state'}
-        use_sensor = self._sensor_connection is not None and method == 'osc_inference_sensor_sample'
+        # Both getters only read existing receive caches. Never admit motion,
+        # gripper commands or other control methods onto this read-only pipe.
+        use_sensor = self._sensor_connection is not None and method in INFERENCE_SENSOR_READ_METHODS
         connection = self._sensor_connection if use_sensor else (self._fast_connection if use_fast else self.connection)
         requested_ns = time.perf_counter_ns()
         lock = self._sensor_lock if use_sensor else (self._fast_lock if use_fast else self._lock)

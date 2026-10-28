@@ -415,6 +415,12 @@ class RuntimeTests(unittest.TestCase):
         for splice in splices:
             self.assertEqual(splice['next_request_perf_ns'],
                 splice['observation_perf_ns']+splice['execute_horizon']*PERIOD_NS)
+        contexts=[r['rtc_context'] for r in self.policy.requests if r['rtc_context']['phase'] != 'bootstrap_hold']
+        self.assertGreaterEqual(len(contexts),2)
+        for context in contexts:
+            self.assertEqual((context['observation_perf_ns']-context['timeline_origin_perf_ns'])%PERIOD_NS,0)
+        for before,after in zip(contexts,contexts[1:]):
+            self.assertEqual(after['observation_perf_ns']-before['observation_perf_ns'],8*PERIOD_NS)
 
     def test_mismatched_identity_never_sends_target(self):
         self.policy.corrupt = "request_id"
@@ -422,6 +428,41 @@ class RuntimeTests(unittest.TestCase):
         self.wait_for(lambda: self.a.state.get("rtc", {}).get("hold_confirmed"))
         self.assertIn("identity mismatch", self.a.state["last_error"])
         self.assertFalse(any(c["type"] == "track_tcp" for c in self.broker.commands))
+
+    def test_aligned_run_with_fake_hardware_joint_and_sdk_gripper_histories(self):
+        from supervisor.inference_feedback import MeasuredTCPFeed
+        a=self.a
+        class Source:
+            def pose_for_joints(self,q):
+                return {'position_m':[float(q[0]),0.,.3],'orientation_xyzw':[0.,0.,0.,1.]}
+            def refresh(self,snapshot,*,tcp_only=False):
+                snapshot['inference_observation']={'pose':self.pose_for_joints([0.]*7),
+                    'joint_position_rad':[0.]*7,'perf_ns':time.perf_counter_ns()-1_000_000,
+                    'feedback_age_s':.001,'source':'fake_measured_joint_fk','timing':{}}
+                return snapshot
+            def close(self):pass
+        self.broker.session['execution_mode']='hardware'
+        self.broker.inference_gripper_feedback=lambda:{'width_m':.0475,
+            'raw':{'value':{'timestamp':time.time()}}}
+        self.broker.gripper=lambda *args:{'ok':True,'result':{'ok':True,'sent':True,'feedback_pending':True}}
+        a._observation_source=Source()
+        a._tcp_feed=MeasuredTCPFeed(a._observation_source,a._feedback_context,a._osc_state_stop)
+        a._tcp_feed.thread.start()
+        a.start('session-1','client-1')
+        self.wait_for(lambda:a.state['executed_steps']>=25)
+        a.stop('fake hardware alignment test')
+        contexts=[r['rtc_context'] for r in self.policy.requests if r['rtc_context']['phase']!='bootstrap_hold']
+        self.assertGreaterEqual(len(contexts),3)
+        for before,after in zip(contexts,contexts[1:]):
+            self.assertEqual(after['observation_perf_ns']-before['observation_perf_ns'],8*PERIOD_NS)
+        events=[json.loads(line) for line in (a._completed_capture.path/'events.jsonl').read_text().splitlines()]
+        aligned=[r for r in events if r['event']=='rtc_observation_alignment']
+        self.assertGreaterEqual(len(aligned),2)
+        for row in aligned:
+            for name in ('state_alignment','gripper_alignment'):
+                left,right=row[name]['source_perf_ns']
+                self.assertLessEqual(left,row['observation_perf_ns'])
+                self.assertGreaterEqual(right,row['observation_perf_ns'])
 
     def test_bootstrap_future_target_too_far_from_hold_never_moves(self):
         original = self.policy.infer
@@ -596,8 +637,12 @@ class RuntimeTests(unittest.TestCase):
         self.broker.inference_gripper_feedback = lambda: {"width_m": .02,
             "raw": {"value": {"timestamp": time.time()}},
             "status": {"foc_status": {"driver_enable_status": True}}}
-        self.a.start("session-1", "client-1")
-        self.wait_for(lambda: self.a.state.get("rtc", {}).get("hold_confirmed"))
+        # This old fixture has no joint RX/FK producer. Isolate its intended
+        # partial-send failure; real aligned feedback is tested separately.
+        with patch.object(ObservationAssembler, 'read_aligned',
+                          lambda assembler, anchor, cancel: assembler.read()):
+            self.a.start("session-1", "client-1")
+            self.wait_for(lambda: self.a.state.get("rtc", {}).get("hold_confirmed"))
         self.assertIn("gripper was not sent", self.a.state["last_error"])
         self.assertEqual([c["type"] for c in self.broker.commands], ["track_tcp", "gripper", "hold"])
 
