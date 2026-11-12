@@ -874,6 +874,24 @@ class PicoGateway:
         self.reconnect_usb(source="session_start")
         return self._state_result()
 
+    def rebind_standby(self, session_id: str, client_id: str) -> dict[str, Any]:
+        """Rebind a parked receiver without replacing its USB socket."""
+        with self._lock:
+            if not self._session or self._session.get('client_id') != client_id:
+                raise PermissionError('PICO receiver belongs to another client')
+            adapters = self.runtime.require_adapters()
+            current = adapters.osc.fast_state().get('session') or {}
+            if (current.get('state') != 'ACTIVE' or current.get('id') != session_id
+                    or current.get('client_id') != client_id):
+                raise PermissionError('PICO standby requires the current client session')
+            adapters.pico.set_control_enabled(False)
+            # begin_connection performs the existing active-session owner checks.
+            adapters.pico_begin_connection(session_id, client_id)
+            self._session = {'session_id': session_id, 'client_id': client_id}
+            if self._connection_active:
+                adapters.pico_connected()
+        return self._state_result()
+
     def invalidate(self) -> None:
         with self._lock:
             self._connection_generation += 1
@@ -1304,6 +1322,9 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         try:
+            if parsed.path.startswith('/api/recap2/'):
+                from supervisor.recap_extension import get
+                return get(self, parsed.path)
             if parsed.path == "/api/status":
                 return self._json_ok(self.broker.status())
             if parsed.path.startswith("/api/actions/"):
@@ -1365,6 +1386,12 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             body = self._read_json()
+            if self.path.startswith('/api/recap2/'):
+                from supervisor.recap_extension import post
+                return post(self, self.path, body)
+            if getattr(self.runtime, 'recap_extension', None) is not None:
+                from supervisor.recap_extension import guard
+                guard(self.runtime, self.path, body)
             if self.path == "/api/control/reset":
                 result = schedule_service_reset()
                 self._json_accepted(result)
@@ -1627,6 +1654,12 @@ def main() -> int:
             if http_thread.is_alive():
                 server.shutdown()
             server.server_close()
+        collection = getattr(runtime, 'recap_extension', None)
+        if collection is not None and collection.state()['recording']:
+            try:
+                collection.finish(collection.meta['client_id'], 'aborted', 'page service closing')
+            except Exception as exc:
+                print(f'RECAP finalization failed: {exc}', flush=True)
         pico_gateway.close()
         runtime.close()
         instance_lock.release()

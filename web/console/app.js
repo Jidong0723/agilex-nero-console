@@ -436,7 +436,7 @@
   const selectedAdapter = () => $("input-adapter")?.value || "web";
   function applyAdapterSelection() {
     const pi = selectedAdapter() === "pi05";
-    const pico = selectedAdapter() === "pico";
+    const pico = ["pico", "recap"].includes(selectedAdapter());
     document.querySelectorAll("[data-web-adapter]").forEach((element) => element.classList.toggle("hidden", pi || pico));
     $("pi05-panel")?.classList.toggle("hidden", !pi);
     $("pico-panel")?.classList.toggle("hidden", !pico);
@@ -452,6 +452,7 @@
       })();
     }
     render();
+    window.NeroRecap?.layout();
   }
 
   function renderPico() {
@@ -475,7 +476,7 @@
     const diagnosticText = $("pico-diagnostic");
     if (diagnosticText) diagnosticText.textContent = diagnostic;
     renderPicoDetails(pico, gateway);
-    $("pico-start").disabled = Boolean(gateway.session_id) || session().state === "ACTIVE" && selectedAdapter() !== "pico";
+    $("pico-start").disabled = Boolean(gateway.session_id) || session().state === "ACTIVE" && !["pico", "recap"].includes(selectedAdapter());
     $("pico-stop").disabled = !gateway.session_id && pico.state === "IDLE";
     if ($("pico-reconnect")) $("pico-reconnect").disabled = !gateway.session_id || gatewayConnected;
     $("pico-start").textContent = "启动 PICO 接收器";
@@ -699,7 +700,7 @@
         const started = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId, input_source: "pico" }, 10000);
         updateOscState(started.state, true); current = session();
       }
-      state.pico = await api("/api/adapters/pico/connect", "POST", { session_id: current.id, client_id: clientId }, 10000);
+      state.pico = await api(selectedAdapter() === "recap" ? "/api/recap2/connect-pico" : "/api/adapters/pico/connect", "POST", { session_id: current.id, client_id: clientId }, 10000);
        phase("PICO USB 接收器已启动；请运行 ADB 转发脚本并连接 APK。 "); render();
     } catch (error) { phase(`PICO 接入失败：${error.message}`, true); }
     finally { $("pico-start").disabled = false; }
@@ -722,9 +723,7 @@
   }
 
   function renderPi05() {
-    const pi = state.pi05 || {}; const config = pi.config || {}; const cameras = config.cameras || {}; const model = config.model || {};
-    if ($("pi05-external-index") && document.activeElement !== $("pi05-external-index")) $("pi05-external-index").value = cameras.external?.index ?? 0;
-    if ($("pi05-wrist-index") && document.activeElement !== $("pi05-wrist-index")) $("pi05-wrist-index").value = cameras.wrist?.index ?? 1;
+    const pi = state.pi05 || {}; const config = pi.config || {}; const model = config.model || {};
     const promptInput = $("pi05-prompt");
     const serverPrompt = model.prompt || pi.prompt || "";
     // Periodic telemetry refreshes must never overwrite a task the operator
@@ -784,7 +783,7 @@
   }
 
   function cameraConfigBody() {
-    const prefix = selectedAdapter() === "pico" ? "pico" : "pi05";
+    const prefix = ["pico", "recap"].includes(selectedAdapter()) ? "pico" : "pi05";
     const saved = state.cameras?.config || state.pi05?.config?.cameras || {};
     const index = (source, fallback) => {
       const value = $(`${prefix}-${source}-index`)?.value;
@@ -810,21 +809,32 @@
   }
 
   function refreshPi05Frames() {
-    if ((selectedAdapter() !== "pi05" && selectedAdapter() !== "pico") || !state.cameras?.ready) return;
+    if ((!["pi05", "pico", "recap"].includes(selectedAdapter())) || !state.cameras?.ready) return;
     const sources = state.cameras?.sources || {};
-    ["pi05", "pico"].forEach((prefix) => ["external", "wrist"].forEach((source) => {
+    const prefix = selectedAdapter() === "pi05" ? "pi05" : "pico";
+    ["external", "wrist"].forEach((source) => {
       const image = $(`${prefix}-${source}-frame`); const details = sources[source] || {};
       if (!image || !details.frame_available) return;
       const stamp = String(details.timestamp_monotonic_ns || state.cameras.frame_version || 0);
-      if (!stamp || image.dataset.cameraStamp === stamp) return;
-      image.dataset.cameraStamp = stamp;
-      image.src = `/api/cameras/frame/${source}.jpg?v=${encodeURIComponent(stamp)}`;
-      image.classList.add("ready");
-    }));
+      if (!stamp || image.dataset.cameraStamp === stamp || image.dataset.cameraLoading) return;
+      const pending = new Image();
+      image.dataset.cameraLoading = stamp;
+      pending.onload = () => {
+        if (image.dataset.cameraLoading !== stamp) return;
+        image.src = pending.src;
+        image.dataset.cameraStamp = stamp;
+        delete image.dataset.cameraLoading;
+        image.classList.add("ready");
+      };
+      pending.onerror = () => {
+        if (image.dataset.cameraLoading === stamp) delete image.dataset.cameraLoading;
+      };
+      pending.src = `/api/cameras/frame/${source}.jpg?v=${encodeURIComponent(stamp)}`;
+    });
   }
 
   async function pollSharedCameraFrames() {
-    if ((selectedAdapter() !== "pi05" && selectedAdapter() !== "pico") || state.cameraRefreshBusy) return;
+    if ((!["pi05", "pico", "recap"].includes(selectedAdapter())) || state.cameraRefreshBusy) return;
     state.cameraRefreshBusy = true;
     try {
       // Inference status already carries live frame metadata. Avoid repeated
@@ -845,11 +855,19 @@
   function clearSharedCameraFrames() {
     ["pi05", "pico"].forEach((prefix) => ["external", "wrist"].forEach((source) => {
       const image = $(`${prefix}-${source}-frame`); if (!image) return;
-      image.removeAttribute("src"); image.classList.remove("ready"); delete image.dataset.cameraStamp;
+      image.removeAttribute("src"); image.classList.remove("ready"); delete image.dataset.cameraStamp; delete image.dataset.cameraLoading;
     }));
   }
 
   function scheduleSharedCameraActivation() {
+    const prefix = selectedAdapter() === "pi05" ? "pi05" : "pico";
+    for (const source of ["external", "wrist"]) {
+      const value = $(`${prefix}-${source}-index`)?.value;
+      if (value !== undefined && value !== "") {
+        const other = $(`${prefix === "pi05" ? "pico" : "pi05"}-${source}-index`);
+        if (other) other.value = value;
+      }
+    }
     state.cameraSelectionVersion = (state.cameraSelectionVersion || 0) + 1;
     clearTimeout(state.cameraActivationTimer);
     state.cameraActivationTimer = setTimeout(() => { void activateSharedCameras(); }, 120);
@@ -1325,6 +1343,7 @@
     renderHierarchy(osc, broker, transport, hardwareFeedback, diagnostic, current);
     renderPi05();
     renderPico();
+    window.NeroRecap?.layout();
     renderDataset();
     renderCameraControls();
   }
@@ -1475,7 +1494,7 @@
   }
 
   async function refreshPi05State() {
-    if (selectedAdapter() !== "pi05") return;
+    if (!["pi05", "recap"].includes(selectedAdapter())) return;
     try {
       const pi05 = await api("/api/pi05/state", "GET", undefined, 1200);
       if (Number(pi05?.updated_at || 0) >= Number(state.pi05?.updated_at || 0)) state.pi05 = pi05;
@@ -1489,7 +1508,6 @@
     const request = (state.cameraActivationRequest || 0) + 1;
     state.cameraActivationRequest = request;
     const config = cameraConfigBody();
-    clearSharedCameraFrames();
     try {
       await api("/api/cameras/config", "POST", config);
       if (request !== state.cameraActivationRequest) return;
@@ -1683,6 +1701,8 @@
   buildPi05Card();
   window.NeroInferencePanel.initialize(api, (value) => { state.pi05 = value; renderPi05(); }, phase);
   buildPicoCard();
+  window.NeroRecap.init({api,clientId,mode:() => $("execution-mode").value,session,
+    acceptOsc:value=>updateOscState(value,true),phase});
   buildDatasetCard();
   void loadSharedCameras();
   $("input-adapter")?.addEventListener("change", async () => {
@@ -1697,10 +1717,14 @@
         // session so changing the selector cannot leave a stale shadow
         // session while the UI says hardware mode.
         await api("/api/pi05/stop", "POST", { reason: "execution mode changed" }).catch(() => {});
+        if (state.pico?.session_id) {
+          state.pico = await api("/api/adapters/pico/disconnect", "POST", { reason: "execution mode changed" });
+        }
         await api("/api/osc/session/stop", "POST", { reason: "execution mode changed" });
         const result = await api("/api/osc/session/start", "POST", { execution_mode: $("execution-mode").value, client_id: clientId, input_source: selectedAdapter() }, 10000);
         updateOscState(result.state, true);
-        phase($("execution-mode").value === "hardware" ? "已切换为真机模式，请点击开始自动控制" : "已切换为影子模式");
+        phase(selectedAdapter() === "pico" ? "模式已切换，请重新连接PICO后按住Grip控制" :
+          ($("execution-mode").value === "hardware" ? "已切换为真机模式，请点击开始自动控制" : "已切换为影子模式"));
       } catch (error) {
         phase(`控制模式切换失败：${error.message}`, true);
       }

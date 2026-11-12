@@ -45,6 +45,7 @@ class OscClient:
     def __init__(self, broker: Any, input_source: str = "external") -> None:
         self._broker = broker
         self.input_source = input_source
+        self.preserve_session_on_hold = False
 
     def state(self) -> dict[str, Any]:
         return self._broker.osc_state()
@@ -105,11 +106,29 @@ class OscClient:
         """
         submit = getattr(self._broker, "osc_track_tcp_nonblocking", None)
         if submit is not None:
-            return submit(session_id, client_id, sequence, target_pose)
+            result = submit(session_id, client_id, sequence, target_pose)
+            rejected = result.get("result") if isinstance(result.get("result"), dict) else result
+            if (self.input_source == "pico" and not result.get("ok")
+                    and rejected.get("reason") == "OSC target submission is unavailable while BRAKING"):
+                # The control process verifies real HOLD readiness again. Only
+                # this rejected target may use the original synchronous path.
+                return self._broker.osc_command({
+                    "session_id": session_id, "client_id": client_id,
+                    "sequence": sequence, "type": "track_tcp",
+                    "acknowledgement_only": True, "pico_hold_resume": True,
+                    "payload": {"target_pose": target_pose},
+                })
+            return result
         # Compatibility fallback for isolated adapter fakes and older callers.
         return self._command(session_id, client_id, sequence, "track_tcp", {"target_pose": target_pose}, acknowledgement_only=True)
 
     def hold(self, session_id: str, client_id: str, sequence: int, reason: str) -> dict[str, Any]:
+        if self.preserve_session_on_hold:
+            current = self._broker.osc_state().get('session') or {}
+            if (current.get('state') != 'ACTIVE' or current.get('id') != session_id
+                    or current.get('client_id') != client_id):
+                raise PermissionError('Handover HOLD requires the current client session')
+            return self._broker.osc_input_hold(reason)
         return self._command(session_id, client_id, sequence, "hold", {"reason": reason})
 
     def osc_input_hold(self, reason: str) -> dict[str, Any]:

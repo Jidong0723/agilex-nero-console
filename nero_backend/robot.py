@@ -101,6 +101,23 @@ class NeroRobot:
         return self._connect_stage
 
     def connect(self) -> dict[str, Any]:
+        attempts = []
+        for attempt in range(2):
+            started = time.monotonic()
+            result = self._connect_once()
+            no_feedback = (self._control_mode == "FAULT" and self._last_control_reason ==
+                           "connected without fresh follower or leader feedback")
+            attempts.append({"attempt": attempt + 1, "no_feedback": no_feedback,
+                             "duration_s": round(time.monotonic() - started, 3)})
+            if not no_feedback or attempt == 1:
+                result["connection_attempts"] = attempts
+                return result
+            # Only retry an empty initial receive connection, before TX
+            # authority is bound. Never retry real drive or emergency faults.
+            self.disconnect()
+            time.sleep(0.2)
+
+    def _connect_once(self) -> dict[str, Any]:
         self._connect_stage = "import_can_sdk"
         import can
         from pyAgxArm import AgxArmFactory, ArmModel, NeroFW, create_agx_arm_config
@@ -218,16 +235,26 @@ class NeroRobot:
             self.gripper = None
             self._connect_stage = f"failed:{failed_stage}"
             raise
-        self._connect_stage = "connected"
-        return {
+        self._connect_stage = "read_connection_diagnostics"
+        # Firmware requests transmit and may block in a broken CAN link.
+        # No receive feedback means there is no reason to send that query.
+        firmware = self._connection_firmware(bool(ready.get("ok") or leader_feedback))
+        result = {
             "config": jsonable(cfg),
             "channel": call_safe("get_channel", self.robot.get_channel),
             "is_ok": call_safe("is_ok", self.robot.is_ok),
-            "firmware": call_safe("get_firmware", self.robot.get_firmware),
+            "firmware": firmware,
             "gripper_is_ok": call_safe("gripper.is_ok", self.gripper.is_ok),
             "feedback_ready": ready,
             "task_tcp": task_tcp,
         }
+        self._connect_stage = "connected"
+        return result
+
+    def _connection_firmware(self, feedback_ready: bool) -> dict[str, Any]:
+        if not feedback_ready:
+            return {"ok": False, "value": None, "error": "skipped: no live CAN feedback"}
+        return call_safe("get_firmware", lambda: self.robot.get_firmware(timeout=0.2))
 
     def disconnect(self) -> dict[str, Any]:
         if self.robot is None:

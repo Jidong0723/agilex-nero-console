@@ -656,7 +656,7 @@ class TcpVlaDatasetRecorder:
                 "longest_contiguous_points": max(runs, default=0),
                 "possible_h16_windows": sum(max(0, run - 16) for run in runs)}
 
-    def stop(self, status: str = "completed", reason: str = "") -> dict[str, Any]:
+    def stop(self, status: str = "completed", reason: str = "", *, context_end_perf_ns: int | None = None) -> dict[str, Any]:
         with self.lock:
             if not self.active:
                 return self.state()
@@ -719,7 +719,12 @@ class TcpVlaDatasetRecorder:
                 reasons.append("missing_required_raw_stream")
             if active["osc_input_gaps"]:
                 reasons.append("osc_input_history_overflow")
-            if any(item.get("session_id") != active["session_id"] for item in active["input_context_history"]):
+            # RECAP closes the control session while stopping. Its explicit
+            # finish boundary excludes only subsequent teardown contexts.
+            # A source change within the same session remains legitimate.
+            if any(item.get("session_id") != active["session_id"]
+                   for item in active["input_context_history"]
+                   if context_end_perf_ns is None or item.get("perf_counter_ns", 0) <= context_end_perf_ns):
                 reasons.append("osc_session_changed")
             if active["_raw_robot_drops"]:
                 reasons.append("raw_robot_samples_rejected")
@@ -752,6 +757,7 @@ class TcpVlaDatasetRecorder:
                 "control_source": active["control_source"], "session_id": active["session_id"],
                 "client_id": active["client_id"], "execution_mode": active["execution_mode"],
                 "output_mode": active["output_mode"], "input_context_history": active["input_context_history"],
+                "input_context_cutoff_perf_ns": context_end_perf_ns,
                 "control_sources": active["control_sources"], "output_modes": active["output_modes"],
                 "enabled_cameras": active["enabled_cameras"], "warnings": active["warnings"],
                 "failure": None if accepted else (reason or "; ".join(reasons) or "operator marked episode failed"),

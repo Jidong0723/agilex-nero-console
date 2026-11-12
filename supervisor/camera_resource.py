@@ -108,11 +108,14 @@ class CameraPair:
             # Request 30 Hz; observed cadence depends on exposure/driver.
             # -7 was checked against automatic exposure brightness on both
             # cameras, retaining highlight headroom and short exposure.
-            # Resolution changes reset the subtype: apply these in order.
+            # Dabai exposes MJPEG at 640x480/30. Both resolution and FPS setters
+            # reset its DirectShow subtype, so apply FOURCC after all of them.
+            # Keeping YUY2 on two simultaneous devices caused severe drops.
+            requested_fourcc = "MJPG" if "dabai" in name.lower() else "YUY2"
             requested = [("width", self.cv2.CAP_PROP_FRAME_WIDTH, 640),
                          ("height", self.cv2.CAP_PROP_FRAME_HEIGHT, 480),
-                         ("fourcc", self.cv2.CAP_PROP_FOURCC, self.cv2.VideoWriter_fourcc(*"YUY2")),
                          ("fps", self.cv2.CAP_PROP_FPS, 30),
+                         ("fourcc", self.cv2.CAP_PROP_FOURCC, self.cv2.VideoWriter_fourcc(*requested_fourcc)),
                          ("auto_exposure", self.cv2.CAP_PROP_AUTO_EXPOSURE, 0),
                          ("exposure", self.cv2.CAP_PROP_EXPOSURE, -7)]
             failures = [key for key, prop, value in requested if not capture.set(prop, value)]
@@ -125,7 +128,7 @@ class CameraPair:
                           and abs(actual[key] - value) > 0.001]
             self.capture_settings[index] = {
                 "requested_width": 640, "requested_height": 480,
-                "requested_fourcc": "YUY2", "requested_fps": 30,
+                "requested_fourcc": requested_fourcc, "requested_fps": 30,
                 "requested_exposure_mode": "manual", "requested_exposure": -7,
                 "setting_failures": failures, "negotiation_mismatches": mismatches,
                 "configuration_ok": not failures and not mismatches,
@@ -215,15 +218,20 @@ class CameraPair:
 
     def close(self) -> None:
         with self.read_lock:
-            for capture in getattr(self, "captures", {}).values(): capture.release()
             for future in getattr(self, "pending_reads", {}).values(): future.cancel()
-        self.read_pool.shutdown(wait=True, cancel_futures=True)
+            pending = [future for future in getattr(self, "pending_reads", {}).values() if not future.cancelled()]
+            if pending and wait(pending, timeout=2.0).not_done:
+                raise RuntimeError("camera read has not stopped; refusing to reopen an active device")
+            self.read_pool.shutdown(wait=True, cancel_futures=True)
+            for capture in getattr(self, "captures", {}).values(): capture.release()
 
 
 class SharedCameraResource:
     """One capture owner, with latest frames safe for multiple adapters."""
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = copy.deepcopy(config); self.lock = threading.RLock(); self.frame_condition = threading.Condition(self.lock); self.cameras: CameraPair | None = None
+        self.lifecycle_lock = threading.RLock()
+        self._active_config: dict[str, Any] | None = None
         self.preview_stop = threading.Event(); self.preview_thread: threading.Thread | None = None
         self.frames: dict[str, Any] = {}; self.frame_times: dict[str, float] = {}; self.frame_times_ns: dict[str, int] = {}; self.frame_history: dict[str, list[tuple[int, Any]]] = {"external": [], "wrist": []}
         self.dataset_frame_history: dict[str, list[tuple[int, Any]]] = {"external": [], "wrist": []}; self.dataset_frame_sizes: dict[str, tuple[int, int]] = {}
@@ -343,7 +351,7 @@ class SharedCameraResource:
             # The enumeration package is not installed in every service
             # environment. Probe all usable OpenCV backends as a fallback and
             # merge the results instead of stopping after the first backend.
-            backends = [getattr(cv2, "CAP_DSHOW", 700), getattr(cv2, "CAP_MSMF", 1400), getattr(cv2, "CAP_ANY", 0)]
+            backends = [] if devices else [getattr(cv2, "CAP_DSHOW", 700), getattr(cv2, "CAP_MSMF", 1400), getattr(cv2, "CAP_ANY", 0)]
             for backend in dict.fromkeys(backends):
                 for index in range(10):
                     if index in devices: continue
@@ -372,12 +380,13 @@ class SharedCameraResource:
                 self.config[key]["index"] = index
             return self.snapshot()
 
-    def _preview_loop(self) -> None:
-        while not self.preview_stop.is_set():
+    def _preview_loop(self, cameras: CameraPair, stop: threading.Event) -> None:
+        while not stop.is_set():
             try:
-                if self.cameras is None: return
-                captured = self.cameras.read_with_raw()
+                captured = cameras.read_with_raw()
                 with self.lock:
+                    if stop.is_set() or self.cameras is not cameras:
+                        return
                     current = {key: pair[0] for key, pair in captured.items()}
                     if not current:
                         # USB cameras, especially RealSense, can have a short
@@ -385,7 +394,7 @@ class SharedCameraResource:
                         # worker alive and retain any previously captured JPEG
                         # instead of turning a momentary gap into a black UI.
                         self.last_error = None if self.frames else "waiting for a camera frame"
-                        self.preview_stop.wait(.05)
+                        stop.wait(.05)
                         continue
                     self.last_error = None
                     # A failed source must not erase a last-known-good frame
@@ -439,26 +448,47 @@ class SharedCameraResource:
                 # 12-13 Hz and caused avoidable duplicate-frame rejection.
             except Exception as exc:
                 # Keep previewing after a recoverable camera/backend hiccup.
-                with self.lock: self.last_error = f"{type(exc).__name__}: {exc}"
-                self.preview_stop.wait(.1)
+                with self.lock:
+                    if stop.is_set() or self.cameras is not cameras:
+                        return
+                    self.last_error = f"{type(exc).__name__}: {exc}"
+                stop.wait(.1)
 
-    def activate(self) -> dict[str, Any]:
+    def _stop_preview(self) -> None:
+        # Never join while holding the cache lock: the reader needs that lock
+        # to finish. An old reader must exit before its device can be reopened.
         with self.lock:
             self.preview_stop.set()
-            if self.preview_thread and self.preview_thread is not threading.current_thread(): self.preview_thread.join(timeout=.5)
-            if self.cameras: self.cameras.close()
+            preview, cameras = self.preview_thread, self.cameras
+        if preview and preview is not threading.current_thread():
+            preview.join(timeout=2.0)
+            if preview.is_alive():
+                raise RuntimeError("previous camera reader is still stopping")
+        if cameras:
+            cameras.close()
+        with self.lock:
+            self.cameras = None
+            self.preview_thread = None
+            self._active_config = None
+
+    def activate(self) -> dict[str, Any]:
+        with self.lifecycle_lock:
+          with self.lock:
+            if (self.cameras is not None and self.preview_thread and self.preview_thread.is_alive()
+                    and not self.preview_stop.is_set() and self._active_config == self.config):
+                return self.snapshot()
+          self._stop_preview()
+          with self.lock:
             self.cameras = CameraPair(self.config); self.frames = {}; self.frame_times = {}; self.frame_times_ns = {}; self.frame_history = {"external": [], "wrist": []}; self.dataset_frame_history = {"external": [], "wrist": []}; self.dataset_frame_sizes = {}; self.dataset_source_history = {"external": [], "wrist": []}; self.dataset_source_sequence = {"external": 0, "wrist": 0}; self.dataset_pair_history = []; self.dataset_pair_sequence = 0; self.dataset_pair_candidates = {"external": [], "wrist": []}; self.dataset_pair_unmatched_drops = {"external": 0, "wrist": 0}; self.frame_version = 0; self.last_error = None; self.preview_stop = threading.Event()
-            self.preview_thread = threading.Thread(target=self._preview_loop, name="nero-shared-camera-preview", daemon=True); self.preview_thread.start()
+            self._active_config = copy.deepcopy(self.config)
+            self.preview_thread = threading.Thread(target=self._preview_loop, args=(self.cameras, self.preview_stop), name="nero-shared-camera-preview", daemon=True); self.preview_thread.start()
             return self.snapshot()
 
     def deactivate(self) -> dict[str, Any]:
         """Release both camera handles and stop preview work immediately."""
-        with self.lock:
-            self.preview_stop.set()
-            preview = self.preview_thread
-        if preview and preview is not threading.current_thread(): preview.join(timeout=1.0)
-        with self.lock:
-            if self.cameras: self.cameras.close()
+        with self.lifecycle_lock:
+          self._stop_preview()
+          with self.lock:
             self.cameras = None; self.preview_thread = None; self.frames = {}; self.frame_times = {}; self.frame_times_ns = {}; self.frame_history = {"external": [], "wrist": []}; self.dataset_frame_history = {"external": [], "wrist": []}; self.dataset_frame_sizes = {}; self.dataset_source_history = {"external": [], "wrist": []}; self.dataset_source_sequence = {"external": 0, "wrist": 0}; self.dataset_pair_history = []; self.dataset_pair_sequence = 0; self.dataset_pair_candidates = {"external": [], "wrist": []}; self.dataset_pair_unmatched_drops = {"external": 0, "wrist": 0}; self.frame_version = 0; self.last_error = None
             return self.snapshot()
 
