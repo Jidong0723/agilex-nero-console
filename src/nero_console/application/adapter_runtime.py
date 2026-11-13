@@ -104,6 +104,19 @@ class OscClient:
         the servo/hardware result.  ``ok`` means only that the target passed
         the session/safety checks and replaced the pending mailbox value.
         """
+        # PICO's first target after confirmed HOLD must use the existing
+        # guarded resume entry. A mailbox acceptance alone does not rebuild
+        # the successful-send reference after the idle interval.
+        if self.input_source == "pico":
+            current = self.fast_state()
+            trajectory = (current.get("diagnostics") or {}).get("trajectory_state")
+            if trajectory in {"HOLD_READY", "BRAKING"}:
+                return self._broker.osc_command({
+                    "session_id": session_id, "client_id": client_id,
+                    "sequence": sequence, "type": "track_tcp",
+                    "acknowledgement_only": True, "pico_hold_resume": True,
+                    "payload": {"target_pose": target_pose},
+                })
         submit = getattr(self._broker, "osc_track_tcp_nonblocking", None)
         if submit is not None:
             result = submit(session_id, client_id, sequence, target_pose)

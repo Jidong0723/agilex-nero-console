@@ -77,9 +77,9 @@
  }
  function init(o){
   options=o;startup=root.NeroInferenceStartup.create();selected=()=>$('input-adapter').value==='recap';
-  const choice=document.createElement('option');choice.value='recap';choice.textContent='RECAP采集';$('input-adapter').appendChild(choice);
+  const choice=document.createElement('option');choice.value='recap';choice.textContent='RECAP 学习工作台';$('input-adapter').appendChild(choice);
   card=document.createElement('section');card.id='recap-panel';card.className='panel hidden';
-  card.innerHTML=`<h2>RECAP采集</h2><div id="recap-camera-area"></div>
+  card.innerHTML=`<h2>RECAP 学习工作台</h2><div id="recap-camera-area"></div>
    <div class="dataset-fields"><label>任务指令<input id="recap-task" maxlength="500"></label><label>场景编号<input id="recap-scene" maxlength="120"></label>
    <label>用途<select id="recap-purpose"><option value="pilot">试运行</option><option value="train">正式采集</option><option value="demo">补充示教</option><option value="test">独立测试</option></select></label></div>
    <div class="session-actions"><button class="button primary" id="recap-begin">开始本轮</button><button class="button" id="recap-human">PICO接管</button><button class="button" id="recap-model">交还模型</button>
@@ -118,6 +118,9 @@
    layout();void refresh();
   });
   setInterval(refresh,500);layout();
+  const learning=document.createElement('script');learning.src='recap_learning.js?v=20261112';
+  learning.onload=()=>root.NeroRecapLearning.init({api:options.api,clientId:options.clientId,selected,collectionState:()=>latest});
+  document.head.appendChild(learning);
  }
  root.NeroRecap={init,layout};
 })(window);

@@ -1018,7 +1018,13 @@ class PicoInputAdapter:
     def gripper(self, value: Any) -> dict[str, Any]:
         fraction = max(0.0, min(1.0, float(value)))
         width = self._gripper_open_width_m * (1.0 - fraction)
-        result = self._command("gripper", {"mode": "position", "width_m": width, "force_n": self._gripper_force_n})
+        # Hardware sessions already prime CPV. Use the existing dispatch-only
+        # path so gripper confirmation cannot occupy its sole sender for 250ms.
+        # The backend retains health/enable checks; never fall back to a slow
+        # recovery call while that CPV stream is active. Shadow keeps its mode.
+        with self.lock:
+            mode = "position_inference" if self._execution_mode == "hardware" else "position"
+        result = self._command("gripper", {"mode": mode, "width_m": width, "force_n": self._gripper_force_n})
         with self.lock:
             self.state.update({"gripper_position": fraction, "updated_at": time.time()})
         return self._ack("gripper", result)

@@ -390,6 +390,9 @@ def manager(handler):
         return value
 
 def get(handler,path):
+    if path.startswith('/api/recap2/learning/'):
+        from supervisor import recap_learning
+        return recap_learning.get(handler,path)
     if path=='/api/recap2/state':return handler._json_ok(manager(handler).state())
     if path=='/api/recap2/export':
         target=manager(handler).prepare_export()
@@ -402,6 +405,12 @@ def get(handler,path):
     raise ValueError('Unknown collection endpoint')
 
 def post(handler,path,body):
+    if path.startswith('/api/recap2/learning/'):
+        from supervisor import recap_learning
+        return recap_learning.post(handler,path,body)
+    if path=='/api/recap2/start':
+        from supervisor import recap_learning
+        recap_learning.assert_collection_allowed()
     m=manager(handler);client=str(body.get('client_id',''))
     if path=='/api/recap2/start':result=m.start(body)
     elif path=='/api/recap2/connect-pico':result=m.connect_pico(body)
