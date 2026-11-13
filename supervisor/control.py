@@ -1432,9 +1432,24 @@ class OperationalSpaceController:
 
     def _osc_input_hold(self, reason: str) -> dict[str, Any]:
         """Deadman HOLD for PICO input while keeping its OSC session active."""
-        session = self._osc.status().get("session") or {}
+        status = self._osc.status()
+        session = status.get("session") or {}
         mode = str(session.get("execution_mode") or "shadow")
         if mode == "hardware":
+            authority = self.supervisor.snapshot()
+            diagnostics = status.get("diagnostics") or {}
+            velocity = diagnostics.get("last_sent_velocity_rad_s") or []
+            mailbox = (self._osc.fast_status().get("diagnostics") or {}).get("target_mailbox") or {}
+            if (session.get("state") == "ACTIVE"
+                    and diagnostics.get("trajectory_state") == "HOLD_READY"
+                    and not status.get("command")
+                    and authority.writer is ArmWriter.SERVO
+                    and authority.servo_mode is ServoMode.HOLDING
+                    and len(velocity) == 7 and all(float(v) == 0.0 for v in velocity)
+                    and mailbox.get("status") != "pending"):
+                return {"ok": True, "accepted": True, "already_stopped": True,
+                        "reason": reason, "robot_commands_sent": False,
+                        "session_id": session.get("id")}
             return self._osc.request_hardware_hold(reason)
         if mode == "shadow":
             return self._osc.request_shadow_hold(reason)
@@ -1442,6 +1457,16 @@ class OperationalSpaceController:
 
     def osc_command(self, body: dict[str, Any]) -> dict[str, Any]:
         command_type = str(body.get("type", "")).strip().lower()
+        if command_type == "track_tcp" and body.get("pico_hold_resume") is True:
+            state = self._osc.status()
+            if (state.get("diagnostics") or {}).get("trajectory_state") != "HOLD_READY":
+                return {"ok": False, "result": {"accepted": False,
+                    "reason": "PICO resume is waiting for HOLD_READY", "recoverable": True}}
+            # submit_absolute_target retains session, sequence, workspace,
+            # feedback and authority validation and rebuilds the CPV reference.
+            timing = {}
+            return self._observe_osc_input(
+                body, lambda: self._execute_osc_command(body, timing), timing=timing)
         # Keep the public HTTP envelope, but route high-rate TCP targets to
         # the same latest-value mailbox used by model/PICO adapters.  HOLD,
         # stop, gripper and move_tcp retain their synchronous semantics.

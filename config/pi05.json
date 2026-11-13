@@ -16,14 +16,14 @@
   },
   "model": {
     "request_timeout_s": 30,
-    "prompt": "Pick up the yellow cube and move it to the P1 area."
+    "prompt": "pick up the yellow cube and pick up it to the p1 area"
   },
   "execution": {
     "period_s": 0.05,
     "osc_state_poll_s": 0.05,
     "startup_hold_s": 0.3,
     "arrival_wait_s": 0.1,
-    "mode": "rtc",
+    "mode": "normal",
     "inference_delay": 5,
     "execute_horizon": 6
   },

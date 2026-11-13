@@ -209,6 +209,9 @@ class PicoInputAdapter:
         self._anchor_generation = 0
         self._pending_anchor: dict[str, Any] | None = None
         self._sequence = 0
+        self._control_gate = threading.RLock()
+        self._control_enabled = True
+        self._control_enabled_since_ns = 0
         self._connection_stop = threading.Event()
         self._connection_thread: threading.Thread | None = None
         self._pose_receive_times_ns: list[int] = []
@@ -272,6 +275,7 @@ class PicoInputAdapter:
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             result = copy.deepcopy(self.state)
+            result['control_enabled'] = self._control_enabled
             if self.state["updated_at"]:
                 result["last_input_age_s"] = max(0.0, time.time() - self.state["updated_at"])
             if self.state.get("last_target_sent_at"):
@@ -479,6 +483,8 @@ class PicoInputAdapter:
                 return
 
     def _command(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self._control_enabled:
+            return {"ok": True, "accepted": False, "reason": "PICO receive-only standby"}
         # Do not hold the adapter lock while entering the OSC/control layer.
         # The latter may wait for the shadow runtime, and holding this lock
         # would block the websocket receive path and state polling together.
@@ -492,7 +498,13 @@ class PicoInputAdapter:
             self._sequence = max(self._sequence + 1, time.monotonic_ns() // 1_000_000)
             sequence = self._sequence
         if kind == "track_tcp":
-            return self.osc.track_tcp(session_id, client_id, sequence, payload["target_pose"])
+            result = self.osc.track_tcp(session_id, client_id, sequence, payload["target_pose"])
+            detail = result.get('result') if isinstance(result.get('result'), dict) else result
+            latest = detail.get('accepted_sequence', result.get('accepted_sequence'))
+            if isinstance(latest, int):
+                with self.lock:
+                    self._sequence = max(self._sequence, latest)
+            return result
         if kind == "hold":
             # Grip release is a deadman HOLD, not a session handoff. The
             # console facade keeps the hardware OSC lease alive while the
@@ -538,6 +550,8 @@ class PicoInputAdapter:
         return ack
 
     def heartbeat(self) -> None:
+        if not self._control_enabled:
+            return
         with self.lock:
             session_id, client_id = self._session_id, self._client_id
         if session_id and client_id:
@@ -583,7 +597,45 @@ class PicoInputAdapter:
         diagnostics = snapshot.get("diagnostics") or {}
         return str(diagnostics.get("trajectory_state") or "") == "HOLD_READY"
 
+    def set_control_enabled(self, enabled: bool) -> None:
+        with self._control_gate:
+            if enabled == self._control_enabled:
+                return
+            if enabled and self._session_id:
+                snapshot = self.osc.state()
+                session = snapshot.get('session') or {}
+                if (session.get('state') != 'ACTIVE' or session.get('id') != self._session_id
+                        or session.get('client_id') != self._client_id):
+                    raise PermissionError('PICO control requires the current client session')
+                with self.lock:
+                    self._sequence = max(self._sequence, int(session.get('sequence') or 0),
+                        int((snapshot.get('command') or {}).get('sequence') or 0))
+            try:
+                if not enabled and self._session_id:
+                    self.stop('RECAP PICO control disabled')
+            finally:
+                self._control_enabled = enabled
+                self._control_enabled_since_ns = time.monotonic_ns()
+                with self.lock:
+                    self._anchor_controller = self._anchor_tcp = None
+                    self._pending_anchor = None
+                    self._last_frame_grip = False
+                    self.state.update(control_enabled=enabled, anchor_active=False,
+                                      clutch_signal=False, input_clutch=False)
+                if self.trace_logger:
+                    self.trace_logger.append({'record_type': 'event', 'event': 'recap_pico_control',
+                        'monotonic_ns': self._control_enabled_since_ns,
+                        'control_enabled': enabled, 'session_id': self._session_id})
+
     def input_frame(self, frame: dict[str, Any]) -> dict[str, Any]:
+        with self._control_gate:
+            received = int(frame.get('_gateway_received_monotonic_ns') or time.monotonic_ns())
+            if not self._control_enabled or received <= self._control_enabled_since_ns:
+                return {'ok': True, 'accepted': False, 'type': 'input_frame',
+                        'reason': 'PICO receive-only standby'}
+            return self._controlled_input_frame(frame)
+
+    def _controlled_input_frame(self, frame: dict[str, Any]) -> dict[str, Any]:
         """Process one newest combined PICO Pose + Grip + Trigger frame."""
         position = _vector(frame.get("position_m"), 3, "input_frame.position_m")
         orientation = _normalise(_vector(frame.get("orientation_xyzw"), 4, "input_frame.orientation_xyzw"))
@@ -966,12 +1018,22 @@ class PicoInputAdapter:
     def gripper(self, value: Any) -> dict[str, Any]:
         fraction = max(0.0, min(1.0, float(value)))
         width = self._gripper_open_width_m * (1.0 - fraction)
-        result = self._command("gripper", {"mode": "position", "width_m": width, "force_n": self._gripper_force_n})
+        # Hardware sessions already prime CPV. Use the existing dispatch-only
+        # path so gripper confirmation cannot occupy its sole sender for 250ms.
+        # The backend retains health/enable checks; never fall back to a slow
+        # recovery call while that CPV stream is active. Shadow keeps its mode.
+        with self.lock:
+            mode = "position_inference" if self._execution_mode == "hardware" else "position"
+        result = self._command("gripper", {"mode": mode, "width_m": width, "force_n": self._gripper_force_n})
         with self.lock:
             self.state.update({"gripper_position": fraction, "updated_at": time.time()})
         return self._ack("gripper", result)
 
     def stop(self, reason: str) -> dict[str, Any]:
+        with self._control_gate:
+            return self._stop_control(reason)
+
+    def _stop_control(self, reason: str) -> dict[str, Any]:
         with self.lock:
             self._anchor_controller = self._anchor_tcp = None
             self._absolute_position_offset = None
